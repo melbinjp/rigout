@@ -1,0 +1,111 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rigout"
+version = "0.1.0"
+description = "Let AI agents use your computer through MCP."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+keywords = ["mcp", "ai-agents", "remote-control", "automation", "developer-tools"]
+authors = [
+    {name = "The Rigout Authors"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "starlette>=0.37.0",
+    "uvicorn>=0.29.0",
+    "paramiko>=3.0.0",
+    "requests>=2.28.0",
+    "cryptography>=3.4.8",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2.0",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.3.1",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+    "pre-commit>=3.7.0",
+    "twine>=5.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/melbinjp/rigout"
+Repository = "https://github.com/melbinjp/rigout"
+
+[project.scripts]
+rigout = "rigout.mcp_url_launcher:main"
+rigout-stdio = "rigout.server:stdio_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rigout"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/rigout",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "unit: Unit tests (no external dependencies)",
+    "integration: Integration tests (require running services)",
+    "slow: Tests that take more than 10 seconds",
+]
+asyncio_mode = "auto"
+addopts = "--strict-markers -v --tb=short"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+exclude = ["production_validation.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "N"]
+ignore = ["SIM117", "E501", "B904"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["paramiko.*", "mcp.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "rigout.mcp_workspace_manager",
+    "rigout.config_manager"
+]
+ignore_errors = true

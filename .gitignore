@@ -1,9 +1,7 @@
-# AI Agent Hardware Access - .gitignore
-
-# ============================================
-# CRITICAL: Sensitive configuration files
-# NEVER COMMIT THESE!
-# ============================================
+# Sensitive local configuration
+.env
+.env.*
+!.env.example
 *.key
 *.pem
 *_key
@@ -14,103 +12,62 @@
 *.secret
 mcp-server-config.json
 cloudflare-config.json
-.env
+ai_agent_connection.*
+connection_info.*
 configs/
-docker/.env
-docker/data/
 
-# Log files
+# Runtime state and logs
 *.log
+.rigout.pid
+.rigout.log
+.rigout_stdout.log
+.rigout_stderr.log
 logs/
+production_validation_report.json
+.workspace_state.json
+bin/
 
-# Python
+# Python build/test artifacts
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 .Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.cache/
+.hypothesis/
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+wheels/
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
-env.bak/
-venv.bak/
 
-# IDE and Editor files
+# Generated project exports
+generated_files/
+generated_repo_files/
+
+# Editor and OS files
 .vscode/
 .idea/
 .kiro/
 *.swp
 *.swo
 *~
-.project
-.classpath
-.settings/
-
-# OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
 # Temporary files
 *.tmp
 *.temp
-temp/
 tmp/
-
-# Generated files (user copies these to their projects)
-# These should NOT be committed - they contain user-specific connection info
-generated_files/
-generated_repo_files/
-ai_agent_connection.*
-connection_info.*
-
-# Setup configuration (user-specific)
-setup_config.json
-production_validation_report.json
-.workspace_state.json
-
-# Test artifacts
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-
-# Tunnel configurations
-tunnel_config.yml
-tunnel_credentials.json
-
-# SSH configurations
-ssh_config
-known_hosts
-
-# Backup files
-*.bak
-*.backup
-backup_*/
+temp/

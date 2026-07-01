@@ -1,20 +1,8 @@
-# AI Agent Hardware Access - Core Dependencies
-
-# Model Context Protocol
+# pyproject.toml is the canonical dependency source.
 mcp>=1.0.0
-
-# SSH client for secure connections
+starlette>=0.37.0
+uvicorn>=0.29.0
 paramiko>=3.0.0
-
-# HTTP client for API calls
 requests>=2.28.0
-
-# Security and cryptography
 cryptography>=3.4.8
-
-# Configuration management
 pyyaml>=6.0
-
-# Testing (development only)
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
