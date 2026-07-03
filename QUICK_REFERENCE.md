@@ -14,6 +14,9 @@ rigout --tunnel cloudflare
 rigout --port 9000
 rigout --public-url https://rigout.example.com
 rigout --auth-token "$RIGOUT_TOKEN"
+rigout --tunnel cloudflare --cloudflared-path /path/to/cloudflared
+rigout --tunnel cloudflare --no-cloudflared-download
+python -m rigout.mcp_url_launcher --tunnel cloudflare
 ```
 
 ## Source Checkout
@@ -36,6 +39,7 @@ rigout-stdio
 - `pyproject.toml`: package metadata and build configuration.
 - `src/rigout/`: package source.
 - `tests/`: pytest coverage.
+- User-local Rigout cache: stores auto-downloaded `cloudflared` when needed.
 
 ## Verification
 

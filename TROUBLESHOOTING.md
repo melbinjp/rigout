@@ -21,6 +21,12 @@ Use another port if needed:
 rigout --port 9000
 ```
 
+If `rigout` is not found after installation, Python installed the console script outside your shell PATH. Use the module launcher or add Python's Scripts directory to PATH:
+
+```bash
+python -m rigout.mcp_url_launcher --tunnel cloudflare
+```
+
 ## Cloud Agent Cannot Connect
 
 Confirm the generated connection file:
@@ -36,6 +42,20 @@ curl https://your-public-host/health
 ```
 
 If using Cloudflare quick tunnels, remember that the URL changes each time the tunnel restarts.
+
+## Cloudflare Download Fails
+
+`rigout --tunnel cloudflare` automatically downloads `cloudflared` when it is not already installed. If the machine is offline, blocks GitHub downloads, or uses an unsupported CPU architecture, install `cloudflared` manually and pass:
+
+```bash
+rigout --tunnel cloudflare --cloudflared-path /path/to/cloudflared
+```
+
+To require a preinstalled binary and prevent automatic downloads:
+
+```bash
+rigout --tunnel cloudflare --no-cloudflared-download
+```
 
 ## Unauthorized
 
