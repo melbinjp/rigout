@@ -16,11 +16,13 @@
 |   `-- release.yml
 |-- README.md
 |-- AGENTS.md
+|-- CHANGELOG.md
 |-- URL_MCP_SERVER.md
 |-- QUICK_REFERENCE.md
 |-- TROUBLESHOOTING.md
 |-- CONTRIBUTING.md
 |-- DEVELOPMENT_STANDARDS.md
+|-- RELEASE.md
 |-- SECURITY.md
 |-- pyproject.toml
 |-- rigout.sh

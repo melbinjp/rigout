@@ -4,6 +4,18 @@ Rigout is a Streamable HTTP MCP server for controlled device access. Agents shou
 
 For repository changes, follow [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md). Keep edits small, tested, and aligned with the `rigout` package and CLI.
 
+## Repository Operations
+
+Agents working in this repository must use the same systematic path as human contributors:
+
+1. Read [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [RELEASE.md](RELEASE.md) before changing release, packaging, CI, security, or public behavior.
+2. Start from an up-to-date `main`.
+3. Create a short-lived branch before editing. Use `codex/<scope>` for agent-authored work.
+4. Never commit or push directly to `main`.
+5. Update `CHANGELOG.md` for user-facing behavior, CLI, packaging, security, or release-process changes.
+6. Run the relevant local checks and report any skipped check clearly.
+7. Open a pull request and wait for CI plus review before merge.
+
 ## Connection
 
 Connection files have this shape:

@@ -4,6 +4,19 @@ Rigout follows a Google Engineering Practices-inspired workflow: small changes, 
 
 This file is the source of truth for future contributors and agents.
 
+## Change Control Standard
+
+- Do not commit or push directly to `main`.
+- Start every change from an up-to-date `main` branch and create a short-lived branch such as `codex/<scope>` or `feature/<scope>`.
+- Open a pull request for every repository change, including docs-only changes.
+- Keep pull requests small enough to review in one pass.
+- Require CI to pass before merge.
+- Require at least one approving review before merge, even for maintainer-authored changes.
+- Resolve review comments and conversations before merge.
+- Prefer squash merge for a readable main history.
+- Delete merged branches.
+- Emergency fixes may be small, but they still go through a pull request.
+
 ## Core Rules
 
 - Keep changes small and scoped to the behavior being changed.
@@ -48,9 +61,12 @@ python -m twine check dist/rigout-*
 - Never upload old local `dist/` artifacts.
 - Confirm `pip install rigout` and `rigout --help` work from the built wheel.
 - Rotate any token that was pasted into chat, logs, commits, or issue trackers.
+- Keep `CHANGELOG.md` accurate for every user-facing behavior, CLI, packaging, security, or release-process change.
+- Prepare version bumps through a release pull request before tagging.
 - Publish only through the tagged GitHub Actions release workflow.
 - Use PyPI Trusted Publishing with the GitHub environment named `pypi`; do not store long-lived PyPI credentials in GitHub secrets.
 - Keep the PyPI trusted publisher fields aligned with the current repository: owner `melbinjp`, repository `rigout`, workflow `release.yml`, environment `pypi`, project `rigout`.
+- Follow [RELEASE.md](RELEASE.md) for release gates, validation, version PRs, and tagging.
 
 ## Documentation Standard
 
