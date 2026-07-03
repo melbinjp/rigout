@@ -2,6 +2,7 @@ import io
 import json
 import os
 import tarfile
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from rigout.mcp_url_launcher import (
     cloudflared_cache_path,
     install_cloudflared,
     resolve_cloudflared_binary,
+    start_server,
 )
 
 
@@ -55,6 +57,49 @@ def test_write_connection_file_includes_agent_setup_url(tmp_path):
     assert data["agent_setup_url"] == "https://agent.example/connection.json?setup_token=setup"
     assert data["agent_setup_security"] == "credential_url"
     assert data["mcp"]["headers"]["Authorization"] == "Bearer secret-token"
+
+
+def launcher_args(**overrides):
+    values = {
+        "host": "127.0.0.1",
+        "port": 8765,
+        "path": "/mcp",
+        "connection_file": "connection.json",
+        "json_response": False,
+        "stateless": False,
+        "auth_token": None,
+    }
+    values.update(overrides)
+    return Namespace(**values)
+
+
+@pytest.mark.unit
+def test_start_server_passes_public_url_and_setup_token():
+    args = launcher_args(json_response=True, stateless=True, auth_token="auth-token")
+
+    with patch("rigout.mcp_url_launcher.subprocess.Popen") as popen:
+        start_server(args, public_url="https://agent.example/mcp", setup_token="setup-token")
+
+    command = popen.call_args.args[0]
+    assert command[command.index("--public-url") + 1] == "https://agent.example/mcp"
+    assert command[command.index("--setup-token") + 1] == "setup-token"
+    assert command[command.index("--auth-token") + 1] == "auth-token"
+    assert "--json-response" in command
+    assert "--stateless" in command
+    assert "--serve-connection-file" not in command
+
+
+@pytest.mark.unit
+def test_start_server_omits_public_setup_arguments_for_local_start():
+    args = launcher_args()
+
+    with patch("rigout.mcp_url_launcher.subprocess.Popen") as popen:
+        start_server(args)
+
+    command = popen.call_args.args[0]
+    assert "--public-url" not in command
+    assert "--setup-token" not in command
+    assert "--serve-connection-file" not in command
 
 
 @pytest.mark.unit

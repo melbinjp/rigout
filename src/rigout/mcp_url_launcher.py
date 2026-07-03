@@ -186,7 +186,12 @@ def resolve_cloudflared_binary(cloudflared_path: str | None = None, allow_downlo
     )
 
 
-def start_server(args: argparse.Namespace) -> subprocess.Popen:
+def start_server(
+    args: argparse.Namespace,
+    *,
+    public_url: str | None = None,
+    setup_token: str | None = None,
+) -> subprocess.Popen:
     command = [
         sys.executable,
         "-m",
@@ -199,18 +204,18 @@ def start_server(args: argparse.Namespace) -> subprocess.Popen:
         args.path,
         "--connection-file",
         args.connection_file,
-        "--serve-connection-file",
-        args.connection_file,
         "--no-write-connection",
     ]
+    if public_url:
+        command.extend(["--public-url", public_url])
     if args.json_response:
         command.append("--json-response")
     if args.stateless:
         command.append("--stateless")
     if args.auth_token:
         command.extend(["--auth-token", args.auth_token])
-    if args.connection_setup_token:
-        command.extend(["--connection-setup-token", args.connection_setup_token])
+    if setup_token:
+        command.extend(["--setup-token", setup_token])
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -293,7 +298,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--public-url", help="Use an already-created public base URL or full MCP URL")
     parser.add_argument("--connection-file", default=DEFAULT_CONNECTION_FILE)
     parser.add_argument("--auth-token", help="Bearer token required for MCP requests")
-    parser.add_argument("--agent-setup-token", help="Use this token for the generated agent setup URL")
+    parser.add_argument("--setup-token", help="Use this token for the generated agent setup URL")
     parser.add_argument(
         "--no-agent-setup-url",
         action="store_true",
@@ -332,9 +337,9 @@ def main(argv: list[str] | None = None) -> int:
     is_public = bool(args.tunnel != "none" or args.public_url)
     if not args.auth_token and not args.no_auth and is_public:
         args.auth_token = secrets.token_urlsafe(32)
-    args.connection_setup_token = None
+    setup_token = None
     if args.auth_token and is_public and not args.no_agent_setup_url:
-        args.connection_setup_token = args.agent_setup_token or secrets.token_urlsafe(32)
+        setup_token = args.setup_token or secrets.token_urlsafe(32)
 
     server_process: subprocess.Popen | None = None
     tunnel_process: subprocess.Popen | None = None
@@ -351,10 +356,16 @@ def main(argv: list[str] | None = None) -> int:
         if not args.skip_install:
             install_dependencies()
 
-        server_process = start_server(args)
-        health_url = health_url_from_mcp_url(local_url(args.host, args.port, args.path), args.path)
-        if not wait_for_health(health_url):
-            raise RuntimeError(f"MCP server did not become healthy at {health_url}")
+        server_public_url = resolve_public_mcp_url(args, None) if args.public_url else None
+        initial_mcp_url = server_public_url or local_url(args.host, args.port, args.path)
+        server_process = start_server(
+            args,
+            public_url=server_public_url,
+            setup_token=setup_token if server_public_url else None,
+        )
+        local_health_url = health_url_from_mcp_url(local_url(args.host, args.port, args.path), args.path)
+        if not wait_for_health(local_health_url):
+            raise RuntimeError(f"MCP server did not become healthy at {local_health_url}")
 
         tunnel_base_url = None
         if args.tunnel == "cloudflare":
@@ -366,11 +377,13 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         mcp_url = resolve_public_mcp_url(args, tunnel_base_url)
-        setup_url = (
-            connection_setup_url(mcp_url, args.path, args.connection_setup_token)
-            if args.connection_setup_token
-            else None
-        )
+        if mcp_url != initial_mcp_url:
+            stop_process(server_process)
+            server_process = start_server(args, public_url=mcp_url, setup_token=setup_token)
+            if not wait_for_health(local_health_url):
+                raise RuntimeError(f"MCP server did not become healthy at {local_health_url}")
+
+        setup_url = connection_setup_url(mcp_url, args.path, setup_token) if setup_token else None
         write_connection_file(
             args.connection_file,
             mcp_url,
@@ -390,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Auth: bearer token written to connection file")
         if setup_url:
             print(f"Agent setup URL: {setup_url}")
+            print("Paste this URL to your AI agent so it can configure itself.")
             print("Treat the agent setup URL like a password; it can fetch the bearer token.")
         print("Press Ctrl+C to stop.")
 

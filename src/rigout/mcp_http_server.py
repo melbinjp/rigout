@@ -16,7 +16,7 @@ import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from urllib.parse import urlencode
 
 import uvicorn
@@ -161,21 +161,6 @@ def write_connection_file(
     )
 
 
-def read_served_connection_file(path: str | Path | None) -> dict[str, Any] | None:
-    if not path:
-        return None
-    connection_path = Path(path)
-    if not connection_path.exists():
-        return None
-    try:
-        connection_data = json.loads(connection_path.read_text(encoding="utf-8"))
-        if not isinstance(connection_data, dict):
-            return None
-        return cast(dict[str, Any], connection_data)
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
 def create_app(
     *,
     host: str = DEFAULT_HOST,
@@ -183,8 +168,7 @@ def create_app(
     path: str = DEFAULT_PATH,
     public_url: str | None = None,
     connection_file: str | Path | None = None,
-    served_connection_file: str | Path | None = None,
-    connection_setup_token: str | None = None,
+    setup_token: str | None = None,
     auth_token: str | None = None,
     json_response: bool = False,
     stateless: bool = False,
@@ -216,15 +200,10 @@ def create_app(
 
     async def connection(request: Request) -> JSONResponse:
         bearer_authorized = bool(auth_token and request.headers.get("authorization") == f"Bearer {auth_token}")
-        setup_authorized = bool(
-            connection_setup_token and request.query_params.get("setup_token") == connection_setup_token
-        )
+        setup_authorized = bool(setup_token and request.query_params.get("setup_token") == setup_token)
         if auth_token and not (bearer_authorized or setup_authorized):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        connection_data = read_served_connection_file(served_connection_file) or build_connection_data(
-            mcp_url, host, port, path, auth_token
-        )
-        return JSONResponse(connection_data)
+        return JSONResponse(build_connection_data(mcp_url, host, port, path, auth_token))
 
     async def root(_: Request) -> PlainTextResponse:
         return PlainTextResponse(
@@ -256,8 +235,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--path", default=DEFAULT_PATH, help="MCP path, default: /mcp")
     parser.add_argument("--public-url", help="Public MCP URL to write into connection files")
     parser.add_argument("--connection-file", default=DEFAULT_CONNECTION_FILE)
-    parser.add_argument("--serve-connection-file", help="Serve this runtime connection file from /connection.json")
-    parser.add_argument("--connection-setup-token", help="Allow this setup token to fetch /connection.json")
+    parser.add_argument("--setup-token", help="Allow this setup token to fetch /connection.json")
     parser.add_argument("--auth-token", help="Bearer token required for MCP requests")
     parser.add_argument(
         "--generate-token", action="store_true", help="Generate a bearer token and write it to the connection file"
@@ -281,8 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         path=mcp_path,
         public_url=mcp_url,
         connection_file=connection_file,
-        served_connection_file=args.serve_connection_file,
-        connection_setup_token=args.connection_setup_token,
+        setup_token=args.setup_token,
         auth_token=auth_token,
         json_response=args.json_response,
         stateless=args.stateless,
