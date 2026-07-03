@@ -2,7 +2,7 @@ import asyncio
 import logging
 import sys
 
-from mcp.server import Server
+from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import (
@@ -36,7 +36,7 @@ if not logger.handlers:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.FileHandler("mcp-hardware-server.log"), logging.StreamHandler(sys.stdout)],
+        handlers=[logging.FileHandler("mcp-hardware-server.log"), logging.StreamHandler(sys.stderr)],
     )
 
 server = Server("enhanced-hardware-server")
@@ -356,8 +356,8 @@ async def main():
                 server_name="enhanced-hardware-server",
                 server_version="1.0.0",
                 capabilities=server.get_capabilities(
-                    notification_options=None,
-                    experimental_capabilities=None,
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
                 ),
             ),
         )

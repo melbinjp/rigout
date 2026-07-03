@@ -185,7 +185,9 @@ def create_app(
             }
         )
 
-    async def connection(_: Request) -> JSONResponse:
+    async def connection(request: Request) -> JSONResponse:
+        if auth_token and request.headers.get("authorization") != f"Bearer {auth_token}":
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         return JSONResponse(build_connection_data(mcp_url, host, port, path, auth_token))
 
     async def root(_: Request) -> PlainTextResponse:

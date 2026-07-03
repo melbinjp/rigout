@@ -43,7 +43,10 @@ class TestHTTPTransport:
         """Public URL mode should be able to protect the MCP transport with bearer auth."""
         app = create_app(connection_file=None, auth_token="test-token")
         with TestClient(app) as client:
-            connection = client.get("/connection.json").json()
+            unauthenticated_connection = client.get("/connection.json")
+            assert unauthenticated_connection.status_code == 401
+
+            connection = client.get("/connection.json", headers={"Authorization": "Bearer test-token"}).json()
             assert connection["mcp"]["headers"]["Authorization"] == "Bearer test-token"
             assert connection["security"]["auth"] == "bearer"
 

@@ -30,6 +30,8 @@ This starts the local server, downloads `cloudflared` into a user-local Rigout c
 
 Agents should use the generated `mcp.url`, `mcp.transport`, and `mcp.headers`.
 
+When bearer auth is enabled, `/connection.json` also requires the same bearer token. Use the local `ai_agent_connection.json` file as the credential source.
+
 ## Existing Public URL
 
 When a reverse proxy or stable tunnel already exists:

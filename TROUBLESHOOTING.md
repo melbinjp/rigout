@@ -35,6 +35,8 @@ Confirm the generated connection file:
 python -m json.tool ai_agent_connection.json
 ```
 
+If bearer auth is enabled, `/connection.json` also requires the same `Authorization` header. The local `ai_agent_connection.json` file is the source of the token.
+
 Confirm the health URL from the same network as the agent if possible:
 
 ```bash
