@@ -20,12 +20,6 @@ Start a local MCP server:
 rigout
 ```
 
-If your shell does not find the `rigout` command after installation, run the same launcher with:
-
-```bash
-python -m rigout.mcp_url_launcher
-```
-
 This serves MCP at:
 
 ```text
@@ -40,7 +34,7 @@ For a cloud agent, expose the server with a Cloudflare quick tunnel:
 rigout --tunnel cloudflare
 ```
 
-If `cloudflared` is not already installed, Rigout downloads the matching official Cloudflare release into a user-local Rigout cache and runs it from there. Public/tunnel mode automatically generates a bearer token and writes it into the connection file.
+Public/tunnel mode automatically generates a bearer token and writes it into the connection file.
 
 ## Source Checkout
 
@@ -99,18 +93,6 @@ Do not expose Rigout publicly with `--no-auth` unless the network is private and
 ## Public URL Reliability
 
 Cloudflare quick tunnels are useful for one-command setup and testing, but their public URLs are ephemeral. For long-running or production use, put Rigout behind a stable tunnel or gateway such as a named Cloudflare Tunnel, Tailscale, a reverse proxy, or a dedicated VM with explicit network controls.
-
-Rigout's automatic `cloudflared` download does not require administrator privileges. To use a pinned or system-managed binary instead:
-
-```bash
-rigout --tunnel cloudflare --cloudflared-path /path/to/cloudflared
-```
-
-To disable automatic downloads:
-
-```bash
-rigout --tunnel cloudflare --no-cloudflared-download
-```
 
 ## Validation
 

@@ -10,16 +10,13 @@ Examples:
 
 import argparse
 import os
-import platform
 import queue
 import re
 import secrets
 import shutil
 import signal
-import stat
 import subprocess
 import sys
-import tarfile
 import threading
 import time
 import urllib.error
@@ -38,7 +35,6 @@ from .mcp_http_server import (
 )
 
 CLOUDFLARE_URL_PATTERN = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
-CLOUDFLARED_DOWNLOAD_BASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download"
 
 
 def install_dependencies() -> None:
@@ -61,128 +57,6 @@ def wait_for_health(url: str, timeout: int = 30) -> bool:
         except (OSError, urllib.error.URLError):
             time.sleep(0.5)
     return False
-
-
-def normalize_cloudflared_arch(machine: str | None = None) -> str:
-    machine_name = (machine or platform.machine()).lower()
-    if machine_name in {"x86_64", "amd64"}:
-        return "amd64"
-    if machine_name in {"i386", "i686", "x86"}:
-        return "386"
-    if machine_name in {"aarch64", "arm64"}:
-        return "arm64"
-    if machine_name.startswith("armv7") or machine_name.startswith("armv6") or machine_name == "arm":
-        return "arm"
-    raise RuntimeError(f"Unsupported architecture for cloudflared auto-install: {machine_name}")
-
-
-def cloudflared_asset(system: str | None = None, machine: str | None = None) -> tuple[str, bool]:
-    system_name = (system or platform.system()).lower()
-    arch = normalize_cloudflared_arch(machine)
-
-    if system_name == "linux" and arch in {"amd64", "386", "arm", "arm64"}:
-        return f"cloudflared-linux-{arch}", False
-    if system_name == "darwin" and arch in {"amd64", "arm64"}:
-        return f"cloudflared-darwin-{arch}.tgz", True
-    if system_name == "windows" and arch in {"amd64", "386"}:
-        return f"cloudflared-windows-{arch}.exe", False
-
-    raise RuntimeError(f"Unsupported platform for cloudflared auto-install: {system_name}/{arch}")
-
-
-def cloudflared_cache_dir() -> Path:
-    override = os.getenv("RIGOUT_CACHE_DIR")
-    if override:
-        return Path(override).expanduser() / "cloudflared"
-
-    if sys.platform == "win32":
-        base = Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Caches"
-    else:
-        base = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
-
-    return base / "rigout" / "cloudflared"
-
-
-def cloudflared_cache_path(system: str | None = None, machine: str | None = None) -> Path:
-    asset_name, _ = cloudflared_asset(system, machine)
-    system_name = (system or platform.system()).lower()
-    executable_name = "cloudflared.exe" if system_name == "windows" else "cloudflared"
-    platform_dir = asset_name.removesuffix(".tgz").removesuffix(".exe")
-    return cloudflared_cache_dir() / platform_dir / executable_name
-
-
-def make_executable(path: Path) -> None:
-    if sys.platform == "win32":
-        return
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-
-def download_file(url: str, destination: Path) -> None:
-    with urllib.request.urlopen(url, timeout=120) as response, destination.open("wb") as output:
-        shutil.copyfileobj(response, output)
-
-
-def extract_cloudflared_archive(archive_path: Path, destination: Path) -> None:
-    with tarfile.open(archive_path, "r:gz") as archive:
-        for member in archive.getmembers():
-            if member.isfile() and Path(member.name).name == "cloudflared":
-                source = archive.extractfile(member)
-                if source is None:
-                    break
-                with destination.open("wb") as output:
-                    shutil.copyfileobj(source, output)
-                return
-
-    raise RuntimeError("Downloaded cloudflared archive did not contain a cloudflared executable")
-
-
-def install_cloudflared() -> Path:
-    target = cloudflared_cache_path()
-    if target.exists():
-        make_executable(target)
-        return target
-
-    asset_name, is_archive = cloudflared_asset()
-    download_url = f"{CLOUDFLARED_DOWNLOAD_BASE_URL}/{asset_name}"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary_download = target.parent / f"{asset_name}.download"
-
-    print(f"cloudflared is not installed. Downloading {asset_name}...")
-    try:
-        download_file(download_url, temporary_download)
-        if is_archive:
-            extract_cloudflared_archive(temporary_download, target)
-        else:
-            temporary_download.replace(target)
-        make_executable(target)
-    finally:
-        if temporary_download.exists():
-            temporary_download.unlink()
-
-    print(f"Installed cloudflared at {target}")
-    return target
-
-
-def resolve_cloudflared_binary(cloudflared_path: str | None = None, allow_download: bool = True) -> str:
-    if cloudflared_path:
-        path = Path(cloudflared_path).expanduser()
-        if not path.exists():
-            raise RuntimeError(f"cloudflared binary not found: {path}")
-        return str(path)
-
-    existing_binary = shutil.which("cloudflared")
-    if existing_binary:
-        return existing_binary
-
-    if allow_download:
-        return str(install_cloudflared())
-
-    raise RuntimeError(
-        "cloudflared is not installed. Re-run without --no-cloudflared-download or install it from "
-        "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/"
-    )
 
 
 def start_server(args: argparse.Namespace) -> subprocess.Popen:
@@ -220,16 +94,15 @@ def stream_process_output(process: subprocess.Popen, output_queue: queue.Queue[s
         output_queue.put(line)
 
 
-def start_cloudflare_tunnel(
-    port: int,
-    timeout: int = 45,
-    cloudflared_path: str | None = None,
-    allow_download: bool = True,
-) -> tuple[subprocess.Popen, str]:
-    cloudflared_binary = resolve_cloudflared_binary(cloudflared_path, allow_download)
+def start_cloudflare_tunnel(port: int, timeout: int = 45) -> tuple[subprocess.Popen, str]:
+    if not shutil.which("cloudflared"):
+        raise RuntimeError(
+            "cloudflared is not installed. Install it from "
+            "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+        )
 
     command = [
-        cloudflared_binary,
+        "cloudflared",
         "tunnel",
         "--url",
         f"http://127.0.0.1:{port}",
@@ -286,12 +159,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--public-url", help="Use an already-created public base URL or full MCP URL")
     parser.add_argument("--connection-file", default=DEFAULT_CONNECTION_FILE)
     parser.add_argument("--auth-token", help="Bearer token required for MCP requests")
-    parser.add_argument("--cloudflared-path", help="Use this cloudflared binary instead of PATH/cache lookup")
-    parser.add_argument(
-        "--no-cloudflared-download",
-        action="store_true",
-        help="Fail instead of downloading cloudflared when --tunnel cloudflare is used and cloudflared is missing",
-    )
     parser.add_argument(
         "--no-auth",
         action="store_true",
@@ -342,11 +209,7 @@ def main(argv: list[str] | None = None) -> int:
         tunnel_base_url = None
         if args.tunnel == "cloudflare":
             print("Starting Cloudflare quick tunnel...")
-            tunnel_process, tunnel_base_url = start_cloudflare_tunnel(
-                args.port,
-                cloudflared_path=args.cloudflared_path,
-                allow_download=not args.no_cloudflared_download,
-            )
+            tunnel_process, tunnel_base_url = start_cloudflare_tunnel(args.port)
 
         mcp_url = resolve_public_mcp_url(args, tunnel_base_url)
         write_connection_file(args.connection_file, mcp_url, args.host, args.port, args.path, args.auth_token)

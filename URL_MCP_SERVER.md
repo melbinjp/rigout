@@ -26,7 +26,7 @@ curl http://127.0.0.1:8765/health
 rigout --tunnel cloudflare
 ```
 
-This starts the local server, downloads `cloudflared` into a user-local Rigout cache if it is not already installed, creates a Cloudflare quick tunnel, writes `ai_agent_connection.json`, and keeps running until stopped.
+This starts the local server, creates a Cloudflare quick tunnel, writes `ai_agent_connection.json`, and keeps running until stopped.
 
 Agents should use the generated `mcp.url`, `mcp.transport`, and `mcp.headers`.
 
