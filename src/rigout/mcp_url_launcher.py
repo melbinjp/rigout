@@ -31,6 +31,7 @@ from .mcp_http_server import (
     DEFAULT_HOST,
     DEFAULT_PATH,
     DEFAULT_PORT,
+    connection_setup_url,
     health_url_from_mcp_url,
     local_url,
     normalize_path,
@@ -196,6 +197,10 @@ def start_server(args: argparse.Namespace) -> subprocess.Popen:
         str(args.port),
         "--path",
         args.path,
+        "--connection-file",
+        args.connection_file,
+        "--serve-connection-file",
+        args.connection_file,
         "--no-write-connection",
     ]
     if args.json_response:
@@ -204,6 +209,8 @@ def start_server(args: argparse.Namespace) -> subprocess.Popen:
         command.append("--stateless")
     if args.auth_token:
         command.extend(["--auth-token", args.auth_token])
+    if args.connection_setup_token:
+        command.extend(["--connection-setup-token", args.connection_setup_token])
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -286,6 +293,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--public-url", help="Use an already-created public base URL or full MCP URL")
     parser.add_argument("--connection-file", default=DEFAULT_CONNECTION_FILE)
     parser.add_argument("--auth-token", help="Bearer token required for MCP requests")
+    parser.add_argument("--agent-setup-token", help="Use this token for the generated agent setup URL")
+    parser.add_argument(
+        "--no-agent-setup-url",
+        action="store_true",
+        help="Do not generate a credential-bearing setup URL for public/tunnel mode",
+    )
     parser.add_argument("--cloudflared-path", help="Use this cloudflared binary instead of PATH/cache lookup")
     parser.add_argument(
         "--no-cloudflared-download",
@@ -316,8 +329,12 @@ def resolve_public_mcp_url(args: argparse.Namespace, tunnel_base_url: str | None
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     args.path = normalize_path(args.path)
-    if not args.auth_token and not args.no_auth and (args.tunnel != "none" or args.public_url):
+    is_public = bool(args.tunnel != "none" or args.public_url)
+    if not args.auth_token and not args.no_auth and is_public:
         args.auth_token = secrets.token_urlsafe(32)
+    args.connection_setup_token = None
+    if args.auth_token and is_public and not args.no_agent_setup_url:
+        args.connection_setup_token = args.agent_setup_token or secrets.token_urlsafe(32)
 
     server_process: subprocess.Popen | None = None
     tunnel_process: subprocess.Popen | None = None
@@ -349,7 +366,20 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         mcp_url = resolve_public_mcp_url(args, tunnel_base_url)
-        write_connection_file(args.connection_file, mcp_url, args.host, args.port, args.path, args.auth_token)
+        setup_url = (
+            connection_setup_url(mcp_url, args.path, args.connection_setup_token)
+            if args.connection_setup_token
+            else None
+        )
+        write_connection_file(
+            args.connection_file,
+            mcp_url,
+            args.host,
+            args.port,
+            args.path,
+            args.auth_token,
+            agent_setup_url=setup_url,
+        )
 
         print()
         print("Hardware MCP server is running.")
@@ -358,6 +388,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Connection file: {Path(args.connection_file).resolve()}")
         if args.auth_token:
             print("Auth: bearer token written to connection file")
+        if setup_url:
+            print(f"Agent setup URL: {setup_url}")
+            print("Treat the agent setup URL like a password; it can fetch the bearer token.")
         print("Press Ctrl+C to stop.")
 
         while server_process.poll() is None:

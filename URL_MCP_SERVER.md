@@ -28,9 +28,9 @@ rigout --tunnel cloudflare
 
 This starts the local server, downloads `cloudflared` into a user-local Rigout cache if it is not already installed, creates a Cloudflare quick tunnel, writes `ai_agent_connection.json`, and keeps running until stopped.
 
-Agents should use the generated `mcp.url`, `mcp.transport`, and `mcp.headers`.
+Agents should use the generated `mcp.url`, `mcp.transport`, and `mcp.headers`. You can give the agent either the local `ai_agent_connection.json` content or the printed agent setup URL.
 
-When bearer auth is enabled, `/connection.json` also requires the same bearer token. Use the local `ai_agent_connection.json` file as the credential source.
+When bearer auth is enabled, plain `/connection.json` also requires the same bearer token. The printed agent setup URL includes a setup token that can fetch the full MCP configuration without already knowing the bearer token. Treat that setup URL like a password.
 
 ## Existing Public URL
 

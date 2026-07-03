@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -55,3 +57,36 @@ class TestHTTPTransport:
 
             authenticated = client.post("/mcp", json={}, headers={"Authorization": "Bearer test-token"})
             assert authenticated.status_code in {400, 406}
+
+    def test_connection_setup_token_can_fetch_runtime_connection_file(self, tmp_path):
+        connection_file = tmp_path / "connection.json"
+        connection_file.write_text(
+            json.dumps(
+                {
+                    "mcp": {
+                        "transport": "streamable-http",
+                        "url": "https://public.example/mcp",
+                        "headers": {"Authorization": "Bearer test-token"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        app = create_app(
+            connection_file=None,
+            served_connection_file=connection_file,
+            connection_setup_token="setup-secret",
+            auth_token="test-token",
+        )
+
+        with TestClient(app) as client:
+            assert client.get("/connection.json").status_code == 401
+            assert client.get("/connection.json?setup_token=wrong").status_code == 401
+
+            setup_connection = client.get("/connection.json?setup_token=setup-secret")
+            assert setup_connection.status_code == 200
+            assert setup_connection.json()["mcp"]["url"] == "https://public.example/mcp"
+
+            bearer_connection = client.get("/connection.json", headers={"Authorization": "Bearer test-token"})
+            assert bearer_connection.status_code == 200
+            assert bearer_connection.json()["mcp"]["headers"]["Authorization"] == "Bearer test-token"

@@ -42,6 +42,8 @@ rigout --tunnel cloudflare
 
 If `cloudflared` is not already installed, Rigout downloads the matching official Cloudflare release into a user-local Rigout cache and runs it from there. Public/tunnel mode automatically generates a bearer token and writes it into the connection file.
 
+For a smooth handoff, public/tunnel mode also prints an agent setup URL. Give that setup URL to the agent when it can fetch its own MCP configuration. Treat the setup URL like a password: it can retrieve the bearer token.
+
 ## Source Checkout
 
 From a cloned repo:
@@ -110,6 +112,12 @@ To disable automatic downloads:
 
 ```bash
 rigout --tunnel cloudflare --no-cloudflared-download
+```
+
+To avoid printing a credential-bearing setup URL:
+
+```bash
+rigout --tunnel cloudflare --no-agent-setup-url
 ```
 
 ## Validation

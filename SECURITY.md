@@ -8,6 +8,7 @@ Rigout exposes powerful device-control tools over MCP. Treat every public MCP UR
 - Use bearer auth for any non-localhost deployment.
 - Prefer stable private networking for long-running usage: named Cloudflare Tunnel, Tailscale, VPN, or a reverse proxy with access controls.
 - Rotate generated connection files and tokens after sharing them with an agent.
+- Treat the printed agent setup URL like a bearer token; it can retrieve the full MCP client configuration.
 - Review `mcp-hardware-server.log` after agent sessions.
 
 ## Not For

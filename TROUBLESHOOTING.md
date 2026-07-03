@@ -35,7 +35,7 @@ Confirm the generated connection file:
 python -m json.tool ai_agent_connection.json
 ```
 
-If bearer auth is enabled, `/connection.json` also requires the same `Authorization` header. The local `ai_agent_connection.json` file is the source of the token.
+If bearer auth is enabled, plain `/connection.json` also requires the same `Authorization` header. Use either the local `ai_agent_connection.json` file or the printed agent setup URL as the credential source.
 
 Confirm the health URL from the same network as the agent if possible:
 
@@ -68,6 +68,8 @@ Authorization: Bearer <token>
 ```
 
 If you pass `--auth-token`, use that exact token in the client headers.
+
+If the agent only accepts a URL, use the printed agent setup URL rather than plain `/connection.json`. That setup URL is credential-bearing and should be shared only with the intended agent.
 
 ## Command Blocked
 

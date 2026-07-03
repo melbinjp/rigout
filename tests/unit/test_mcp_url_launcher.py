@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import tarfile
 from pathlib import Path
@@ -6,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+from rigout.mcp_http_server import connection_setup_url, write_connection_file
 from rigout.mcp_url_launcher import (
     cloudflared_asset,
     cloudflared_cache_path,
@@ -26,6 +28,33 @@ def test_cloudflared_asset_names_for_supported_platforms():
 def test_cloudflared_asset_rejects_unsupported_platform():
     with pytest.raises(RuntimeError, match="Unsupported platform"):
         cloudflared_asset("FreeBSD", "x86_64")
+
+
+@pytest.mark.unit
+def test_connection_setup_url_uses_public_base_and_custom_path():
+    setup_url = connection_setup_url("https://agent.example/custom-mcp", "/custom-mcp", "setup secret")
+
+    assert setup_url == "https://agent.example/connection.json?setup_token=setup+secret"
+
+
+@pytest.mark.unit
+def test_write_connection_file_includes_agent_setup_url(tmp_path):
+    connection_file = tmp_path / "connection.json"
+
+    write_connection_file(
+        connection_file,
+        "https://agent.example/mcp",
+        "127.0.0.1",
+        8765,
+        "/mcp",
+        auth_token="secret-token",
+        agent_setup_url="https://agent.example/connection.json?setup_token=setup",
+    )
+
+    data = json.loads(connection_file.read_text(encoding="utf-8"))
+    assert data["agent_setup_url"] == "https://agent.example/connection.json?setup_token=setup"
+    assert data["agent_setup_security"] == "credential_url"
+    assert data["mcp"]["headers"]["Authorization"] == "Bearer secret-token"
 
 
 @pytest.mark.unit
