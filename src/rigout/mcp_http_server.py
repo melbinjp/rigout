@@ -78,15 +78,21 @@ def health_url_from_mcp_url(mcp_url: str, path: str) -> str:
     return mcp_url.rstrip("/") + "/health"
 
 
+_hardware_summary_cache: dict[str, Any] | None = None
+
+
 def get_hardware_summary() -> dict[str, Any]:
-    gpu_info: list[str] = []
-    return {
-        "cpu_count": os.cpu_count() or 0,
-        "gpu_info": gpu_info,
-        "platform": platform.system(),
-        "architecture": platform.machine(),
-        "hostname": socket.gethostname(),
-    }
+    global _hardware_summary_cache
+    if _hardware_summary_cache is None:
+        gpu_info: list[str] = []
+        _hardware_summary_cache = {
+            "cpu_count": os.cpu_count() or 0,
+            "gpu_info": gpu_info,
+            "platform": platform.system(),
+            "architecture": platform.machine(),
+            "hostname": socket.gethostname(),
+        }
+    return _hardware_summary_cache
 
 
 def build_connection_data(
@@ -200,7 +206,11 @@ def create_app(
 
     async def connection(request: Request) -> JSONResponse:
         bearer_authorized = bool(auth_token and request.headers.get("authorization") == f"Bearer {auth_token}")
-        setup_authorized = bool(setup_token and request.query_params.get("setup_token") == setup_token)
+        # Setup tokens should be passed in headers to avoid URL leakage where possible
+        setup_token_header = request.headers.get("x-setup-token")
+        setup_token_query = request.query_params.get("setup_token")
+        setup_authorized = bool(setup_token and (setup_token_header == setup_token or setup_token_query == setup_token))
+
         if auth_token and not (bearer_authorized or setup_authorized):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return JSONResponse(build_connection_data(mcp_url, host, port, path, auth_token))

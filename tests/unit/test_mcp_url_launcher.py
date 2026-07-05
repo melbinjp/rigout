@@ -140,7 +140,7 @@ def test_install_cloudflared_downloads_linux_binary(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGOUT_CACHE_DIR", str(tmp_path))
     expected_path = cloudflared_cache_path("Linux", "x86_64")
 
-    def fake_download(_url: str, destination: Path) -> None:
+    def fake_download(_url: str, destination: Path, _expected_sha256: str | None = None) -> None:
         destination.write_bytes(b"#!/bin/sh\n")
 
     with (
@@ -160,7 +160,7 @@ def test_install_cloudflared_extracts_macos_archive(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGOUT_CACHE_DIR", str(tmp_path))
     expected_path = cloudflared_cache_path("Darwin", "arm64")
 
-    def fake_download(_url: str, destination: Path) -> None:
+    def fake_download(_url: str, destination: Path, _expected_sha256: str | None = None) -> None:
         payload = b"#!/bin/sh\n"
         with tarfile.open(destination, "w:gz") as archive:
             info = tarfile.TarInfo("cloudflared")
