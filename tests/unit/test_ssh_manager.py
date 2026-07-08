@@ -313,3 +313,74 @@ class TestTunnelManager:
 
             assert result["success"] is True
             assert "rigout-local-test" in result["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_local_command_working_directory_and_environment(self, temp_config_file, tmp_path):
+        """Local execution honors working_directory and environment natively."""
+        with patch("rigout.ssh_manager.TunnelManager._start_background_tasks"):
+            manager = TunnelManager(config_file=temp_config_file)
+            endpoint = manager.get_local_endpoint()
+
+            command = "cd" if os.name == "nt" else "pwd"
+            result = await manager.execute_command(endpoint, command, working_directory=str(tmp_path))
+            assert result["success"] is True
+            assert tmp_path.name in result["stdout"]
+
+            command = "echo %RIGOUT_TEST_VAR%" if os.name == "nt" else "echo $RIGOUT_TEST_VAR"
+            result = await manager.execute_command(endpoint, command, environment={"RIGOUT_TEST_VAR": "sentinel-42"})
+            assert result["success"] is True
+            assert "sentinel-42" in result["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_local_command_rejects_missing_working_directory(self, temp_config_file, tmp_path):
+        """A nonexistent working directory is reported instead of crashing."""
+        with patch("rigout.ssh_manager.TunnelManager._start_background_tasks"):
+            manager = TunnelManager(config_file=temp_config_file)
+            endpoint = manager.get_local_endpoint()
+
+            result = await manager.execute_command(endpoint, "pwd", working_directory=str(tmp_path / "missing"))
+            assert result["success"] is False
+            assert "does not exist" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_local_terminal_session_lifecycle(self, temp_config_file):
+        """Terminal sessions work on the local endpoint without SSH."""
+        with patch("rigout.ssh_manager.TunnelManager._start_background_tasks"):
+            manager = TunnelManager(config_file=temp_config_file)
+            endpoint = manager.get_local_endpoint()
+
+            session = await manager.create_terminal_session(endpoint, "unit-session")
+            assert session is not None
+            assert session.session_id == "unit-session"
+            assert "unit-session" in manager.terminal_sessions
+
+            result = await manager.execute_in_session("unit-session", "echo rigout-session-test", timeout=15)
+            assert result["success"] is True
+            assert "rigout-session-test" in result["output"]
+
+            # State persists between commands within the session
+            set_var = "set RIGOUT_SESSION_VAR=persisted" if os.name == "nt" else "RIGOUT_SESSION_VAR=persisted"
+            echo_var = "echo %RIGOUT_SESSION_VAR%" if os.name == "nt" else "echo $RIGOUT_SESSION_VAR"
+            result = await manager.execute_in_session("unit-session", set_var, timeout=15)
+            assert result["success"] is True
+            result = await manager.execute_in_session("unit-session", echo_var, timeout=15)
+            assert result["success"] is True
+            assert "persisted" in result["output"]
+
+            assert manager.close_terminal_session("unit-session") is True
+            assert "unit-session" not in manager.terminal_sessions
+
+    def test_save_config_preserves_other_sections(self, temp_config_file):
+        """Saving endpoints must not destroy unrelated config sections."""
+        with patch("rigout.ssh_manager.TunnelManager._start_background_tasks"):
+            manager = TunnelManager(config_file=temp_config_file)
+            manager.save_config()
+
+            with open(temp_config_file, encoding="utf-8") as f:
+                data = json.load(f)
+
+            assert data["server_config"] == {"name": "test-server", "version": "1.0.0"}
+            assert data["ssh_config"] == {"private_key_path": "/test/key", "username": "testuser"}
+            assert data["cloudflare_config"] == {"domain": "test.com"}
+            assert data["endpoints"] == []
+            assert "last_updated" in data

@@ -1,18 +1,20 @@
-import subprocess
-import time
-import sys
+import contextlib
 import json
-import socket
-import urllib.request
-import urllib.error
 import os
 import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
 from pathlib import Path
+
 
 def get_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
+        s.bind(("", 0))
         return s.getsockname()[1]
+
 
 def run_audit():
     port = get_free_port()
@@ -29,22 +31,22 @@ def run_audit():
 
     # We use -u for unbuffered output to ensure we can read the log lines immediately
     cmd = [
-        sys.executable, "-u", "-m", "rigout.mcp_url_launcher",
-        "--port", str(port),
-        "--connection-file", connection_file,
-        "--tunnel", "none",
-        "--public-url", f"http://localhost:{port}/mcp",
-        "--skip-install"
+        sys.executable,
+        "-u",
+        "-m",
+        "rigout.mcp_url_launcher",
+        "--port",
+        str(port),
+        "--connection-file",
+        connection_file,
+        "--tunnel",
+        "none",
+        "--public-url",
+        f"http://localhost:{port}/mcp",
     ]
 
     process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
-        preexec_fn=os.setsid
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env, preexec_fn=os.setsid
     )
 
     setup_url = None
@@ -104,17 +106,16 @@ def run_audit():
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         process.wait(timeout=5)
-    except:
-        try:
+    except (OSError, subprocess.TimeoutExpired):
+        with contextlib.suppress(OSError):
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except:
-            pass
 
     # Cleanup connection file
     if Path(connection_file).exists():
         Path(connection_file).unlink()
 
     return success
+
 
 if __name__ == "__main__":
     if run_audit():

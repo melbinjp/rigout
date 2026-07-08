@@ -27,9 +27,10 @@ class SecurityValidator:
         r"format\s+",
         r"del\s+/[sq]\s+",
         r"rmdir\s+/[sq]\s+",
-        r">\s*/dev/sd[a-z]",
-        r"curl\s+.*\|\s*bash",
-        r"wget\s+.*\|\s*bash",
+        # Raw disk devices and kernel memory, in either redirect direction
+        r"[<>]\s*/dev/(sd[a-z]|hd[a-z]|nvme\w*|mmcblk\w*|mem\b|kmem|port)",
+        r"curl\s+.*\|\s*(ba)?sh\b",
+        r"wget\s+.*\|\s*(ba)?sh\b",
         r"eval\s+\$\(",
         r"`[^`]*`",
         r"\$\([^)]*\)",
@@ -106,6 +107,37 @@ class SecurityValidator:
         "lsmem",
         "iostat",
         "vmstat",
+        "head",
+        "tail",
+        "awk",
+        "sed",
+        "wc",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "tee",
+        "xargs",
+        "which",
+        "date",
+        "hostname",
+        "uptime",
+        "nproc",
+        "ss",
+        "netstat",
+        "ip",
+        "ping",
+        "sysctl",
+        "wget",
+        "curl",
+        "conda",
+        "cargo",
+        "go",
+        "rustc",
+        "powershell",
+        "sw_vers",
+        "system_profiler",
+        "vm_stat",
     ]
 
     def __init__(self):
@@ -181,38 +213,26 @@ class SecurityValidator:
                 self.blocked_commands.append(command)
                 return False, f"Command contains dangerous pattern: {pattern}"
 
-        # Check for command injection attempts
-        injection_patterns = [
-            r";\s*[^;]+",  # Command chaining with semicolon
-            r"&&\s*[^&]+",  # Command chaining with &&
-            r"\|\s*[^|]+",  # Piping to potentially dangerous commands
-            r"`[^`]+`",  # Command substitution with backticks
-            r"\$\([^)]+\)",  # Command substitution with $()
-            r">\s*/dev/",  # Redirecting to device files
-            r"<\s*/dev/",  # Reading from device files
-        ]
-
-        for pattern in injection_patterns:
-            matches = re.findall(pattern, command)
-            for match in matches:
-                # Check if the chained command is safe
-                chained_cmd = re.sub(r"^[;&|`$()>\s]+", "", match).split()[0]
-                if chained_cmd not in self.ALLOWED_COMMANDS:
-                    return False, f"Potentially dangerous command chaining: {match}"
-
-        # Extract the main command
-        main_command = command.split()[0]
-        if main_command.lower() == "sudo":
-            if not allow_sudo:
-                return False, "Sudo commands not allowed in this context"
-            if len(command.split()) < 2:
-                return False, "Incomplete sudo command"
-            main_command = command.split()[1]
-
-        # Check if main command is in allowed list
-        if main_command not in self.ALLOWED_COMMANDS:
-            logger.warning(f"Command not in allowed list: {main_command}")
-            # Don't block, but log for monitoring
+        # Inspect every segment of a chained/piped command the same way as the
+        # main command: sudo is gated by allow_sudo, destructive patterns are
+        # already blocked above, and unrecognized commands are logged but not
+        # blocked (blanket blocking breaks routine pipelines like `ps | head`).
+        segments = re.split(r"&&|\|\||[;|]", command)
+        for segment in segments:
+            words = segment.strip().split()
+            if not words:
+                continue
+            segment_command = words[0]
+            if segment_command.lower() == "sudo":
+                if not allow_sudo:
+                    self.blocked_commands.append(command)
+                    return False, "Sudo commands not allowed in this context"
+                if len(words) < 2:
+                    return False, "Incomplete sudo command"
+                segment_command = words[1]
+            if segment_command not in self.ALLOWED_COMMANDS:
+                logger.warning(f"Command not in allowed list: {segment_command}")
+                # Don't block, but log for monitoring
 
         return True, ""
 

@@ -79,7 +79,7 @@ Rigout exposes:
 - `environment_setup`: create Python, Node, Docker, or Conda workspaces.
 - `manage_tunnels`: add, list, test, and fail over to SSH endpoints.
 - `connect_hardware` and `get_hardware_info`: verify available hardware.
-- `create_terminal_session`, `execute_in_terminal`, `list_terminal_sessions`, `close_terminal_session`: persistent SSH-backed terminal sessions.
+- `create_terminal_session`, `execute_in_terminal`, `list_terminal_sessions`, `close_terminal_session`: persistent terminal sessions that keep shell state between commands, on the local device or over SSH.
 
 If no SSH endpoint is configured, Rigout uses a local-device endpoint. That makes a fresh one-command server immediately useful on the machine running Rigout.
 
@@ -91,7 +91,9 @@ Default controls:
 
 - Public/tunnel mode generates bearer auth unless `--no-auth` is passed.
 - Localhost mode has no bearer auth unless `--auth-token` is passed.
-- Command validation blocks common destructive patterns unless the caller explicitly uses `bypass_security`.
+- Tokens are handed to the server process through environment variables, not command-line arguments, so they do not appear in the process list.
+- The connection file containing the bearer token is written with owner-only permissions on POSIX systems.
+- Command validation blocks common destructive patterns unless the caller explicitly uses `bypass_security`. Routine pipelines and command chains are allowed; unrecognized commands are logged for auditing rather than blocked.
 - Outputs are sanitized for common secret patterns before returning to the agent.
 - Command activity and security events are written to `mcp-hardware-server.log`.
 - Per-endpoint command rate limiting is enabled.
@@ -112,6 +114,12 @@ To disable automatic downloads:
 
 ```bash
 rigout --tunnel cloudflare --no-cloudflared-download
+```
+
+To verify the downloaded binary against a known checksum:
+
+```bash
+RIGOUT_CLOUDFLARED_SHA256=<sha256> rigout --tunnel cloudflare
 ```
 
 To avoid printing a credential-bearing setup URL:

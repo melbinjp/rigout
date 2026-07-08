@@ -22,7 +22,8 @@ async def handle_docker_operations(arguments: dict) -> CallToolResult:
         if options.get("detach", False):
             docker_cmd += " -d"
         if options.get("interactive", False):
-            docker_cmd += " -it"
+            # No TTY is available for command execution, so use -i without -t
+            docker_cmd += " -i"
         if options.get("remove", True):
             docker_cmd += " --rm"
 
@@ -34,7 +35,8 @@ async def handle_docker_operations(arguments: dict) -> CallToolResult:
     elif operation == "exec":
         container = arguments.get("container_name", "")
         cmd = arguments.get("command", "")
-        command = f"docker exec -it {shell_quote(container)} {cmd}"
+        # -t requires a TTY, which command execution does not have
+        command = f"docker exec {shell_quote(container)} {cmd}"
 
     elif operation == "stop":
         container = arguments.get("container_name", "")

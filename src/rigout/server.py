@@ -152,7 +152,7 @@ async def handle_list_tools() -> list[Tool]:
                     "action": {
                         "type": "string",
                         "description": "Action to perform",
-                        "enum": ["add", "remove", "test", "list", "failover", "rotate"],
+                        "enum": ["add", "remove", "test", "list", "failover"],
                     },
                     "hostname": {"type": "string", "description": "Hostname for add/remove actions"},
                     "username": {"type": "string", "description": "Username for SSH connection"},

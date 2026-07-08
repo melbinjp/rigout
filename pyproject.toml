@@ -100,7 +100,7 @@ warn_unused_configs = true
 files = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["paramiko.*", "mcp.*"]
+module = ["paramiko.*", "mcp.*", "starlette.*", "uvicorn.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

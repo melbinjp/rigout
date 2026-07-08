@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from rigout.mcp_http_server import connection_setup_url, write_connection_file
+from rigout.mcp_http_server import connection_setup_url, tokens_match, write_connection_file
 from rigout.mcp_url_launcher import (
     cloudflared_asset,
     cloudflared_cache_path,
@@ -57,6 +57,17 @@ def test_write_connection_file_includes_agent_setup_url(tmp_path):
     assert data["agent_setup_url"] == "https://agent.example/connection.json?setup_token=setup"
     assert data["agent_setup_security"] == "credential_url"
     assert data["mcp"]["headers"]["Authorization"] == "Bearer secret-token"
+    if os.name == "posix":
+        # File contains a bearer token, so it must be owner-only
+        assert (connection_file.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.unit
+def test_tokens_match_is_none_safe_and_type_flexible():
+    assert tokens_match("Bearer abc", b"Bearer abc")
+    assert tokens_match(b"Bearer abc", "Bearer abc")
+    assert not tokens_match(None, "Bearer abc")
+    assert not tokens_match("Bearer abd", "Bearer abc")
 
 
 def launcher_args(**overrides):
@@ -74,19 +85,22 @@ def launcher_args(**overrides):
 
 
 @pytest.mark.unit
-def test_start_server_passes_public_url_and_setup_token():
+def test_start_server_passes_public_url_and_tokens_via_environment():
     args = launcher_args(json_response=True, stateless=True, auth_token="auth-token")
 
     with patch("rigout.mcp_url_launcher.subprocess.Popen") as popen:
         start_server(args, public_url="https://agent.example/mcp", setup_token="setup-token")
 
     command = popen.call_args.args[0]
+    env = popen.call_args.kwargs["env"]
     assert command[command.index("--public-url") + 1] == "https://agent.example/mcp"
-    assert command[command.index("--setup-token") + 1] == "setup-token"
-    assert command[command.index("--auth-token") + 1] == "auth-token"
     assert "--json-response" in command
     assert "--stateless" in command
-    assert "--serve-connection-file" not in command
+    # Tokens must not appear in argv (visible in the process list)
+    assert "auth-token" not in command
+    assert "setup-token" not in command
+    assert env["RIGOUT_AUTH_TOKEN"] == "auth-token"
+    assert env["RIGOUT_SETUP_TOKEN"] == "setup-token"
 
 
 @pytest.mark.unit
@@ -97,9 +111,10 @@ def test_start_server_omits_public_setup_arguments_for_local_start():
         start_server(args)
 
     command = popen.call_args.args[0]
+    env = popen.call_args.kwargs["env"]
     assert "--public-url" not in command
-    assert "--setup-token" not in command
-    assert "--serve-connection-file" not in command
+    assert "RIGOUT_AUTH_TOKEN" not in env
+    assert "RIGOUT_SETUP_TOKEN" not in env
 
 
 @pytest.mark.unit

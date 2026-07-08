@@ -42,30 +42,6 @@ from .mcp_http_server import (
 CLOUDFLARE_URL_PATTERN = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 CLOUDFLARED_DOWNLOAD_BASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download"
 
-# SHA-256 checksums for latest cloudflared releases (2025.2.0)
-# In a real scenario, these should be updated or fetched from a trusted source.
-CLOUDFLARED_CHECKSUMS = {} # {
-#     "cloudflared-linux-amd64": "4e18375687e85746979603597df9408b02c0b57e799298587b1c313a3f7f02f9",
-#     "cloudflared-linux-386": "97d396798089f302b740523e32b07e8688404a84949514697779f45851412586",
-#     "cloudflared-linux-arm": "f784d720a2479e000787f739603597df9408b02c0b57e799298587b1c313a3f7f",
-#     "cloudflared-linux-arm64": "981432f801646294711883597df9408b02c0b57e799298587b1c313a3f7f02f9",
-#     "cloudflared-darwin-amd64.tgz": "d748375687e85746979603597df9408b02c0b57e799298587b1c313a3f7f02f9",
-#     "cloudflared-darwin-arm64.tgz": "651432f801646294711883597df9408b02c0b57e799298587b1c313a3f7f02f9",
-#     "cloudflared-windows-amd64.exe": "87e85746979603597df9408b02c0b57e799298587b1c313a3f7f02f94e183756",
-#     "cloudflared-windows-386.exe": "2b740523e32b07e8688404a84949514697779f4585141258697d396798089f30",
-# }
-
-
-def install_dependencies() -> None:
-    requirements = Path("requirements.txt")
-    if not requirements.exists():
-        return
-    print("Installing Python dependencies...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
-        check=True,
-    )
-
 
 def wait_for_health(url: str, timeout: int = 30) -> bool:
     deadline = time.time() + timeout
@@ -178,7 +154,10 @@ def install_cloudflared() -> Path:
 
     print(f"cloudflared is not installed. Downloading {asset_name}...")
     try:
-        expected_sha256 = CLOUDFLARED_CHECKSUMS.get(asset_name)
+        # Optional pinning: verify against a user-supplied checksum. The
+        # download URL tracks Cloudflare's latest release, so a fixed
+        # checksum cannot be baked in here.
+        expected_sha256 = os.getenv("RIGOUT_CLOUDFLARED_SHA256")
         download_file(download_url, temporary_download, expected_sha256)
         if is_archive:
             extract_cloudflared_archive(temporary_download, target)
@@ -239,12 +218,14 @@ def start_server(
         command.append("--json-response")
     if args.stateless:
         command.append("--stateless")
-    if args.auth_token:
-        command.extend(["--auth-token", args.auth_token])
-    if setup_token:
-        command.extend(["--setup-token", setup_token])
 
     env = os.environ.copy()
+    # Tokens travel via the environment so they never show up in the
+    # process list (argv is world-readable on most platforms).
+    if args.auth_token:
+        env["RIGOUT_AUTH_TOKEN"] = args.auth_token
+    if setup_token:
+        env["RIGOUT_SETUP_TOKEN"] = setup_token
     env["PYTHONUNBUFFERED"] = "1"
     src_path = str(Path(__file__).resolve().parents[1])
     existing_pythonpath = env.get("PYTHONPATH")
@@ -342,7 +323,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Do not generate a bearer token for public/tunnel URLs. Unsafe for internet-exposed servers.",
     )
-    parser.add_argument("--skip-install", action="store_true", help="Do not install Python requirements")
     parser.add_argument("--json-response", action="store_true")
     parser.add_argument("--stateless", action="store_true")
     return parser.parse_args(argv)
@@ -380,9 +360,6 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, shutdown)
 
     try:
-        if not args.skip_install:
-            install_dependencies()
-
         tunnel_base_url = None
         if args.tunnel == "cloudflare":
             print("Starting Cloudflare quick tunnel...")
@@ -427,7 +404,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("Cloudflare tunnel stopped unexpectedly")
             time.sleep(1)
 
-        return server_process.returncode or 0
+        return_code = server_process.returncode or 0
+        if return_code in (-signal.SIGTERM, -signal.SIGINT):
+            return 0  # normal shutdown via Ctrl+C or terminate
+        return return_code
     except Exception as exc:
         print(f"Setup failed: {exc}", file=sys.stderr)
         stop_process(tunnel_process)

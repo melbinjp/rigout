@@ -1,10 +1,8 @@
 from mcp.types import CallToolResult, TextContent
 
 from ..ssh_manager import (
-    build_env_assignments,
     get_tunnel_manager,
     shell_join,
-    shell_quote,
 )
 
 
@@ -20,21 +18,17 @@ async def handle_execute_command(arguments: dict) -> CallToolResult:
     if not endpoint:
         return CallToolResult(content=[TextContent(type="text", text="No available hardware endpoints")])
 
-    enhanced_command = ""
-    if working_directory != "~":
-        enhanced_command += f"cd {shell_quote(working_directory)} && "
-
-    if environment:
-        env_vars = build_env_assignments(environment)
-        enhanced_command += f"{env_vars} "
-
     if use_sudo and not command.startswith("sudo"):
-        enhanced_command += "sudo "
-
-    enhanced_command += command
+        command = f"sudo {command}"
 
     result = await get_tunnel_manager().execute_command(
-        endpoint, enhanced_command, timeout, allow_sudo=use_sudo, bypass_security=bypass_security
+        endpoint,
+        command,
+        timeout,
+        allow_sudo=use_sudo,
+        bypass_security=bypass_security,
+        working_directory=working_directory,
+        environment=environment,
     )
 
     if result["success"]:

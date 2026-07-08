@@ -7,11 +7,13 @@ at a URL, normally http://127.0.0.1:8765/mcp or a public tunnel URL.
 """
 
 import argparse
+import hmac
 import json
 import os
 import platform
 import secrets
 import socket
+import stat
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -34,6 +36,15 @@ DEFAULT_PATH = "/mcp"
 DEFAULT_CONNECTION_FILE = "ai_agent_connection.json"
 
 
+def tokens_match(provided: str | bytes | None, expected: str | bytes) -> bool:
+    """Compare secrets in constant time to avoid timing side channels."""
+    if provided is None:
+        return False
+    provided_bytes = provided.encode() if isinstance(provided, str) else provided
+    expected_bytes = expected.encode() if isinstance(expected, str) else expected
+    return hmac.compare_digest(provided_bytes, expected_bytes)
+
+
 class BearerAuthASGIApp:
     """Protect an ASGI app with a static bearer token."""
 
@@ -43,7 +54,7 @@ class BearerAuthASGIApp:
 
     async def __call__(self, scope, receive, send) -> None:
         headers = dict(scope.get("headers") or [])
-        if headers.get(b"authorization") != self.expected:
+        if not tokens_match(headers.get(b"authorization"), self.expected):
             response = JSONResponse({"error": "unauthorized"}, status_code=401)
             await response(scope, receive, send)
             return
@@ -165,6 +176,9 @@ def write_connection_file(
         json.dumps(build_connection_data(mcp_url, host, port, mcp_path, auth_token, agent_setup_url), indent=2),
         encoding="utf-8",
     )
+    if os.name == "posix":
+        # The file can contain a bearer token; keep it owner-readable only
+        connection_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
 def create_app(
@@ -205,11 +219,16 @@ def create_app(
         )
 
     async def connection(request: Request) -> JSONResponse:
-        bearer_authorized = bool(auth_token and request.headers.get("authorization") == f"Bearer {auth_token}")
+        bearer_authorized = bool(
+            auth_token and tokens_match(request.headers.get("authorization"), f"Bearer {auth_token}")
+        )
         # Setup tokens should be passed in headers to avoid URL leakage where possible
         setup_token_header = request.headers.get("x-setup-token")
         setup_token_query = request.query_params.get("setup_token")
-        setup_authorized = bool(setup_token and (setup_token_header == setup_token or setup_token_query == setup_token))
+        setup_authorized = bool(
+            setup_token
+            and (tokens_match(setup_token_header, setup_token) or tokens_match(setup_token_query, setup_token))
+        )
 
         if auth_token and not (bearer_authorized or setup_authorized):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -245,8 +264,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--path", default=DEFAULT_PATH, help="MCP path, default: /mcp")
     parser.add_argument("--public-url", help="Public MCP URL to write into connection files")
     parser.add_argument("--connection-file", default=DEFAULT_CONNECTION_FILE)
-    parser.add_argument("--setup-token", help="Allow this setup token to fetch /connection.json")
-    parser.add_argument("--auth-token", help="Bearer token required for MCP requests")
+    parser.add_argument(
+        "--setup-token",
+        default=os.environ.get("RIGOUT_SETUP_TOKEN"),
+        help="Allow this setup token to fetch /connection.json (or set RIGOUT_SETUP_TOKEN)",
+    )
+    parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("RIGOUT_AUTH_TOKEN"),
+        help="Bearer token required for MCP requests (or set RIGOUT_AUTH_TOKEN)",
+    )
     parser.add_argument(
         "--generate-token", action="store_true", help="Generate a bearer token and write it to the connection file"
     )
