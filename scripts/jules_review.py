@@ -83,6 +83,22 @@ def jules_request(method: str, path: str, api_key: str, **kwargs) -> requests.Re
     return response
 
 
+def jules_poll_get(path: str, api_key: str, **kwargs) -> dict | None:
+    """GET for use inside poll_for_review only. Returns None on 404 instead
+    of raising: right after session creation, the session and its
+    /activities sub-resource can 404 for a few seconds before the backend
+    catches up. Since the caller already knows the session exists (it just
+    created it), a 404 here means "not ready yet", not "doesn't exist"."""
+    headers = {"X-Goog-Api-Key": api_key, "Content-Type": "application/json"}
+    response = request_with_retry("GET", f"{JULES_API}/{path}", headers=headers, **kwargs)
+    if response.status_code == 404:
+        return None
+    if response.status_code in (401, 403):
+        raise RuntimeError(f"Jules API rejected the request ({response.status_code}). Check JULES_API_KEY.")
+    response.raise_for_status()
+    return response.json()
+
+
 def load_pull_request_event() -> dict:
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
     if event_name == "pull_request_target":
@@ -286,8 +302,9 @@ def poll_for_review(session_name: str, api_key: str, timeout_minutes: int) -> tu
     deadline = time.monotonic() + timeout_minutes * 60
     last_state = None
     while time.monotonic() < deadline:
-        session = jules_request("GET", session_name, api_key).json()
-        last_state = session.get("state")
+        session = jules_poll_get(session_name, api_key)
+        if session is not None:
+            last_state = session.get("state")
 
         page_token = None
         latest_message: str | None = None
@@ -296,7 +313,9 @@ def poll_for_review(session_name: str, api_key: str, timeout_minutes: int) -> tu
             params = {"pageSize": 100}
             if page_token:
                 params["pageToken"] = page_token
-            activities = jules_request("GET", f"{session_name}/activities", api_key, params=params).json()
+            activities = jules_poll_get(f"{session_name}/activities", api_key, params=params)
+            if activities is None:
+                break  # not ready yet; fall through to the sleep+retry below
             for activity in activities.get("activities", []):
                 if "agentMessaged" in activity:
                     latest_message = activity["agentMessaged"]["agentMessage"]
