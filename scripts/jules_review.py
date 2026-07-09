@@ -137,6 +137,9 @@ def is_trusted_author(pr_author: str, owner: str) -> bool:
     return pr_author.lower() in trusted
 
 
+SECRETLESS_PR_AUTHORS = {"dependabot[bot]"}
+
+
 def check_skip_conditions(pr: dict, owner: str, repo: str) -> None:
     if pr.get("draft") and env_bool("JULES_REVIEW_SKIP_DRAFTS", True):
         raise ReviewSkippedError("draft PR")
@@ -145,6 +148,18 @@ def check_skip_conditions(pr: dict, owner: str, repo: str) -> None:
     is_fork = head_repo.get("full_name") != f"{owner}/{repo}"
     if is_fork and env_bool("JULES_REVIEW_SKIP_FORKS", True):
         raise ReviewSkippedError("fork PR (JULES_REVIEW_SKIP_FORKS=true)")
+
+    pr_author = pr.get("user", {}).get("login", "")
+    if pr_author in SECRETLESS_PR_AUTHORS:
+        # GitHub withholds repository secrets (JULES_API_KEY included) from
+        # workflow runs triggered by Dependabot PRs by default, the same
+        # class of protection used for fork PRs - a compromised/malicious
+        # dependency bump shouldn't be able to trigger a workflow that has
+        # access to secrets. There is no JULES_API_KEY to call the API with,
+        # so failing loudly every time is just noise; skip cleanly instead.
+        raise ReviewSkippedError(
+            f"PR author {pr_author!r} has no access to repository secrets (GitHub platform restriction)"
+        )
 
     bypass_label = os.environ.get("JULES_REVIEW_BYPASS_LABEL", "jules-override")
     labels = {label["name"] for label in pr.get("labels", [])}
