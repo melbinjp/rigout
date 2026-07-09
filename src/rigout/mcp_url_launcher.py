@@ -9,6 +9,7 @@ Examples:
 """
 
 import argparse
+import hashlib
 import os
 import platform
 import queue
@@ -31,6 +32,7 @@ from .mcp_http_server import (
     DEFAULT_HOST,
     DEFAULT_PATH,
     DEFAULT_PORT,
+    connection_setup_url,
     health_url_from_mcp_url,
     local_url,
     normalize_path,
@@ -39,17 +41,6 @@ from .mcp_http_server import (
 
 CLOUDFLARE_URL_PATTERN = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 CLOUDFLARED_DOWNLOAD_BASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download"
-
-
-def install_dependencies() -> None:
-    requirements = Path("requirements.txt")
-    if not requirements.exists():
-        return
-    print("Installing Python dependencies...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
-        check=True,
-    )
 
 
 def wait_for_health(url: str, timeout: int = 30) -> bool:
@@ -119,9 +110,21 @@ def make_executable(path: Path) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def download_file(url: str, destination: Path) -> None:
+def verify_checksum(path: Path, expected_sha256: str) -> bool:
+    sha256_hash = hashlib.sha256()
+    with path.open("rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest() == expected_sha256
+
+
+def download_file(url: str, destination: Path, expected_sha256: str | None = None) -> None:
     with urllib.request.urlopen(url, timeout=120) as response, destination.open("wb") as output:
         shutil.copyfileobj(response, output)
+
+    if expected_sha256 and not verify_checksum(destination, expected_sha256):
+        destination.unlink()
+        raise RuntimeError(f"Checksum verification failed for {url}")
 
 
 def extract_cloudflared_archive(archive_path: Path, destination: Path) -> None:
@@ -151,7 +154,11 @@ def install_cloudflared() -> Path:
 
     print(f"cloudflared is not installed. Downloading {asset_name}...")
     try:
-        download_file(download_url, temporary_download)
+        # Optional pinning: verify against a user-supplied checksum. The
+        # download URL tracks Cloudflare's latest release, so a fixed
+        # checksum cannot be baked in here.
+        expected_sha256 = os.getenv("RIGOUT_CLOUDFLARED_SHA256")
+        download_file(download_url, temporary_download, expected_sha256)
         if is_archive:
             extract_cloudflared_archive(temporary_download, target)
         else:
@@ -185,7 +192,12 @@ def resolve_cloudflared_binary(cloudflared_path: str | None = None, allow_downlo
     )
 
 
-def start_server(args: argparse.Namespace) -> subprocess.Popen:
+def start_server(
+    args: argparse.Namespace,
+    *,
+    public_url: str | None = None,
+    setup_token: str | None = None,
+) -> subprocess.Popen:
     command = [
         sys.executable,
         "-m",
@@ -196,16 +208,24 @@ def start_server(args: argparse.Namespace) -> subprocess.Popen:
         str(args.port),
         "--path",
         args.path,
+        "--connection-file",
+        args.connection_file,
         "--no-write-connection",
     ]
+    if public_url:
+        command.extend(["--public-url", public_url])
     if args.json_response:
         command.append("--json-response")
     if args.stateless:
         command.append("--stateless")
-    if args.auth_token:
-        command.extend(["--auth-token", args.auth_token])
 
     env = os.environ.copy()
+    # Tokens travel via the environment so they never show up in the
+    # process list (argv is world-readable on most platforms).
+    if args.auth_token:
+        env["RIGOUT_AUTH_TOKEN"] = args.auth_token
+    if setup_token:
+        env["RIGOUT_SETUP_TOKEN"] = setup_token
     env["PYTHONUNBUFFERED"] = "1"
     src_path = str(Path(__file__).resolve().parents[1])
     existing_pythonpath = env.get("PYTHONPATH")
@@ -286,6 +306,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--public-url", help="Use an already-created public base URL or full MCP URL")
     parser.add_argument("--connection-file", default=DEFAULT_CONNECTION_FILE)
     parser.add_argument("--auth-token", help="Bearer token required for MCP requests")
+    parser.add_argument("--setup-token", help="Use this token for the generated agent setup URL")
+    parser.add_argument(
+        "--no-agent-setup-url",
+        action="store_true",
+        help="Do not generate a credential-bearing setup URL for public/tunnel mode",
+    )
     parser.add_argument("--cloudflared-path", help="Use this cloudflared binary instead of PATH/cache lookup")
     parser.add_argument(
         "--no-cloudflared-download",
@@ -297,7 +323,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Do not generate a bearer token for public/tunnel URLs. Unsafe for internet-exposed servers.",
     )
-    parser.add_argument("--skip-install", action="store_true", help="Do not install Python requirements")
     parser.add_argument("--json-response", action="store_true")
     parser.add_argument("--stateless", action="store_true")
     return parser.parse_args(argv)
@@ -316,8 +341,12 @@ def resolve_public_mcp_url(args: argparse.Namespace, tunnel_base_url: str | None
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     args.path = normalize_path(args.path)
-    if not args.auth_token and not args.no_auth and (args.tunnel != "none" or args.public_url):
+    is_public = bool(args.tunnel != "none" or args.public_url)
+    if not args.auth_token and not args.no_auth and is_public:
         args.auth_token = secrets.token_urlsafe(32)
+    setup_token = None
+    if args.auth_token and is_public and not args.no_agent_setup_url:
+        setup_token = args.setup_token or secrets.token_urlsafe(32)
 
     server_process: subprocess.Popen | None = None
     tunnel_process: subprocess.Popen | None = None
@@ -331,14 +360,6 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, shutdown)
 
     try:
-        if not args.skip_install:
-            install_dependencies()
-
-        server_process = start_server(args)
-        health_url = health_url_from_mcp_url(local_url(args.host, args.port, args.path), args.path)
-        if not wait_for_health(health_url):
-            raise RuntimeError(f"MCP server did not become healthy at {health_url}")
-
         tunnel_base_url = None
         if args.tunnel == "cloudflare":
             print("Starting Cloudflare quick tunnel...")
@@ -349,7 +370,21 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         mcp_url = resolve_public_mcp_url(args, tunnel_base_url)
-        write_connection_file(args.connection_file, mcp_url, args.host, args.port, args.path, args.auth_token)
+        server_process = start_server(args, public_url=mcp_url, setup_token=setup_token)
+        local_health_url = health_url_from_mcp_url(local_url(args.host, args.port, args.path), args.path)
+        if not wait_for_health(local_health_url):
+            raise RuntimeError(f"MCP server did not become healthy at {local_health_url}")
+
+        setup_url = connection_setup_url(mcp_url, args.path, setup_token) if setup_token else None
+        write_connection_file(
+            args.connection_file,
+            mcp_url,
+            args.host,
+            args.port,
+            args.path,
+            args.auth_token,
+            agent_setup_url=setup_url,
+        )
 
         print()
         print("Hardware MCP server is running.")
@@ -358,6 +393,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Connection file: {Path(args.connection_file).resolve()}")
         if args.auth_token:
             print("Auth: bearer token written to connection file")
+        if setup_url:
+            print(f"Agent setup URL: {setup_url}")
+            print("Paste this URL to your AI agent so it can configure itself.")
+            print("Treat the agent setup URL like a password; it can fetch the bearer token.")
         print("Press Ctrl+C to stop.")
 
         while server_process.poll() is None:
@@ -365,7 +404,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("Cloudflare tunnel stopped unexpectedly")
             time.sleep(1)
 
-        return server_process.returncode or 0
+        return_code = server_process.returncode or 0
+        if return_code in (-signal.SIGTERM, -signal.SIGINT):
+            return 0  # normal shutdown via Ctrl+C or terminate
+        return return_code
     except Exception as exc:
         print(f"Setup failed: {exc}", file=sys.stderr)
         stop_process(tunnel_process)

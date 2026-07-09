@@ -16,6 +16,8 @@ rigout --public-url https://rigout.example.com
 rigout --auth-token "$RIGOUT_TOKEN"
 rigout --tunnel cloudflare --cloudflared-path /path/to/cloudflared
 rigout --tunnel cloudflare --no-cloudflared-download
+rigout --tunnel cloudflare --setup-token "$RIGOUT_SETUP_TOKEN"
+rigout --tunnel cloudflare --no-agent-setup-url
 python -m rigout.mcp_url_launcher --tunnel cloudflare
 ```
 
@@ -65,8 +67,8 @@ Trusted publisher fields:
 Create and push a version tag only after the publisher is configured:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 ## Cleanup Before Publishing

@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -17,7 +18,7 @@ from typing import Any
 
 import paramiko
 
-from .terminal_session import TerminalSession
+from .terminal_session import LocalTerminalSession, TerminalSession
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,84 @@ def heredoc_redirect(content: str, destination: str) -> str:
     """Create a shell heredoc that writes content to destination safely."""
     delimiter = f"EOF_{uuid.uuid4().hex}"
     return f"cat > {shell_quote(destination)} <<'{delimiter}'\n{content}\n{delimiter}"
+
+
+def load_ssh_private_key(path: str) -> paramiko.PKey:
+    """Load a private key of any supported type (Ed25519, RSA, ECDSA)."""
+    try:
+        if hasattr(paramiko.PKey, "from_path"):
+            return paramiko.PKey.from_path(path)
+    except paramiko.ssh_exception.PasswordRequiredException as exc:
+        raise SecurityError("Private key is password protected - not supported") from exc
+    except (paramiko.SSHException, OSError, ValueError):
+        pass  # fall back to explicit per-type attempts below
+
+    last_error: Exception | None = None
+    for key_cls in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
+        try:
+            return key_cls.from_private_key_file(path)
+        except paramiko.ssh_exception.PasswordRequiredException as exc:
+            raise SecurityError("Private key is password protected - not supported") from exc
+        except Exception as exc:
+            last_error = exc
+    raise SecurityError(f"Failed to load private key: {last_error}")
+
+
+def _local_memory_gb() -> float:
+    """Best-effort total physical memory of the machine running Rigout."""
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/meminfo", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("MemTotal:"):
+                        return round(int(line.split()[1]) / (1024**2), 2)
+        elif sys.platform == "darwin":
+            output = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5, check=True
+            )
+            return round(int(output.stdout.strip()) / (1024**3), 2)
+        elif sys.platform == "win32":
+            import ctypes
+
+            class MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):  # type: ignore[attr-defined]
+                return round(status.ullTotalPhys / (1024**3), 2)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _local_gpu_info() -> list[str]:
+    """Best-effort GPU names on the machine running Rigout."""
+    if shutil.which("nvidia-smi"):
+        try:
+            output = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            names = [line.strip() for line in output.stdout.splitlines() if line.strip()]
+            if names:
+                return names
+        except Exception:
+            pass
+    return []
 
 
 class SecurityError(Exception):
@@ -154,7 +233,7 @@ class TunnelManager:
         self.endpoints: list[TunnelEndpoint] = []
         self.active_endpoint: TunnelEndpoint | None = None
         self.hardware_cache: dict[str, HardwareInfo] = {}
-        self.terminal_sessions: dict[str, TerminalSession] = {}
+        self.terminal_sessions: dict[str, TerminalSession | LocalTerminalSession] = {}
         self.cf_email: str | None = None
         self.cf_api_key: str | None = None
         self.ssh_private_key: str | None = None
@@ -200,11 +279,8 @@ class TunnelManager:
 
         # Close all terminal sessions
         for session in list(self.terminal_sessions.values()):
-            try:
-                session.channel.close()
-                session.ssh_client.close()
-            except Exception:
-                pass
+            with contextlib.suppress(Exception):
+                session.close()
 
         self.terminal_sessions.clear()
         self._connection_pool.clear()
@@ -359,11 +435,19 @@ class TunnelManager:
         logger.info(f"Created default configuration file: {self.config_file}")
 
     def save_config(self):
-        """Save tunnel endpoints to configuration file"""
-        data = {
-            "endpoints": [asdict(endpoint) for endpoint in self.endpoints],
-            "last_updated": datetime.now().isoformat(),
-        }
+        """Save tunnel endpoints to configuration file, preserving other sections"""
+        data: dict[str, Any] = {}
+        config_path = Path(self.config_file)
+        if config_path.exists():
+            try:
+                existing = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    data = existing
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning(f"Could not read existing config, rewriting it: {e}")
+
+        data["endpoints"] = [asdict(endpoint) for endpoint in self.endpoints]
+        data["last_updated"] = datetime.now().isoformat()
         # Convert datetime objects to strings for JSON serialization
         for endpoint_data in data["endpoints"]:
             if endpoint_data.get("last_tested"):
@@ -406,16 +490,7 @@ class TunnelManager:
             ssh_client = paramiko.SSHClient()
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-            # Load private key with error handling
-            try:
-                if endpoint.private_key_path.endswith(".pem") or "rsa" in endpoint.private_key_path.lower():
-                    private_key = paramiko.RSAKey.from_private_key_file(endpoint.private_key_path)
-                else:
-                    private_key = paramiko.Ed25519Key.from_private_key_file(endpoint.private_key_path)
-            except paramiko.ssh_exception.PasswordRequiredException:
-                raise SecurityError("Private key is password protected - not supported")
-            except Exception as e:
-                raise SecurityError(f"Failed to load private key: {e}")
+            private_key = load_ssh_private_key(endpoint.private_key_path)
 
             # Connect with security settings
             ssh_client.connect(
@@ -500,8 +575,8 @@ class TunnelManager:
                 free = 0
             info = HardwareInfo(
                 cpu_count=os.cpu_count() or 0,
-                memory_gb=0.0,
-                gpu_info=["Not probed"],
+                memory_gb=_local_memory_gb(),
+                gpu_info=_local_gpu_info(),
                 disk_space_gb=round(free / (1024**3), 2) if free else 0.0,
                 platform=platform.system(),
                 architecture=platform.machine(),
@@ -514,7 +589,7 @@ class TunnelManager:
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-            private_key = paramiko.Ed25519Key.from_private_key_file(endpoint.private_key_path)
+            private_key = load_ssh_private_key(endpoint.private_key_path)
             ssh.connect(
                 hostname=endpoint.hostname, port=endpoint.port, username=endpoint.username, pkey=private_key, timeout=10
             )
@@ -563,10 +638,14 @@ class TunnelManager:
         timeout: int = 30,
         allow_sudo: bool = False,
         bypass_security: bool = False,
+        working_directory: str | None = None,
+        environment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Execute command on remote system with security validation"""
         if self._is_local_endpoint(endpoint):
-            return await self._execute_local_command(endpoint, command, timeout, allow_sudo, bypass_security)
+            return await self._execute_local_command(
+                endpoint, command, timeout, allow_sudo, bypass_security, working_directory, environment
+            )
 
         # Rate limiting check
         if not self._check_rate_limit(f"execute_{endpoint.hostname}"):
@@ -588,7 +667,8 @@ class TunnelManager:
                     )
                     return {
                         "success": False,
-                        "error": f"Security validation failed: {error_msg}",
+                        "error": f"Security validation failed: {error_msg}. "
+                        "Pass bypass_security=true if this command is intentional.",
                         "command": command,
                         "endpoint": endpoint.hostname,
                         "timestamp": datetime.now().isoformat(),
@@ -600,13 +680,21 @@ class TunnelManager:
                     "INFO",
                 )
 
+        # Apply working directory and environment on the remote (POSIX) side
+        remote_prefix = ""
+        if working_directory and working_directory != "~":
+            remote_prefix += f"cd {shell_quote(working_directory)} && "
+        if environment:
+            remote_prefix += f"{build_env_assignments(environment)} "
+        remote_command = remote_prefix + command
+
         ssh_client = None
         try:
             # Get connection from pool or create new one
             ssh_client = await self._get_ssh_connection(endpoint)
 
             # Execute command with timeout
-            stdin, stdout, stderr = ssh_client.exec_command(command, timeout=timeout)
+            stdin, stdout, stderr = ssh_client.exec_command(remote_command, timeout=timeout)
 
             # Get results with proper encoding and error handling
             try:
@@ -678,14 +766,13 @@ class TunnelManager:
         # Check if we have available connections in pool
         if pool_key in self._connection_pool and self._connection_pool[pool_key]:
             ssh_client = self._connection_pool[pool_key].pop()
-            # Test if connection is still alive
-            try:
-                ssh_client.exec_command('echo "test"', timeout=5)
+            # Reuse only if the transport is still alive
+            transport = ssh_client.get_transport()
+            if transport is not None and transport.is_active():
                 endpoint.current_connections += 1
                 return ssh_client
-            except Exception:
-                # Connection is dead, create new one
-                pass
+            with contextlib.suppress(Exception):
+                ssh_client.close()
 
         # Create new connection
         if endpoint.current_connections >= endpoint.max_connections:
@@ -694,14 +781,7 @@ class TunnelManager:
         ssh_client = paramiko.SSHClient()
         ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        # Load private key
-        try:
-            if endpoint.private_key_path.endswith(".pem") or "rsa" in endpoint.private_key_path.lower():
-                private_key = paramiko.RSAKey.from_private_key_file(endpoint.private_key_path)
-            else:
-                private_key = paramiko.Ed25519Key.from_private_key_file(endpoint.private_key_path)
-        except Exception as e:
-            raise SecurityError(f"Failed to load private key: {e}")
+        private_key = load_ssh_private_key(endpoint.private_key_path)
 
         # Connect with security settings
         ssh_client.connect(
@@ -724,15 +804,10 @@ class TunnelManager:
         pool_key = f"{endpoint.hostname}:{endpoint.port}"
 
         try:
-            # Test if connection is still alive
-            ssh_client.exec_command('echo "test"', timeout=5)
-
-            # Add to pool if not full
-            if pool_key not in self._connection_pool:
-                self._connection_pool[pool_key] = []
-
-            if len(self._connection_pool[pool_key]) < self._max_pool_size:
-                self._connection_pool[pool_key].append(ssh_client)
+            transport = ssh_client.get_transport()
+            pool = self._connection_pool.setdefault(pool_key, [])
+            if transport is not None and transport.is_active() and len(pool) < self._max_pool_size:
+                pool.append(ssh_client)
             else:
                 ssh_client.close()
         except Exception:
@@ -744,16 +819,29 @@ class TunnelManager:
 
     async def create_terminal_session(
         self, endpoint: TunnelEndpoint, session_id: str | None = None
-    ) -> TerminalSession | None:
+    ) -> TerminalSession | LocalTerminalSession | None:
         """Create a persistent terminal session"""
         if not session_id:
             session_id = str(uuid.uuid4())[:8]
+
+        if session_id in self.terminal_sessions:
+            logger.error(f"Terminal session already exists: {session_id}")
+            return None
+
+        if self._is_local_endpoint(endpoint):
+            try:
+                local_session = await asyncio.to_thread(LocalTerminalSession, session_id, endpoint)
+            except Exception as e:
+                logger.error(f"Failed to create local terminal session: {e}")
+                return None
+            self.terminal_sessions[session_id] = local_session
+            return local_session
 
         try:
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-            private_key = paramiko.Ed25519Key.from_private_key_file(endpoint.private_key_path)
+            private_key = load_ssh_private_key(endpoint.private_key_path)
             ssh.connect(
                 hostname=endpoint.hostname, port=endpoint.port, username=endpoint.username, pkey=private_key, timeout=10
             )
@@ -786,6 +874,9 @@ class TunnelManager:
             return {"success": False, "error": f"Terminal session {session_id} not found"}
 
         session = self.terminal_sessions[session_id]
+
+        if isinstance(session, LocalTerminalSession):
+            return await asyncio.to_thread(session.execute, command, timeout)
 
         try:
             # Send command
@@ -820,16 +911,12 @@ class TunnelManager:
 
     def close_terminal_session(self, session_id: str) -> bool:
         """Close a terminal session"""
-        if session_id in self.terminal_sessions:
-            session = self.terminal_sessions[session_id]
-            try:
-                session.channel.close()
-                session.ssh_client.close()
-                del self.terminal_sessions[session_id]
-                return True
-            except Exception:
-                pass
-        return False
+        session = self.terminal_sessions.pop(session_id, None)
+        if session is None:
+            return False
+        with contextlib.suppress(Exception):
+            session.close()
+        return True
 
     def add_endpoint(
         self, hostname: str, username: str, private_key_path: str, platform: str = "unknown", purpose: str = "primary"
@@ -895,6 +982,8 @@ class TunnelManager:
         timeout: int = 30,
         allow_sudo: bool = False,
         bypass_security: bool = False,
+        working_directory: str | None = None,
+        environment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Execute a command on the Rigout host without SSH."""
         if not self._check_rate_limit("execute_local"):
@@ -917,7 +1006,8 @@ class TunnelManager:
                     )
                     return {
                         "success": False,
-                        "error": f"Security validation failed: {error_msg}",
+                        "error": f"Security validation failed: {error_msg}. "
+                        "Pass bypass_security=true if this command is intentional.",
                         "command": command,
                         "endpoint": endpoint.hostname,
                         "timestamp": datetime.now().isoformat(),
@@ -929,6 +1019,21 @@ class TunnelManager:
                     "INFO",
                 )
 
+        cwd = None
+        if working_directory and working_directory != "~":
+            cwd = str(Path(working_directory).expanduser())
+            if not Path(cwd).is_dir():
+                return {
+                    "success": False,
+                    "error": f"Working directory does not exist: {cwd}",
+                    "command": command,
+                    "endpoint": endpoint.hostname,
+                    "timestamp": datetime.now().isoformat(),
+                }
+        env = None
+        if environment:
+            env = {**os.environ, **{str(key): str(value) for key, value in environment.items()}}
+
         try:
             completed = await asyncio.to_thread(
                 subprocess.run,
@@ -937,6 +1042,8 @@ class TunnelManager:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                cwd=cwd,
+                env=env,
             )
             stdout = completed.stdout
             stderr = completed.stderr

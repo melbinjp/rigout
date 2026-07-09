@@ -93,6 +93,37 @@ class TestSecurityValidator:
             assert is_valid is False
             assert "dangerous command chaining" in err.lower() or "dangerous pattern" in err.lower()
 
+    def test_validate_command_allows_common_pipelines(self, validator):
+        """Routine pipelines and chains must not be blocked (agents rely on them)"""
+        allowed_commands = [
+            "ps aux --sort=-%cpu | head -10",
+            "ss -tuln | head -10",
+            "nvidia-smi 2>/dev/null || echo 'No NVIDIA GPU detected'",
+            "echo hi > /dev/null",
+            "cd /tmp && cargo build",
+            "mkdir -p /tmp/w && cd /tmp/w && python3 -m venv venv && . venv/bin/activate && pip install requests",
+            "ls ; ",
+        ]
+        for cmd in allowed_commands:
+            is_valid, err = validator.validate_command(cmd)
+            assert is_valid is True, f"{cmd!r} should be allowed, got: {err}"
+
+    def test_validate_command_blocks_chained_sudo_without_permission(self, validator):
+        """Sudo hidden behind chaining is still gated by allow_sudo"""
+        is_valid, err = validator.validate_command("ls && sudo apt update", allow_sudo=False)
+        assert is_valid is False
+        assert "sudo commands not allowed" in err.lower()
+
+        is_valid, err = validator.validate_command("ls && sudo apt update", allow_sudo=True)
+        assert is_valid is True
+
+    def test_validate_command_blocks_raw_device_redirects(self, validator):
+        """Raw disk and kernel memory devices are blocked in both directions"""
+        for cmd in ["echo x > /dev/nvme0n1", "cat < /dev/kmem", "echo x > /dev/mmcblk0"]:
+            is_valid, err = validator.validate_command(cmd)
+            assert is_valid is False
+            assert "dangerous pattern" in err.lower()
+
     def test_validate_command_sudo(self, validator):
         """Test sudo command validation"""
         # Sudo not allowed by default

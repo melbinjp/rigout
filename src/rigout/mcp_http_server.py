@@ -7,16 +7,19 @@ at a URL, normally http://127.0.0.1:8765/mcp or a public tunnel URL.
 """
 
 import argparse
+import hmac
 import json
 import os
 import platform
 import secrets
 import socket
+import stat
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import uvicorn
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -33,6 +36,15 @@ DEFAULT_PATH = "/mcp"
 DEFAULT_CONNECTION_FILE = "ai_agent_connection.json"
 
 
+def tokens_match(provided: str | bytes | None, expected: str | bytes) -> bool:
+    """Compare secrets in constant time to avoid timing side channels."""
+    if provided is None:
+        return False
+    provided_bytes = provided.encode() if isinstance(provided, str) else provided
+    expected_bytes = expected.encode() if isinstance(expected, str) else expected
+    return hmac.compare_digest(provided_bytes, expected_bytes)
+
+
 class BearerAuthASGIApp:
     """Protect an ASGI app with a static bearer token."""
 
@@ -42,7 +54,7 @@ class BearerAuthASGIApp:
 
     async def __call__(self, scope, receive, send) -> None:
         headers = dict(scope.get("headers") or [])
-        if headers.get(b"authorization") != self.expected:
+        if not tokens_match(headers.get(b"authorization"), self.expected):
             response = JSONResponse({"error": "unauthorized"}, status_code=401)
             await response(scope, receive, send)
             return
@@ -77,15 +89,21 @@ def health_url_from_mcp_url(mcp_url: str, path: str) -> str:
     return mcp_url.rstrip("/") + "/health"
 
 
+_hardware_summary_cache: dict[str, Any] | None = None
+
+
 def get_hardware_summary() -> dict[str, Any]:
-    gpu_info: list[str] = []
-    return {
-        "cpu_count": os.cpu_count() or 0,
-        "gpu_info": gpu_info,
-        "platform": platform.system(),
-        "architecture": platform.machine(),
-        "hostname": socket.gethostname(),
-    }
+    global _hardware_summary_cache
+    if _hardware_summary_cache is None:
+        gpu_info: list[str] = []
+        _hardware_summary_cache = {
+            "cpu_count": os.cpu_count() or 0,
+            "gpu_info": gpu_info,
+            "platform": platform.system(),
+            "architecture": platform.machine(),
+            "hostname": socket.gethostname(),
+        }
+    return _hardware_summary_cache
 
 
 def build_connection_data(
@@ -94,9 +112,10 @@ def build_connection_data(
     port: int,
     path: str,
     auth_token: str | None = None,
+    agent_setup_url: str | None = None,
 ) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-    return {
+    connection_data = {
         "mcp_server_type": "hardware_access",
         "connection_method": "mcp_streamable_http",
         "mcp_server_url": mcp_url,
@@ -132,6 +151,15 @@ def build_connection_data(
         ],
         "setup_date": datetime.now().isoformat(),
     }
+    if agent_setup_url:
+        connection_data["agent_setup_url"] = agent_setup_url
+        connection_data["agent_setup_security"] = "credential_url"
+    return connection_data
+
+
+def connection_setup_url(mcp_url: str, mcp_path: str, setup_token: str) -> str:
+    base_url = health_url_from_mcp_url(mcp_url, mcp_path).removesuffix("/health")
+    return f"{base_url}/connection.json?{urlencode({'setup_token': setup_token})}"
 
 
 def write_connection_file(
@@ -141,12 +169,16 @@ def write_connection_file(
     port: int,
     mcp_path: str,
     auth_token: str | None = None,
+    agent_setup_url: str | None = None,
 ) -> None:
     connection_path = Path(path)
     connection_path.write_text(
-        json.dumps(build_connection_data(mcp_url, host, port, mcp_path, auth_token), indent=2),
+        json.dumps(build_connection_data(mcp_url, host, port, mcp_path, auth_token, agent_setup_url), indent=2),
         encoding="utf-8",
     )
+    if os.name == "posix":
+        # The file can contain a bearer token; keep it owner-readable only
+        connection_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
 def create_app(
@@ -156,6 +188,7 @@ def create_app(
     path: str = DEFAULT_PATH,
     public_url: str | None = None,
     connection_file: str | Path | None = None,
+    setup_token: str | None = None,
     auth_token: str | None = None,
     json_response: bool = False,
     stateless: bool = False,
@@ -185,7 +218,20 @@ def create_app(
             }
         )
 
-    async def connection(_: Request) -> JSONResponse:
+    async def connection(request: Request) -> JSONResponse:
+        bearer_authorized = bool(
+            auth_token and tokens_match(request.headers.get("authorization"), f"Bearer {auth_token}")
+        )
+        # Setup tokens should be passed in headers to avoid URL leakage where possible
+        setup_token_header = request.headers.get("x-setup-token")
+        setup_token_query = request.query_params.get("setup_token")
+        setup_authorized = bool(
+            setup_token
+            and (tokens_match(setup_token_header, setup_token) or tokens_match(setup_token_query, setup_token))
+        )
+
+        if auth_token and not (bearer_authorized or setup_authorized):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         return JSONResponse(build_connection_data(mcp_url, host, port, path, auth_token))
 
     async def root(_: Request) -> PlainTextResponse:
@@ -218,7 +264,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--path", default=DEFAULT_PATH, help="MCP path, default: /mcp")
     parser.add_argument("--public-url", help="Public MCP URL to write into connection files")
     parser.add_argument("--connection-file", default=DEFAULT_CONNECTION_FILE)
-    parser.add_argument("--auth-token", help="Bearer token required for MCP requests")
+    parser.add_argument(
+        "--setup-token",
+        default=os.environ.get("RIGOUT_SETUP_TOKEN"),
+        help="Allow this setup token to fetch /connection.json (or set RIGOUT_SETUP_TOKEN)",
+    )
+    parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("RIGOUT_AUTH_TOKEN"),
+        help="Bearer token required for MCP requests (or set RIGOUT_AUTH_TOKEN)",
+    )
     parser.add_argument(
         "--generate-token", action="store_true", help="Generate a bearer token and write it to the connection file"
     )
@@ -241,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
         path=mcp_path,
         public_url=mcp_url,
         connection_file=connection_file,
+        setup_token=args.setup_token,
         auth_token=auth_token,
         json_response=args.json_response,
         stateless=args.stateless,

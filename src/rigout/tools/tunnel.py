@@ -4,7 +4,21 @@ from ..ssh_manager import get_tunnel_manager
 
 
 async def handle_connect_hardware(arguments: dict) -> CallToolResult:
-    endpoint = await get_tunnel_manager().auto_failover()
+    preferred_platform = arguments.get("preferred_platform", "any")
+
+    manager = get_tunnel_manager()
+    endpoint = None
+    if preferred_platform and preferred_platform != "any":
+        for candidate in manager.endpoints:
+            if preferred_platform.lower() in (candidate.platform or "").lower() and await manager.test_endpoint(
+                candidate
+            ):
+                endpoint = candidate
+                manager.active_endpoint = candidate
+                break
+
+    if not endpoint:
+        endpoint = await manager.auto_failover()
 
     if not endpoint:
         return CallToolResult(
@@ -44,6 +58,29 @@ async def handle_manage_tunnels(arguments: dict) -> CallToolResult:
         result_text += f"Username: {username}\n"
         result_text += "Status: Testing connection..."
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
+
+    elif action == "remove":
+        hostname = arguments.get("hostname")
+        if not hostname:
+            return CallToolResult(
+                content=[TextContent(type="text", text="The remove action requires a hostname argument")]
+            )
+
+        manager = get_tunnel_manager()
+        remaining = [endpoint for endpoint in manager.endpoints if endpoint.hostname != hostname]
+        removed_count = len(manager.endpoints) - len(remaining)
+        if not removed_count:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"No tunnel endpoint found with hostname: {hostname}")]
+            )
+
+        manager.endpoints = remaining
+        if manager.active_endpoint and manager.active_endpoint.hostname == hostname:
+            manager.active_endpoint = None
+        manager.save_config()
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Removed {removed_count} tunnel endpoint(s) for {hostname}")]
+        )
 
     elif action == "list":
         if not get_tunnel_manager().endpoints:

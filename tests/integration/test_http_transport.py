@@ -43,7 +43,10 @@ class TestHTTPTransport:
         """Public URL mode should be able to protect the MCP transport with bearer auth."""
         app = create_app(connection_file=None, auth_token="test-token")
         with TestClient(app) as client:
-            connection = client.get("/connection.json").json()
+            unauthenticated_connection = client.get("/connection.json")
+            assert unauthenticated_connection.status_code == 401
+
+            connection = client.get("/connection.json", headers={"Authorization": "Bearer test-token"}).json()
             assert connection["mcp"]["headers"]["Authorization"] == "Bearer test-token"
             assert connection["security"]["auth"] == "bearer"
 
@@ -52,3 +55,25 @@ class TestHTTPTransport:
 
             authenticated = client.post("/mcp", json={}, headers={"Authorization": "Bearer test-token"})
             assert authenticated.status_code in {400, 406}
+
+    def test_setup_token_can_fetch_public_connection(self):
+        app = create_app(
+            connection_file=None,
+            public_url="https://public.example/mcp",
+            setup_token="setup-secret",
+            auth_token="test-token",
+        )
+
+        with TestClient(app) as client:
+            assert client.get("/connection.json").status_code == 401
+            assert client.get("/connection.json?setup_token=wrong").status_code == 401
+
+            setup_connection = client.get("/connection.json?setup_token=setup-secret")
+            assert setup_connection.status_code == 200
+            assert setup_connection.json()["mcp"]["url"] == "https://public.example/mcp"
+            assert setup_connection.json()["mcp"]["headers"]["Authorization"] == "Bearer test-token"
+
+            bearer_connection = client.get("/connection.json", headers={"Authorization": "Bearer test-token"})
+            assert bearer_connection.status_code == 200
+            assert bearer_connection.json()["mcp"]["url"] == "https://public.example/mcp"
+            assert bearer_connection.json()["mcp"]["headers"]["Authorization"] == "Bearer test-token"
