@@ -13,7 +13,7 @@ name: Enable Auto-Merge
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
   enable-auto-merge:
@@ -23,9 +23,15 @@ jobs:
       github.event.pull_request.user.login == github.repository_owner &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.draft == false
+    # contents: write is required here - verified empirically after
+    # pull-requests: write alone failed with "GraphQL: Resource not
+    # accessible by integration (enablePullRequestAutoMerge)". This still
+    # only *arms* auto-merge; the actual merge commit is written by
+    # GitHub's own merge queue once required checks/reviews clear, not by
+    # this token performing a push.
     permissions:
       pull-requests: write
-      contents: read
+      contents: write
     steps:
       - name: Enable auto-merge (squash)
         env:
