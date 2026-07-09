@@ -1,0 +1,42 @@
+name: Jules PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: jules-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Jules Review
+    runs-on: ubuntu-latest
+    # Always posts a review comment, and approves the PR when the review
+    # finds no blocking issues (see scripts/jules_review.py for the exact
+    # fail-closed rule: anything other than a clean verdict just leaves the
+    # comment, no approval). No statuses:write is requested, so this job can
+    # never post a commit status or force a merge closed - the only lever it
+    # has is the same PR-review approval any human reviewer would give. It
+    # also cannot write repo contents: scripts/jules_review.py never sets
+    # the Jules "automationMode" that would let a session create a PR/branch.
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade requests
+
+      - name: Run Jules review
+        env:
+          JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/jules_review.py

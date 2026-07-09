@@ -1,0 +1,33 @@
+name: Enable Auto-Merge
+
+# Arms GitHub's native auto-merge on PRs opened by the repo owner against
+# main. This is deliberately independent of Jules: it never inspects a
+# review verdict itself, it just flips a flag that tells GitHub "merge this
+# once every required status check and required review is satisfied" - the
+# same mechanism that would apply if a human reviewer approved instead of
+# the Jules PR Review bot. Jules' approval is one of the things auto-merge
+# waits on, not something this workflow evaluates directly.
+#
+# PRs opened by anyone else never get this flag set, so they always need a
+# manual review and merge, regardless of what Jules' review says.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+jobs:
+  enable-auto-merge:
+    name: Enable Auto-Merge for Owner PRs
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.user.login == github.repository_owner &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.draft == false
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Enable auto-merge (squash)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge "${{ github.event.pull_request.number }}" --auto --squash --repo "${{ github.repository }}"
