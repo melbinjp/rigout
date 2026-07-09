@@ -6,6 +6,30 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `.github/jules-review-rules.md`: maintainer-authored review guidance loaded
+  from the base branch, telling the reviewer not to flag unfamiliar
+  dependency/Action versions as nonexistent from training knowledge alone (#18).
+- Grouped Dependabot updates: `github-actions` bumps arrive as a single PR;
+  `pip` groups minor/patch only, leaving major bumps isolated for review (#17).
+- Unit tests for `scripts/jules_review.py` covering its fail-closed
+  guarantees: anchored verdict parsing, trusted-author gating, skip
+  conditions, 404-tolerant polling, and the no-`automationMode` session
+  payload.
+
+### Fixed
+- Jules review skips cleanly on Dependabot PRs instead of failing with 401s -
+  GitHub withholds repository secrets from Dependabot-triggered runs (#16).
+- Auto-merge workflow: arming auto-merge needs `contents: write`, and now
+  retries on every push instead of only on PR open/reopen (#16).
+- Jules review verdict parsing anchored to a whole line, so verdict text
+  quoted inside a finding can never be read as the real verdict (#18).
+- GitHub Actions bumped: `checkout` v7, `setup-python` v6,
+  `upload-artifact` v7, `download-artifact` v8 (#17).
+- Diff truncation for review prompts now cuts at a line boundary.
+
+## [0.2.0] - 2026-07-09
+
+### Added
 - Automated Jules PR review (`scripts/jules_review.py`): posts a code review
   comment on every PR and auto-approves it when no blocking issues are found
   and the PR author is trusted (default: the repo owner), since branch
