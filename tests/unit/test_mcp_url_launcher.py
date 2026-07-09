@@ -273,7 +273,9 @@ def test_start_cloudflare_tunnel_terminates_process_and_raises_on_timeout():
 def test_resolve_public_mcp_url_prefers_explicit_public_url():
     args = launcher_args(path="/mcp", public_url="https://agent.example")
 
-    assert resolve_public_mcp_url(args, tunnel_base_url="https://tunnel.trycloudflare.com") == "https://agent.example/mcp"
+    assert (
+        resolve_public_mcp_url(args, tunnel_base_url="https://tunnel.trycloudflare.com") == "https://agent.example/mcp"
+    )
 
 
 @pytest.mark.unit
