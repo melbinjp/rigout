@@ -158,8 +158,11 @@ class LocalTerminalSession:
                         **base_result,
                     }
                 stripped = line.strip()
-                if stripped.startswith(marker):
-                    tail = stripped[len(marker) :].strip()
+                if marker in stripped:
+                    # On Windows the interactive cmd.exe prompt (e.g. "C:\path>")
+                    # is printed even with /q, prefixing the sentinel's own
+                    # output, so the marker isn't necessarily at the start.
+                    tail = stripped.split(marker, 1)[1].strip()
                     if tail.lstrip("-").isdigit():
                         exit_code = int(tail)
                     break
