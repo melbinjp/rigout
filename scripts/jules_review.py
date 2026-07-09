@@ -55,12 +55,19 @@ def env_bool(name: str, default: bool) -> bool:
 def request_with_retry(method: str, url: str, *, headers: dict, max_retries: int = 4, **kwargs) -> requests.Response:
     delay = 1.0
     for attempt in range(max_retries + 1):
-        response = requests.request(method, url, headers=headers, timeout=30, **kwargs)
+        try:
+            response = requests.request(method, url, headers=headers, timeout=30, **kwargs)
+        except requests.exceptions.RequestException:
+            if attempt == max_retries:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 20.0)
+            continue
         if response.status_code not in RETRYABLE_STATUS or attempt == max_retries:
             return response
         time.sleep(delay)
         delay = min(delay * 2, 20.0)
-    return response  # unreachable, keeps type-checkers happy
+    raise AssertionError("unreachable")  # loop always returns or raises
 
 
 def github_request(method: str, path: str, token: str, **kwargs) -> requests.Response:
@@ -116,6 +123,18 @@ def load_pull_request_event() -> dict:
     if not pr:
         raise RuntimeError("No pull_request payload in the event file.")
     return pr
+
+
+def is_trusted_author(pr_author: str, owner: str) -> bool:
+    """Auto-approval requires more than a clean verdict: the PR author must
+    also be trusted. Defaults to just the repo owner, since Jules' verdict
+    alone is an LLM judgement over attacker-influenceable content (diff,
+    title, description) and shouldn't be the only thing standing between a
+    stranger's PR and an approval. Override with a comma-separated
+    JULES_REVIEW_TRUSTED_AUTHORS to add collaborators."""
+    configured = os.environ.get("JULES_REVIEW_TRUSTED_AUTHORS", "").strip()
+    trusted = {a.strip().lower() for a in configured.split(",") if a.strip()} if configured else {owner.lower()}
+    return pr_author.lower() in trusted
 
 
 def check_skip_conditions(pr: dict, owner: str, repo: str) -> None:
@@ -255,8 +274,16 @@ only — it does not gate merging.
 
 
 def parse_verdict(review_message: str) -> str | None:
-    match = VERDICT_PATTERN.search(review_message)
-    return match.group(1).lower() if match else None
+    """Parses the LAST `VERDICT: ...` occurrence, not the first. This script's
+    prompt tells Jules to quote prompt-injection attempts it finds in
+    untrusted content (PR title/body/diff) as part of a finding - and such a
+    quote can itself contain the literal string "VERDICT: approve" as an
+    illustrative example, appearing before the real verdict. Taking the
+    first match picks up that quoted example instead of the actual,
+    structurally-final verdict our prompt format mandates ("end with
+    exactly one line, nothing after it")."""
+    matches = VERDICT_PATTERN.findall(review_message)
+    return matches[-1].lower() if matches else None
 
 
 def resolve_source(owner: str, repo: str, api_key: str) -> str:
@@ -336,6 +363,9 @@ def poll_for_review(session_name: str, api_key: str, timeout_minutes: int) -> tu
     return None, last_state
 
 
+BOT_LOGIN = "github-actions[bot]"
+
+
 def find_marker_comment_id(owner: str, repo: str, pr_number: int, token: str) -> int | None:
     page = 1
     while page <= 5:
@@ -344,7 +374,11 @@ def find_marker_comment_id(owner: str, repo: str, pr_number: int, token: str) ->
         )
         comments = response.json()
         for comment in comments:
-            if comment["body"].startswith(COMMENT_MARKER):
+            # Match on our own author too: anyone can post a comment that
+            # merely starts with COMMENT_MARKER, and matching on the marker
+            # alone would make this PATCH someone else's comment (which
+            # 403s, since we lack permission to edit others' comments).
+            if comment["body"].startswith(COMMENT_MARKER) and comment.get("user", {}).get("login") == BOT_LOGIN:
                 return comment["id"]
         if len(comments) < 100:
             break
@@ -386,6 +420,7 @@ def main() -> int:
         return 1
 
     pr_number = pr["number"]
+    pr_author = pr.get("user", {}).get("login", "")
     base_sha = pr["base"]["sha"]
     base_branch = pr["base"]["ref"]
     head_branch = pr["head"]["ref"]
@@ -440,13 +475,19 @@ def main() -> int:
             return 1
 
         verdict = parse_verdict(review_message)
-        will_approve = verdict in APPROVING_VERDICTS
+        author_trusted = is_trusted_author(pr_author, owner)
+        will_approve = verdict in APPROVING_VERDICTS and author_trusted
 
-        footer = "_This review never edits code or force-blocks a merge._ " + (
-            "_No blocking issues were found, so this PR was auto-approved._"
-            if will_approve
-            else "_This did not auto-approve: a human still needs to review and approve this PR._"
-        )
+        if will_approve:
+            approval_note = "_No blocking issues were found, so this PR was auto-approved._"
+        elif verdict not in APPROVING_VERDICTS:
+            approval_note = "_This did not auto-approve: a human still needs to review and approve this PR._"
+        else:
+            approval_note = (
+                f"_This did not auto-approve: @{pr_author} isn't in the trusted-author allowlist, "
+                "so a human still needs to review and approve this PR._"
+            )
+        footer = f"_This review never edits code or force-blocks a merge._ {approval_note}"
         body = f"## Jules Review\n\n{review_message}\n\n---\n{footer}"
         upsert_comment(owner, repo, pr_number, token, body)
         print("Review posted.")
@@ -464,7 +505,9 @@ def main() -> int:
     # must never cause the already-posted review comment to be overwritten
     # with a generic failure message.
     if not will_approve:
-        print(f"Not approved (verdict: {verdict!r}). A human review is still required.")
+        print(
+            f"Not approved (verdict: {verdict!r}, author_trusted: {author_trusted}). A human review is still required."
+        )
         return 0
     try:
         approve_pull_request(
