@@ -201,11 +201,16 @@ def load_rules_file(owner: str, repo: str, path: str, base_sha: str, token: str)
 def truncate_diff(diff: str, max_chars: int) -> tuple[str, str | None]:
     if len(diff) <= max_chars:
         return diff, None
+    # Cut at a line boundary so the last visible line is never half a hunk
+    cut = diff.rfind("\n", 0, max_chars)
+    if cut <= 0:
+        cut = max_chars
+    text = diff[:cut]
     note = (
-        f"The diff was truncated: original {len(diff)} chars, kept the first {max_chars}. "
+        f"The diff was truncated: original {len(diff)} chars, kept the first {len(text)}. "
         "Some changes are not visible above; say so in your review."
     )
-    return diff[:max_chars], note
+    return text, note
 
 
 def build_prompt(
