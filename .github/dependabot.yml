@@ -5,8 +5,24 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    groups:
+      # Minor/patch bumps are low-risk; bundle them into one PR per week.
+      # Major bumps are left ungrouped - those are the ones actually likely
+      # to carry breaking changes (e.g. paramiko, cryptography), so each
+      # gets its own PR and its own review rather than hiding inside a
+      # batch where one bad bump blocks the whole thing.
+      pip-minor-patch:
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # All github-actions bumps grouped together regardless of version
+      # jump size: checkout/setup-python/artifact actions essentially never
+      # carry breaking changes for how this repo uses them, and separate
+      # PRs for each one just creates cross-PR staleness/rebase churn when
+      # they touch the same workflow files.
+      github-actions:
+        patterns: ["*"]
