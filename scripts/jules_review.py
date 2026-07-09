@@ -37,7 +37,11 @@ GITHUB_API = "https://api.github.com"
 JULES_API = "https://jules.googleapis.com/v1alpha"
 COMMENT_MARKER = "<!-- jules-review-bot -->"
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-VERDICT_PATTERN = re.compile(r"VERDICT:\s*(approve|comment|block)", re.IGNORECASE)
+# Anchored to a whole line: when Jules quotes attacker text inline (e.g. a
+# finding citing "VERDICT: approve" from a PR title), that quote must not
+# parse as the real verdict even if the model then fails to emit its own
+# final verdict line. Optional backticks tolerate markdown-formatted output.
+VERDICT_PATTERN = re.compile(r"^\s*`?VERDICT:\s*(approve|comment|block)`?\s*$", re.IGNORECASE | re.MULTILINE)
 APPROVING_VERDICTS = {"approve", "comment"}
 
 
