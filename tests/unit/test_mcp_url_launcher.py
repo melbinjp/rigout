@@ -14,6 +14,8 @@ from rigout.mcp_url_launcher import (
     cloudflared_cache_path,
     install_cloudflared,
     resolve_cloudflared_binary,
+    resolve_public_mcp_url,
+    start_cloudflare_tunnel,
     start_server,
 )
 
@@ -192,3 +194,99 @@ def test_install_cloudflared_extracts_macos_archive(tmp_path, monkeypatch):
     assert installed == expected_path
     assert installed.exists()
     assert installed.read_bytes() == b"#!/bin/sh\n"
+
+
+class FakeCloudflaredProcess:
+    """Stand-in for the subprocess.Popen handle to a running cloudflared."""
+
+    def __init__(self, lines: list[str], exits_after_output: bool = False):
+        self._lines = iter(lines)
+        self.stdout = self
+        self._exited = False
+        self._exits_after_output = exits_after_output
+        self.terminated = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._lines)
+        except StopIteration:
+            if self._exits_after_output:
+                self._exited = True
+            raise
+
+    def poll(self):
+        return 0 if self._exited else None
+
+    def terminate(self):
+        self.terminated = True
+        self._exited = True
+
+
+@pytest.mark.unit
+def test_start_cloudflare_tunnel_extracts_url_from_process_output():
+    fake_process = FakeCloudflaredProcess(
+        ["cloudflared 2024.1.0\n", "Your quick Tunnel has been created!\n", "https://random-words.trycloudflare.com\n"]
+    )
+
+    with (
+        patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
+        patch("rigout.mcp_url_launcher.subprocess.Popen", return_value=fake_process) as popen,
+    ):
+        process, url = start_cloudflare_tunnel(8765, timeout=5)
+
+    assert process is fake_process
+    assert url == "https://random-words.trycloudflare.com"
+    command = popen.call_args.args[0]
+    assert command == ["cloudflared", "tunnel", "--url", "http://127.0.0.1:8765", "--no-autoupdate"]
+
+
+@pytest.mark.unit
+def test_start_cloudflare_tunnel_raises_when_process_exits_without_url():
+    fake_process = FakeCloudflaredProcess(["failed to connect to origin\n"], exits_after_output=True)
+
+    with (
+        patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
+        patch("rigout.mcp_url_launcher.subprocess.Popen", return_value=fake_process),
+    ):
+        with pytest.raises(RuntimeError, match="exited before publishing a tunnel URL"):
+            start_cloudflare_tunnel(8765, timeout=5)
+
+
+@pytest.mark.unit
+def test_start_cloudflare_tunnel_terminates_process_and_raises_on_timeout():
+    fake_process = FakeCloudflaredProcess([])  # never publishes a URL, never exits
+
+    with (
+        patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
+        patch("rigout.mcp_url_launcher.subprocess.Popen", return_value=fake_process),
+    ):
+        with pytest.raises(RuntimeError, match="Timed out waiting for cloudflared"):
+            start_cloudflare_tunnel(8765, timeout=0.3)
+
+    assert fake_process.terminated is True
+
+
+@pytest.mark.unit
+def test_resolve_public_mcp_url_prefers_explicit_public_url():
+    args = launcher_args(path="/mcp", public_url="https://agent.example")
+
+    assert resolve_public_mcp_url(args, tunnel_base_url="https://tunnel.trycloudflare.com") == "https://agent.example/mcp"
+
+
+@pytest.mark.unit
+def test_resolve_public_mcp_url_uses_tunnel_base_url():
+    args = launcher_args(path="/mcp", public_url=None)
+
+    assert resolve_public_mcp_url(args, tunnel_base_url="https://tunnel.trycloudflare.com") == (
+        "https://tunnel.trycloudflare.com/mcp"
+    )
+
+
+@pytest.mark.unit
+def test_resolve_public_mcp_url_falls_back_to_local_url():
+    args = launcher_args(host="127.0.0.1", port=8765, path="/mcp", public_url=None)
+
+    assert resolve_public_mcp_url(args, tunnel_base_url=None) == "http://127.0.0.1:8765/mcp"
