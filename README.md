@@ -77,7 +77,7 @@ Rigout exposes:
 - `system_monitoring`: inspect CPU, memory, disk, network, processes, and GPU where available.
 - `docker_operations`: list, run, exec, stop, remove, build, pull, logs, and inspect containers.
 - `environment_setup`: create Python, Node, Docker, or Conda workspaces.
-- `manage_tunnels`: add, list, test, and fail over to SSH endpoints.
+- `manage_tunnels`: add, remove, list, test, and fail over to SSH endpoints.
 - `connect_hardware` and `get_hardware_info`: verify available hardware.
 - `create_terminal_session`, `execute_in_terminal`, `list_terminal_sessions`, `close_terminal_session`: persistent terminal sessions that keep shell state between commands, on the local device or over SSH.
 

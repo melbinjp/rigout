@@ -1,10 +1,12 @@
 # Rigout Agent Guide
 
-Rigout is a Streamable HTTP MCP server for controlled device access. Agents should connect to the MCP URL in `ai_agent_connection.json` and use the listed MCP tools directly.
+Rigout is a Streamable HTTP MCP server for controlled device access. Agents should connect to the MCP URL in `ai_agent_connection.json` or use the provided **Agent Setup URL**, and then use the listed MCP tools directly.
 
 For repository changes, follow [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md). Keep edits small, tested, and aligned with the `rigout` package and CLI.
 
 ## Connection
+
+If you are given an **Agent Setup URL** (e.g., `.../connection.json?setup_token=...`), fetch that URL to retrieve the full MCP client configuration.
 
 Connection files have this shape:
 

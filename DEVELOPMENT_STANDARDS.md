@@ -9,7 +9,7 @@ This file is the source of truth for future contributors and agents.
 - Keep changes small and scoped to the behavior being changed.
 - Prefer simple, explicit code over clever abstractions.
 - Do not preserve compatibility for unused legacy names, flags, scripts, or docs.
-- Treat MCP URLs, bearer tokens, generated connection files, logs, keys, and local config as sensitive.
+- Treat MCP URLs, bearer tokens, agent setup URLs, generated connection files, logs, keys, and local config as sensitive.
 - Keep docs, package metadata, CLI names, tests, and examples aligned with `rigout`.
 - Do not add a new dependency unless it removes real complexity or is required by the MCP/device-control domain.
 
