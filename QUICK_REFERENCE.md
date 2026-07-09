@@ -67,8 +67,8 @@ Trusted publisher fields:
 Create and push a version tag only after the publisher is configured:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 ## Cleanup Before Publishing
