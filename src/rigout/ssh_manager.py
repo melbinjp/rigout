@@ -55,6 +55,19 @@ def heredoc_redirect(content: str, destination: str) -> str:
     return f"cat > {shell_quote(destination)} <<'{delimiter}'\n{content}\n{delimiter}"
 
 
+def _run_ssh_command(
+    ssh_client: paramiko.SSHClient,
+    command: str,
+    timeout: int,
+) -> tuple[str, str, int]:
+    """Run Paramiko's blocking command/read sequence outside the event loop."""
+    _stdin, stdout, stderr = ssh_client.exec_command(command, timeout=timeout)
+    stdout_data = stdout.read().decode("utf-8", errors="replace")
+    stderr_data = stderr.read().decode("utf-8", errors="replace")
+    exit_code = int(stdout.channel.recv_exit_status())
+    return stdout_data, stderr_data, exit_code
+
+
 def load_ssh_private_key(path: str) -> paramiko.PKey:
     """Load a private key of any supported type (Ed25519, RSA, ECDSA)."""
     try:
@@ -108,7 +121,8 @@ def _local_memory_gb() -> float:
             status = MemoryStatusEx()
             status.dwLength = ctypes.sizeof(MemoryStatusEx)
             if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):  # type: ignore[attr-defined]
-                return round(status.ullTotalPhys / (1024**3), 2)
+                total_physical = int(status.ullTotalPhys)
+                return round(total_physical / (1024**3), 2)
     except Exception:
         pass
     return 0.0
@@ -693,14 +707,16 @@ class TunnelManager:
             # Get connection from pool or create new one
             ssh_client = await self._get_ssh_connection(endpoint)
 
-            # Execute command with timeout
-            stdin, stdout, stderr = ssh_client.exec_command(remote_command, timeout=timeout)
-
-            # Get results with proper encoding and error handling
+            # Paramiko's exec/read/status APIs are synchronous. Offload the
+            # complete blocking sequence so independent MCP work (including
+            # monitoring metrics) can make progress concurrently.
             try:
-                stdout_data = stdout.read().decode("utf-8", errors="replace")
-                stderr_data = stderr.read().decode("utf-8", errors="replace")
-                exit_code = stdout.channel.recv_exit_status()
+                stdout_data, stderr_data, exit_code = await asyncio.to_thread(
+                    _run_ssh_command,
+                    ssh_client,
+                    remote_command,
+                    timeout,
+                )
             except TimeoutError:
                 return {
                     "success": False,

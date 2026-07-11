@@ -11,6 +11,8 @@ from mcp.types import (
     Tool,
 )
 
+from ._version import __version__
+
 # Import all decomposed tool handlers
 from .tools import (
     handle_bulk_file_transfer,
@@ -23,6 +25,7 @@ from .tools import (
     handle_execute_in_terminal,
     handle_file_operations,
     handle_get_hardware_info,
+    handle_get_server_activity,
     handle_install_software,
     handle_list_terminal_sessions,
     handle_manage_tunnels,
@@ -31,15 +34,17 @@ from .tools import (
 
 logger = logging.getLogger(__name__)
 
-# Configure logging fallback if not done by parent process
-if not logger.handlers:
+# The managed launcher captures stderr in its owner-only activity log. Keep the
+# stdio fallback on stderr as well so importing this module never creates a log
+# file in an arbitrary current working directory.
+if not logging.getLogger().handlers:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.FileHandler("mcp-hardware-server.log"), logging.StreamHandler(sys.stderr)],
+        handlers=[logging.StreamHandler(sys.stderr)],
     )
 
-server = Server("enhanced-hardware-server")
+server = Server("enhanced-hardware-server", version=__version__)
 
 
 @server.list_tools()
@@ -139,6 +144,22 @@ async def handle_list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "Force refresh hardware information",
                         "default": False,
+                    }
+                },
+            },
+        ),
+        Tool(
+            name="get_server_activity",
+            description="Read bounded, sanitized Rigout lifecycle status and recent activity",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of recent activity lines to return",
+                        "default": 50,
+                        "minimum": 1,
+                        "maximum": 200,
                     }
                 },
             },
@@ -314,6 +335,8 @@ async def _handle_call_tool_result(name: str, arguments: dict) -> CallToolResult
             return await handle_close_terminal_session(arguments)
         elif name == "get_hardware_info":
             return await handle_get_hardware_info(arguments)
+        elif name == "get_server_activity":
+            return await handle_get_server_activity(arguments)
         elif name == "manage_tunnels":
             return await handle_manage_tunnels(arguments)
         elif name == "install_software":
@@ -329,15 +352,24 @@ async def _handle_call_tool_result(name: str, arguments: dict) -> CallToolResult
         elif name == "environment_setup":
             return await handle_environment_setup(arguments)
         else:
-            return CallToolResult(content=[TextContent(type="text", text=f"Unknown tool: {name}")])
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Unknown tool: {name}")],
+                isError=True,
+            )
     except Exception as e:
-        return CallToolResult(content=[TextContent(type="text", text=f"Error executing tool '{name}': {str(e)}")])
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error executing tool '{name}': {str(e)}")],
+            isError=True,
+        )
 
 
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle tool calls from MCP clients."""
     result = await _handle_call_tool_result(name, arguments)
+    if result.isError:
+        message = "\n".join(item.text for item in result.content if isinstance(item, TextContent))
+        raise RuntimeError(message or f"Tool '{name}' failed")
     return result.content  # type: ignore
 
 
@@ -354,7 +386,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="enhanced-hardware-server",
-                server_version="1.0.0",
+                server_version=__version__,
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},

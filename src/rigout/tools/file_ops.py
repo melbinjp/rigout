@@ -6,6 +6,7 @@ from pathlib import Path
 from mcp.types import CallToolResult, TextContent
 
 from ..ssh_manager import get_tunnel_manager, heredoc_redirect, shell_join, shell_quote
+from ._results import error_result, failure_detail
 
 
 async def handle_file_operations(arguments: dict) -> CallToolResult:
@@ -14,7 +15,7 @@ async def handle_file_operations(arguments: dict) -> CallToolResult:
 
     endpoint = await get_tunnel_manager().auto_failover()
     if not endpoint:
-        return CallToolResult(content=[TextContent(type="text", text="No available hardware endpoints")])
+        return error_result("No available hardware endpoints")
 
     if getattr(endpoint, "private_key_path", "") == "__local__":
         return await _handle_local_file_operation(operation, arguments)
@@ -43,7 +44,7 @@ async def handle_file_operations(arguments: dict) -> CallToolResult:
         owner = arguments.get("owner", "")
         command = f"sudo chown {shell_quote(owner)} {shell_quote(path)}"
     else:
-        return CallToolResult(content=[TextContent(type="text", text=f"Unsupported file operation: {operation}")])
+        return error_result(f"Unsupported file operation: {operation}")
 
     result = await get_tunnel_manager().execute_command(endpoint, command)
 
@@ -57,8 +58,8 @@ async def handle_file_operations(arguments: dict) -> CallToolResult:
     else:
         result_text = f"File operation '{operation}' failed\n\n"
         result_text += f"Path: {path}\n"
-        result_text += f"Error: {result.get('error', result.get('stderr', 'Unknown error'))}"
-        return CallToolResult(content=[TextContent(type="text", text=result_text)])
+        result_text += f"Error: {failure_detail(result, 'File operation command failed')}"
+        return error_result(result_text)
 
 
 async def handle_bulk_file_transfer(arguments: dict) -> CallToolResult:
@@ -68,7 +69,7 @@ async def handle_bulk_file_transfer(arguments: dict) -> CallToolResult:
 
     endpoint = await get_tunnel_manager().auto_failover()
     if not endpoint:
-        return CallToolResult(content=[TextContent(type="text", text="No available hardware endpoints")])
+        return error_result("No available hardware endpoints")
 
     if getattr(endpoint, "private_key_path", "") == "__local__":
         return await _handle_local_bulk_file_transfer(operation, arguments)
@@ -86,9 +87,7 @@ async def handle_bulk_file_transfer(arguments: dict) -> CallToolResult:
         else:
             command = f"cp -r {shell_quote(source)}/. {shell_quote(destination)}/"
     else:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Unsupported file transfer operation: {operation}")]
-        )
+        return error_result(f"Unsupported file transfer operation: {operation}")
 
     result = await get_tunnel_manager().execute_command(endpoint, command, timeout=120, allow_sudo=True)
 
@@ -100,13 +99,8 @@ async def handle_bulk_file_transfer(arguments: dict) -> CallToolResult:
             result_text += f"\nOutput:\n{result['stdout']}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
-        return CallToolResult(
-            content=[
-                TextContent(
-                    type="text",
-                    text=f"File transfer '{operation}' failed: {result.get('error', 'Unknown error')}",
-                )
-            ]
+        return error_result(
+            f"File transfer '{operation}' failed: {failure_detail(result, 'File transfer command failed')}"
         )
 
 
@@ -147,20 +141,16 @@ async def _handle_local_file_operation(operation: str, arguments: dict) -> CallT
             path.chmod(int(str(arguments.get("permissions", "644")), 8))
             output = ""
         elif operation == "chown":
-            return CallToolResult(
-                content=[TextContent(type="text", text="Local chown is not supported on this platform")]
-            )
+            return error_result("Local chown is not supported on this platform")
         else:
-            return CallToolResult(content=[TextContent(type="text", text=f"Unsupported file operation: {operation}")])
+            return error_result(f"Unsupported file operation: {operation}")
 
         result_text = f"Local file operation '{operation}' completed successfully\n\nPath: {path}"
         if output:
             result_text += f"\n\nOutput:\n{output}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     except Exception as exc:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Local file operation '{operation}' failed: {exc}")]
-        )
+        return error_result(f"Local file operation '{operation}' failed: {exc}")
 
 
 async def _handle_local_bulk_file_transfer(operation: str, arguments: dict) -> CallToolResult:
@@ -191,9 +181,7 @@ async def _handle_local_bulk_file_transfer(operation: str, arguments: dict) -> C
                 else:
                     shutil.copy2(source_path, destination)
         else:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Unsupported file transfer operation: {operation}")]
-            )
+            return error_result(f"Unsupported file transfer operation: {operation}")
 
         return CallToolResult(
             content=[
@@ -204,6 +192,4 @@ async def _handle_local_bulk_file_transfer(operation: str, arguments: dict) -> C
             ]
         )
     except Exception as exc:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Local file transfer '{operation}' failed: {exc}")]
-        )
+        return error_result(f"Local file transfer '{operation}' failed: {exc}")

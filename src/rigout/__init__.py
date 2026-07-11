@@ -1,6 +1,5 @@
 # Rigout package
-__version__ = "0.1.0"
-
+from ._version import __version__
 from .config_manager import CloudflareConfig, ConfigManager, SecurityConfig, ServerConfig, SSHConfig
 from .security_validator import SecurityValidator
 from .ssh_manager import (
@@ -19,6 +18,7 @@ from .ssh_manager import (
 from .terminal_session import TerminalSession
 
 __all__ = [
+    "__version__",
     "ConfigurationError",
     "SecurityError",
     "ConnectionError",

@@ -137,7 +137,8 @@ def is_trusted_author(pr_author: str, owner: str) -> bool:
     stranger's PR and an approval. Override with a comma-separated
     JULES_REVIEW_TRUSTED_AUTHORS to add collaborators."""
     configured = os.environ.get("JULES_REVIEW_TRUSTED_AUTHORS", "").strip()
-    trusted = {a.strip().lower() for a in configured.split(",") if a.strip()} if configured else {owner.lower()}
+    trusted = {owner.lower()}
+    trusted.update(a.strip().lower() for a in configured.split(",") if a.strip())
     return pr_author.lower() in trusted
 
 

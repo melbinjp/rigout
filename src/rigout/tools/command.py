@@ -4,6 +4,7 @@ from ..ssh_manager import (
     get_tunnel_manager,
     shell_join,
 )
+from ._results import error_result, failure_detail
 
 
 async def handle_execute_command(arguments: dict) -> CallToolResult:
@@ -16,7 +17,7 @@ async def handle_execute_command(arguments: dict) -> CallToolResult:
 
     endpoint = await get_tunnel_manager().auto_failover()
     if not endpoint:
-        return CallToolResult(content=[TextContent(type="text", text="No available hardware endpoints")])
+        return error_result("No available hardware endpoints")
 
     if use_sudo and not command.startswith("sudo"):
         command = f"sudo {command}"
@@ -43,8 +44,8 @@ async def handle_execute_command(arguments: dict) -> CallToolResult:
         result_text = f"Command failed on {result['endpoint']}\n\n"
         result_text += f"Command: {result['command']}\n"
         result_text += f"Exit Code: {result.get('exit_code', 'N/A')}\n"
-        result_text += f"Error: {result.get('error', result.get('stderr', 'Unknown error'))}"
-        return CallToolResult(content=[TextContent(type="text", text=result_text)])
+        result_text += f"Error: {failure_detail(result, 'Command execution failed')}"
+        return error_result(result_text)
 
 
 async def handle_create_terminal_session(arguments: dict) -> CallToolResult:
@@ -52,7 +53,7 @@ async def handle_create_terminal_session(arguments: dict) -> CallToolResult:
 
     endpoint = await get_tunnel_manager().auto_failover()
     if not endpoint:
-        return CallToolResult(content=[TextContent(type="text", text="No available hardware endpoints")])
+        return error_result("No available hardware endpoints")
 
     session = await get_tunnel_manager().create_terminal_session(endpoint, session_name)
 
@@ -64,7 +65,7 @@ async def handle_create_terminal_session(arguments: dict) -> CallToolResult:
         result_text += "You can now execute commands in this persistent session using execute_in_terminal."
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
-        return CallToolResult(content=[TextContent(type="text", text="Failed to create terminal session")])
+        return error_result("Failed to create terminal session")
 
 
 async def handle_execute_in_terminal(arguments: dict) -> CallToolResult:
@@ -80,13 +81,8 @@ async def handle_execute_in_terminal(arguments: dict) -> CallToolResult:
         result_text += f"Output:\n{result['output']}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
-        return CallToolResult(
-            content=[
-                TextContent(
-                    type="text",
-                    text=f"Command failed in session {session_id}: {result.get('error', 'Unknown error')}",
-                )
-            ]
+        return error_result(
+            f"Command failed in session {session_id}: {failure_detail(result, 'Terminal command failed')}"
         )
 
 
@@ -112,11 +108,7 @@ async def handle_close_terminal_session(arguments: dict) -> CallToolResult:
             content=[TextContent(type="text", text=f"Terminal session {session_id} closed successfully")]
         )
     else:
-        return CallToolResult(
-            content=[
-                TextContent(type="text", text=f"Failed to close terminal session {session_id} (session not found)")
-            ]
-        )
+        return error_result(f"Failed to close terminal session {session_id} (session not found)")
 
 
 async def handle_install_software(arguments: dict) -> CallToolResult:
@@ -125,7 +117,7 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
 
     endpoint = await get_tunnel_manager().auto_failover()
     if not endpoint:
-        return CallToolResult(content=[TextContent(type="text", text="No available hardware endpoints")])
+        return error_result("No available hardware endpoints")
 
     if package_manager == "auto":
         endpoint_platform = endpoint.platform.lower()
@@ -156,9 +148,7 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
     elif package_manager == "choco":
         command = f"choco install -y {quoted_packages}"
     else:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Unsupported package manager: {package_manager}")]
-        )
+        return error_result(f"Unsupported package manager: {package_manager}")
 
     result = await get_tunnel_manager().execute_command(endpoint, command, timeout=300, allow_sudo=True)
 
@@ -172,5 +162,5 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
     else:
         result_text = "Software installation failed\n\n"
         result_text += f"Packages: {', '.join(packages)}\n"
-        result_text += f"Error: {result.get('error', result.get('stderr', 'Unknown error'))}"
-        return CallToolResult(content=[TextContent(type="text", text=result_text)])
+        result_text += f"Error: {failure_detail(result, 'Software installation failed')}"
+        return error_result(result_text)

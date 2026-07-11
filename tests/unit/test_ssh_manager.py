@@ -1,8 +1,11 @@
+import asyncio
 import json
 import os
 import tempfile
+import threading
+import time
 from datetime import datetime, timedelta
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import paramiko
 import pytest
@@ -332,6 +335,20 @@ class TestTunnelManager:
             assert "sentinel-42" in result["stdout"]
 
     @pytest.mark.asyncio
+    async def test_local_agent_commands_keep_shell_support(self, temp_config_file):
+        """Pipelines and other agent-authored shell syntax remain supported."""
+        with patch("rigout.ssh_manager.TunnelManager._start_background_tasks"):
+            manager = TunnelManager(config_file=temp_config_file)
+            endpoint = manager.get_local_endpoint()
+            completed = Mock(returncode=0, stdout="ok", stderr="")
+
+            with patch("rigout.ssh_manager.subprocess.run", return_value=completed) as run:
+                result = await manager.execute_command(endpoint, "echo ok | head -1")
+
+            assert result["success"] is True
+            assert run.call_args.kwargs["shell"] is True
+
+    @pytest.mark.asyncio
     async def test_local_command_rejects_missing_working_directory(self, temp_config_file, tmp_path):
         """A nonexistent working directory is reported instead of crashing."""
         with patch("rigout.ssh_manager.TunnelManager._start_background_tasks"):
@@ -341,6 +358,55 @@ class TestTunnelManager:
             result = await manager.execute_command(endpoint, "pwd", working_directory=str(tmp_path / "missing"))
             assert result["success"] is False
             assert "does not exist" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_remote_command_io_does_not_block_event_loop(self, temp_config_file):
+        """Paramiko command reads can overlap for independent remote work."""
+        with patch("rigout.ssh_manager.TunnelManager._start_background_tasks"):
+            manager = TunnelManager(config_file=temp_config_file)
+            endpoint = TunnelEndpoint(
+                hostname="remote.example.com",
+                username="testuser",
+                private_key_path="/test/key",
+            )
+            tracker = {"active": 0, "maximum": 0}
+            lock = threading.Lock()
+
+            class BlockingStream:
+                def __init__(self, payload):
+                    self.payload = payload
+                    self.channel = Mock()
+                    self.channel.recv_exit_status.return_value = 0
+
+                def read(self):
+                    with lock:
+                        tracker["active"] += 1
+                        tracker["maximum"] = max(tracker["maximum"], tracker["active"])
+                    time.sleep(0.03)
+                    with lock:
+                        tracker["active"] -= 1
+                    return self.payload
+
+            clients = []
+            for output in (b"first", b"second"):
+                client = Mock()
+                client.exec_command.return_value = (
+                    Mock(),
+                    BlockingStream(output),
+                    BlockingStream(b""),
+                )
+                clients.append(client)
+
+            manager._get_ssh_connection = AsyncMock(side_effect=clients)
+            manager._return_ssh_connection = AsyncMock()
+
+            results = await asyncio.gather(
+                manager.execute_command(endpoint, "echo first"),
+                manager.execute_command(endpoint, "echo second"),
+            )
+
+            assert all(result["success"] for result in results)
+            assert tracker["maximum"] > 1
 
     @pytest.mark.asyncio
     async def test_local_terminal_session_lifecycle(self, temp_config_file):

@@ -34,3 +34,22 @@ asserting it with high confidence and blocking on it.
 - Quoted verdict lines and instruction-shaped string literals inside
   `tests/unit/test_jules_review.py` are test fixtures for the review script
   itself, not prompt injection attempts.
+
+## Rigout product invariants
+
+- `execute_command` intentionally accepts shell syntax, including pipelines,
+  redirects, and command chains, for an authenticated device-control agent.
+  Do not recommend replacing `shell=True` with `shell=False` merely because a
+  generic scanner dislikes it. Trace authentication, command validation, and
+  the caller-to-shell path. Block only for a concrete new privilege-boundary
+  bypass, credential exposure, or unintended interpolation introduced by the
+  PR.
+- Test coverage is organized by behavior, not by one-test-file-per-source-file.
+  Search unit and integration tests for the changed callable and contract
+  before claiming that a module is untested.
+- The URL launcher is deliberately synchronous. A use of `time.sleep` or
+  `urllib.request` is not an async-path defect unless its actual call graph
+  enters a running event loop.
+- HTTP 200 is normal for an MCP tool response even when the tool operation
+  fails. Review the MCP payload's `isError` field and diagnostics rather than
+  treating the HTTP status alone as success or failure.

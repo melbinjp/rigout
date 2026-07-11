@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -8,6 +9,13 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+
+SETUP_TOKEN_PATTERN = re.compile(r"(setup_token=)[^&\s]+")
+
+
+def redact_setup_tokens(text: str) -> str:
+    """Remove credential query values before writing diagnostic output."""
+    return SETUP_TOKEN_PATTERN.sub(r"\1***", text)
 
 
 def get_free_port():
@@ -61,7 +69,7 @@ def run_audit():
             if not line:
                 break
             # Print log line for CI visibility
-            sys.stdout.write(f"SERVER: {line}")
+            sys.stdout.write(f"SERVER: {redact_setup_tokens(line)}")
             sys.stdout.flush()
 
             if "Agent setup URL:" in line:
@@ -72,7 +80,7 @@ def run_audit():
 
     success = False
     if setup_url:
-        print(f"\nSUCCESS: Captured Setup URL: {setup_url}")
+        print("\nSUCCESS: Captured Agent Setup URL (credential redacted)")
 
         # Verify we can fetch the connection file using the setup URL
         print("Verifying setup URL access...")

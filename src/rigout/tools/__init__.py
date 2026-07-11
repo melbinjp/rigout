@@ -1,3 +1,4 @@
+from .activity import handle_get_server_activity
 from .command import (
     handle_close_terminal_session,
     handle_create_terminal_session,
@@ -13,6 +14,7 @@ from .monitoring import handle_get_hardware_info, handle_system_monitoring
 from .tunnel import handle_connect_hardware, handle_manage_tunnels
 
 __all__ = [
+    "handle_get_server_activity",
     "handle_execute_command",
     "handle_create_terminal_session",
     "handle_execute_in_terminal",

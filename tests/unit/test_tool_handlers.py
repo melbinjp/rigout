@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -70,6 +71,7 @@ class TestToolHandlers:
         result = await handle_execute_command(args)
 
         assert isinstance(result, CallToolResult)
+        assert result.isError is False
         assert "file1.txt" in result.content[0].text
         assert "Command executed successfully" in result.content[0].text
         mock_manager.execute_command.assert_called_once()
@@ -90,8 +92,26 @@ class TestToolHandlers:
         result = await handle_execute_command(args)
 
         assert isinstance(result, CallToolResult)
+        assert result.isError is True
         assert "Command failed" in result.content[0].text
         assert "No such file or directory" in result.content[0].text
+
+    async def test_handle_execute_command_failure_falls_back_to_exit_status(self, mock_manager):
+        """A silent nonzero command still returns a deterministic diagnostic."""
+        mock_manager.auto_failover.return_value = MagicMock()
+        mock_manager.execute_command.return_value = {
+            "success": False,
+            "endpoint": "test-host",
+            "command": "false",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "",
+        }
+
+        result = await handle_execute_command({"command": "false"})
+
+        assert result.isError is True
+        assert "Command exited with status 1" in result.content[0].text
 
     async def test_handle_create_terminal_session(self, mock_manager):
         """Test handle_create_terminal_session"""
@@ -152,6 +172,7 @@ class TestToolHandlers:
 
         mock_manager.close_terminal_session.return_value = False
         result = await handle_close_terminal_session({"session_id": "sess-123"})
+        assert result.isError is True
         assert "Failed to close" in result.content[0].text
 
     async def test_handle_install_software(self, mock_manager):
@@ -183,6 +204,23 @@ class TestToolHandlers:
         args = {"operation": "list"}
         result = await handle_docker_operations(args)
         assert "Docker command success" in result.content[0].text
+
+    async def test_handle_docker_failure_preserves_exit_status(self, mock_manager):
+        """Docker failures must be flagged and never collapse to Unknown error."""
+        mock_manager.auto_failover.return_value = MagicMock()
+        mock_manager.execute_command.return_value = {
+            "success": False,
+            "endpoint": "test-host",
+            "command": "docker ps -a",
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": "",
+        }
+
+        result = await handle_docker_operations({"operation": "list"})
+
+        assert result.isError is True
+        assert "Command exited with status 127" in result.content[0].text
 
     async def test_handle_environment_setup(self, mock_manager):
         """Test handle_environment_setup"""
@@ -231,6 +269,49 @@ class TestToolHandlers:
         args = {"metrics": ["cpu"]}
         result = await handle_system_monitoring(args)
         assert "CPU: 5%" in result.content[0].text
+
+    async def test_handle_system_monitoring_runs_metrics_concurrently(self, mock_manager):
+        """Independent metrics no longer incur sequential command latency."""
+        endpoint = MagicMock()
+        endpoint.platform = "Linux"
+        mock_manager.auto_failover.return_value = endpoint
+        active = 0
+        maximum_active = 0
+
+        async def execute(_endpoint, command):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return {"success": True, "stdout": command, "stderr": "", "exit_code": 0}
+
+        mock_manager.execute_command.side_effect = execute
+
+        result = await handle_system_monitoring({"metrics": ["cpu", "memory", "disk"]})
+
+        assert result.isError is False
+        assert maximum_active > 1
+        assert mock_manager.execute_command.call_count == 3
+
+    async def test_handle_system_monitoring_keeps_partial_results(self, mock_manager):
+        """One failed metric is flagged without discarding successful metrics."""
+        endpoint = MagicMock()
+        endpoint.platform = "Linux"
+        mock_manager.auto_failover.return_value = endpoint
+
+        async def execute(_endpoint, command):
+            if command == "free -h":
+                return {"success": False, "stderr": "memory unavailable", "exit_code": 9}
+            return {"success": True, "stdout": "cpu available", "stderr": "", "exit_code": 0}
+
+        mock_manager.execute_command.side_effect = execute
+
+        result = await handle_system_monitoring({"metrics": ["cpu", "memory"]})
+
+        assert result.isError is True
+        assert "cpu available" in result.content[0].text
+        assert "memory unavailable" in result.content[0].text
 
     async def test_handle_get_hardware_info(self, mock_manager):
         """Test handle_get_hardware_info"""

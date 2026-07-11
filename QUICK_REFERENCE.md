@@ -9,8 +9,8 @@ pip install rigout
 ## Run
 
 ```bash
-rigout
 rigout --tunnel cloudflare
+rigout
 rigout --port 9000
 rigout --public-url https://rigout.example.com
 rigout --auth-token "$RIGOUT_TOKEN"
@@ -20,6 +20,29 @@ rigout --tunnel cloudflare --setup-token "$RIGOUT_SETUP_TOKEN"
 rigout --tunnel cloudflare --no-agent-setup-url
 python -m rigout.mcp_url_launcher --tunnel cloudflare
 ```
+
+`rigout --tunnel cloudflare` is the primary foreground shortcut. It prints the agent setup URL and runs until Ctrl+C. Cloudflare quick-tunnel URLs are ephemeral.
+
+## Managed Lifecycle
+
+```bash
+rigout start --tunnel cloudflare --detach
+rigout status
+rigout logs --tail 100
+rigout logs --follow
+rigout stop
+```
+
+Machine-readable commands:
+
+```bash
+rigout start --tunnel cloudflare --detach --output json
+rigout status --output json
+rigout logs --tail 50 --output json
+rigout stop --output json
+```
+
+`--output json` startup requires `--detach`. `logs --follow` is text-only.
 
 ## Source Checkout
 
@@ -36,12 +59,24 @@ rigout-stdio
 
 ## Files
 
-- `ai_agent_connection.json`: generated MCP client configuration.
-- `mcp-hardware-server.log`: audit and runtime log.
+- Windows state: `%LOCALAPPDATA%\rigout\state`
+- macOS state: `~/Library/Application Support/rigout`
+- Linux state: `$XDG_STATE_HOME/rigout` or `~/.local/state/rigout`
+- `connection.json`: generated MCP client configuration; contains the bearer token.
+- `activity.log`: managed startup/runtime output.
+- `runtime.json` and `rigout.pid`: credential-free lifecycle metadata.
 - `pyproject.toml`: package metadata and build configuration.
 - `src/rigout/`: package source.
 - `tests/`: pytest coverage.
 - User-local Rigout cache: stores auto-downloaded `cloudflared` when needed.
+
+Use `--state-dir PATH` or `RIGOUT_STATE_DIR` to override the state root. Managed files use owner-only modes on POSIX.
+
+## Agent Diagnostics
+
+Call `get_server_activity` for bounded, sanitized JSON containing lifecycle status and the most recent 1-200 activity lines (default 50). MCP access does not automatically expose the host's raw terminal window.
+
+Tool failures use MCP `isError: true`; HTTP 200 alone does not mean a tool call succeeded.
 
 ## Verification
 

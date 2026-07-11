@@ -1,6 +1,7 @@
 from mcp.types import CallToolResult, TextContent
 
 from ..ssh_manager import get_tunnel_manager, heredoc_redirect, shell_quote
+from ._results import error_result, failure_detail
 
 
 async def handle_environment_setup(arguments: dict) -> CallToolResult:
@@ -10,7 +11,7 @@ async def handle_environment_setup(arguments: dict) -> CallToolResult:
 
     endpoint = await get_tunnel_manager().auto_failover()
     if not endpoint:
-        return CallToolResult(content=[TextContent(type="text", text="No available hardware endpoints")])
+        return error_result("No available hardware endpoints")
 
     is_local = getattr(endpoint, "private_key_path", "") == "__local__"
     is_windows = "win" in (endpoint.platform or "").lower()
@@ -70,6 +71,8 @@ async def handle_environment_setup(arguments: dict) -> CallToolResult:
         if requirements:
             for req in requirements:
                 commands.append(f"conda install -y {shell_quote(req)}")
+    elif env_type != "custom":
+        return error_result(f"Unsupported environment type: {env_type}")
 
     full_command = " && ".join(commands)
     result = await get_tunnel_manager().execute_command(endpoint, full_command, timeout=300, allow_sudo=True)
@@ -81,11 +84,6 @@ async def handle_environment_setup(arguments: dict) -> CallToolResult:
         result_text += f"\nSetup output:\n{result['stdout']}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
-        return CallToolResult(
-            content=[
-                TextContent(
-                    type="text",
-                    text=f"Environment setup '{env_type}' failed: {result.get('error', 'Unknown error')}",
-                )
-            ]
+        return error_result(
+            f"Environment setup '{env_type}' failed: {failure_detail(result, 'Environment command failed')}"
         )

@@ -1,6 +1,7 @@
 from mcp.types import CallToolResult, TextContent
 
 from ..ssh_manager import get_tunnel_manager, shell_quote
+from ._results import error_result, failure_detail
 
 
 async def handle_docker_operations(arguments: dict) -> CallToolResult:
@@ -8,7 +9,7 @@ async def handle_docker_operations(arguments: dict) -> CallToolResult:
 
     endpoint = await get_tunnel_manager().auto_failover()
     if not endpoint:
-        return CallToolResult(content=[TextContent(type="text", text="No available hardware endpoints")])
+        return error_result("No available hardware endpoints")
 
     command = ""
     if operation == "list":
@@ -62,6 +63,8 @@ async def handle_docker_operations(arguments: dict) -> CallToolResult:
     elif operation == "inspect":
         container = arguments.get("container_name", "")
         command = f"docker inspect {shell_quote(container)}"
+    else:
+        return error_result(f"Unsupported Docker operation: {operation}")
 
     result = await get_tunnel_manager().execute_command(endpoint, command, timeout=60, allow_sudo=True)
 
@@ -71,11 +74,4 @@ async def handle_docker_operations(arguments: dict) -> CallToolResult:
         result_text += f"Output:\n{result['stdout']}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
-        return CallToolResult(
-            content=[
-                TextContent(
-                    type="text",
-                    text=f"Docker operation '{operation}' failed: {result.get('error', 'Unknown error')}",
-                )
-            ]
-        )
+        return error_result(f"Docker operation '{operation}' failed: {failure_detail(result, 'Docker command failed')}")

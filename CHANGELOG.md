@@ -6,6 +6,13 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- Packaged process lifecycle commands: `rigout start --detach`, `status`,
+  `logs`, and `stop`, with credential-free `--output json` results and a
+  platform-appropriate per-user state directory configurable through
+  `--state-dir` or `RIGOUT_STATE_DIR`.
+- `get_server_activity`, a read-only MCP tool returning lifecycle status and
+  1-200 recent sanitized activity lines instead of exposing an unbounded raw
+  terminal transcript.
 - `.github/jules-review-rules.md`: maintainer-authored review guidance loaded
   from the base branch, telling the reviewer not to flag unfamiliar
   dependency/Action versions as nonexistent from training knowledge alone (#18).
@@ -17,6 +24,29 @@ All notable changes to this project are documented here. Format follows
   payload.
 
 ### Fixed
+- Setup-token handling: tokens expire after 15 minutes by default, are
+  redacted from Rigout-controlled access logs, and protected connection
+  responses include no-store/no-cache headers. Unauthorized responses now
+  include a bearer challenge.
+- MCP operational failures and unknown tools now preserve `isError: true`;
+  command-backed failures report an explicit error, stderr, or exit-status
+  fallback instead of blank or misleading diagnostics.
+- Malformed MCP requests retain their JSON-RPC validation response while the
+  server logs one concise summary instead of a large Pydantic union dump.
+- Shell validation now distinguishes quoted literal data from control
+  operators while retaining destructive-command protection.
+- Package, HTTP, and stdio server version reporting now use the same package
+  metadata source.
+- Managed runtime files no longer depend on the launcher's current working
+  directory, and the launcher no longer injects its source tree into child
+  `PYTHONPATH`. Detached startup also handles Windows virtual-environment
+  redirector processes whose PID differs from the managed Python child.
+- System monitoring gathers independent metrics concurrently with a small
+  bound while preserving partial failure diagnostics.
+- Production validation now runs the required lint, format, type-check, and
+  test gates and only reports production ready when every category passes.
+- The Jules review workflow executes the trusted reviewer script from the
+  protected base revision with persisted checkout credentials disabled.
 - Jules review skips cleanly on Dependabot PRs instead of failing with 401s -
   GitHub withholds repository secrets from Dependabot-triggered runs (#16).
 - Auto-merge workflow: arming auto-merge needs `contents: write`, and now

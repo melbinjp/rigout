@@ -108,6 +108,35 @@ class TestSecurityValidator:
             is_valid, err = validator.validate_command(cmd)
             assert is_valid is True, f"{cmd!r} should be allowed, got: {err}"
 
+    def test_validate_command_treats_quoted_dangerous_text_as_data(self, validator):
+        """Harmless diagnostics may mention destructive commands literally."""
+        for cmd in ["printf 'rm -rf /'", 'echo "rm -rf /"', "echo '$(rm -rf /)'"]:
+            is_valid, err = validator.validate_command(cmd)
+            assert is_valid is True, f"{cmd!r} should be allowed, got: {err}"
+
+    def test_validate_command_blocks_substitution_inside_double_quotes(self, validator):
+        """Double quotes do not make command substitutions literal."""
+        for cmd in ['echo "$(rm -rf /)"', 'echo "it\'s $(rm -rf /)"']:
+            is_valid, err = validator.validate_command(cmd)
+            assert is_valid is False
+            assert "dangerous pattern" in err.lower()
+
+    def test_validate_command_does_not_split_quoted_grep_alternation(self, validator):
+        """A quoted regex pipe must not be audited as extra executables."""
+        with patch("rigout.security_validator.logger.warning") as warning:
+            is_valid, err = validator.validate_command("grep -E 'ERROR|WARNING|Traceback' service.log")
+
+        assert is_valid is True
+        assert err == ""
+        warning.assert_not_called()
+
+    def test_validate_command_blocks_quoted_executable_and_shell_c(self, validator):
+        """Quoting syntax must not hide commands that the shell will execute."""
+        for cmd in ["'rm' -rf /", "bash -c 'rm -rf /'"]:
+            is_valid, err = validator.validate_command(cmd)
+            assert is_valid is False
+            assert "dangerous pattern" in err.lower()
+
     def test_validate_command_blocks_chained_sudo_without_permission(self, validator):
         """Sudo hidden behind chaining is still gated by allow_sudo"""
         is_valid, err = validator.validate_command("ls && sudo apt update", allow_sudo=False)
