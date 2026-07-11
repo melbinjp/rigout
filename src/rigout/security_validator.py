@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import stat
 
 logger = logging.getLogger(__name__)
@@ -144,6 +145,99 @@ class SecurityValidator:
         self.blocked_commands = []
         self.security_log = []
 
+    @staticmethod
+    def _mask_quoted_literals(command: str, *, include_double_quotes: bool) -> str:
+        """Mask shell literals while preserving the command's character positions."""
+        masked: list[str] = []
+        quote: str | None = None
+        escaped = False
+        for char in command:
+            if escaped:
+                should_mask = quote == "'" or (quote == '"' and include_double_quotes)
+                masked.append(" " if should_mask else char)
+                escaped = False
+                continue
+            if char == "\\" and quote != "'":
+                masked.append(" " if quote == '"' and include_double_quotes else char)
+                escaped = True
+                continue
+            if quote:
+                if char == quote:
+                    quote = None
+                    masked.append(" ")
+                elif quote == "'" or include_double_quotes:
+                    masked.append(" ")
+                else:
+                    masked.append(char)
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                masked.append(" ")
+                continue
+            masked.append(char)
+        return "".join(masked)
+
+    @staticmethod
+    def _tokenize_command(command: str) -> list[str]:
+        """Tokenize shell operators without treating quoted operators as syntax."""
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
+        lexer.commenters = ""
+        lexer.whitespace_split = True
+        return list(lexer)
+
+    @staticmethod
+    def _command_segments(tokens: list[str]) -> list[list[str]]:
+        """Split shell tokens at control operators while retaining redirections."""
+        segments: list[list[str]] = [[]]
+        for token in tokens:
+            if token in {"&&", "||", ";", "|", "&"}:
+                if segments[-1]:
+                    segments.append([])
+                continue
+            segments[-1].append(token)
+        return [segment for segment in segments if segment]
+
+    @staticmethod
+    def _segment_command(segment: list[str]) -> tuple[str, list[str]]:
+        """Return the executable and arguments from one shell segment."""
+        words = list(segment)
+        while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+            words.pop(0)
+        if not words:
+            return "", []
+        return os.path.basename(words[0]).lower(), words[1:]
+
+    def _semantic_danger(self, tokens: list[str]) -> str | None:
+        """Detect destructive behavior that quote masking alone could hide."""
+        raw_devices = re.compile(r"/dev/(?:sd[a-z]|hd[a-z]|nvme\w*|mmcblk\w*|mem\b|kmem|port)$", re.IGNORECASE)
+        for index, token in enumerate(tokens[:-1]):
+            if token in {">", ">>", "<", "<<"} and raw_devices.fullmatch(tokens[index + 1]):
+                return "raw device redirection"
+
+        segments = self._command_segments(tokens)
+        for segment in segments:
+            executable, args = self._segment_command(segment)
+            if executable == "sudo" and args:
+                executable = os.path.basename(args[0]).lower()
+                args = args[1:]
+
+            if executable == "rm":
+                flags = "".join(arg[1:] for arg in args if arg.startswith("-") and not arg.startswith("--"))
+                targets = [arg for arg in args if not arg.startswith("-")]
+                if (
+                    "r" in flags
+                    and "f" in flags
+                    and any(target == "/" or target.startswith("/*") for target in targets)
+                ):
+                    return "executable rm -rf /"
+
+            if executable in {"bash", "sh"} and len(args) >= 2 and args[0] == "-c":
+                nested_safe, nested_error = self.validate_command(args[1], allow_sudo=True)
+                if not nested_safe:
+                    return nested_error
+
+        return None
+
     def validate_hostname(self, hostname: str) -> tuple[bool, str]:
         """
         Validate hostname for security and format compliance
@@ -207,29 +301,44 @@ class SecurityValidator:
         # Remove leading/trailing whitespace
         command = command.strip()
 
-        # Check for dangerous patterns
+        try:
+            tokens = self._tokenize_command(command)
+        except ValueError as exc:
+            return False, f"Invalid shell syntax: {exc}"
+
+        # Quoted text is data, not shell syntax. Command substitutions inside
+        # double quotes remain executable, so mask only single quotes for them.
+        unquoted_command = self._mask_quoted_literals(command, include_double_quotes=True)
         for pattern in self.DANGEROUS_PATTERNS:
-            if re.search(pattern, command, re.IGNORECASE):
+            if pattern in {r"`[^`]*`", r"\$\([^)]*\)"}:
+                scan_text = self._mask_quoted_literals(command, include_double_quotes=False)
+            else:
+                scan_text = unquoted_command
+            if re.search(pattern, scan_text, re.IGNORECASE):
                 self.blocked_commands.append(command)
                 return False, f"Command contains dangerous pattern: {pattern}"
+
+        semantic_danger = self._semantic_danger(tokens)
+        if semantic_danger:
+            self.blocked_commands.append(command)
+            return False, f"Command contains dangerous pattern: {semantic_danger}"
 
         # Inspect every segment of a chained/piped command the same way as the
         # main command: sudo is gated by allow_sudo, destructive patterns are
         # already blocked above, and unrecognized commands are logged but not
         # blocked (blanket blocking breaks routine pipelines like `ps | head`).
-        segments = re.split(r"&&|\|\||[;|]", command)
+        segments = self._command_segments(tokens)
         for segment in segments:
-            words = segment.strip().split()
-            if not words:
+            segment_command, words = self._segment_command(segment)
+            if not segment_command:
                 continue
-            segment_command = words[0]
-            if segment_command.lower() == "sudo":
+            if segment_command == "sudo":
                 if not allow_sudo:
                     self.blocked_commands.append(command)
                     return False, "Sudo commands not allowed in this context"
-                if len(words) < 2:
+                if not words:
                     return False, "Incomplete sudo command"
-                segment_command = words[1]
+                segment_command = os.path.basename(words[0]).lower()
             if segment_command not in self.ALLOWED_COMMANDS:
                 logger.warning(f"Command not in allowed list: {segment_command}")
                 # Don't block, but log for monitoring

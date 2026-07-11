@@ -1,6 +1,7 @@
 from mcp.types import CallToolResult, TextContent
 
 from ..ssh_manager import get_tunnel_manager
+from ._results import error_result
 
 
 async def handle_connect_hardware(arguments: dict) -> CallToolResult:
@@ -21,11 +22,7 @@ async def handle_connect_hardware(arguments: dict) -> CallToolResult:
         endpoint = await manager.auto_failover()
 
     if not endpoint:
-        return CallToolResult(
-            content=[
-                TextContent(type="text", text="No available hardware endpoints. Please add tunnel endpoints first.")
-            ]
-        )
+        return error_result("No available hardware endpoints. Please add tunnel endpoints first.")
 
     hardware_info = await get_tunnel_manager().get_hardware_info(endpoint)
 
@@ -62,17 +59,13 @@ async def handle_manage_tunnels(arguments: dict) -> CallToolResult:
     elif action == "remove":
         hostname = arguments.get("hostname")
         if not hostname:
-            return CallToolResult(
-                content=[TextContent(type="text", text="The remove action requires a hostname argument")]
-            )
+            return error_result("The remove action requires a hostname argument")
 
         manager = get_tunnel_manager()
         remaining = [endpoint for endpoint in manager.endpoints if endpoint.hostname != hostname]
         removed_count = len(manager.endpoints) - len(remaining)
         if not removed_count:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"No tunnel endpoint found with hostname: {hostname}")]
-            )
+            return error_result(f"No tunnel endpoint found with hostname: {hostname}")
 
         manager.endpoints = remaining
         if manager.active_endpoint and manager.active_endpoint.hostname == hostname:
@@ -110,6 +103,8 @@ async def handle_manage_tunnels(arguments: dict) -> CallToolResult:
 
         result_text = "Tunnel Test Results:\n\n"
         result_text += "\n".join(results)
+        if any(result.endswith(": FAIL") for result in results):
+            return error_result(result_text)
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
 
     elif action == "failover":
@@ -124,6 +119,6 @@ async def handle_manage_tunnels(arguments: dict) -> CallToolResult:
             result_text += f"Response time: {new_endpoint.response_time:.2f}s"
             return CallToolResult(content=[TextContent(type="text", text=result_text)])
         else:
-            return CallToolResult(content=[TextContent(type="text", text="Failover failed: No available endpoints")])
+            return error_result("Failover failed: No available endpoints")
     else:
-        return CallToolResult(content=[TextContent(type="text", text=f"Unsupported tunnel action: {action}")])
+        return error_result(f"Unsupported tunnel action: {action}")

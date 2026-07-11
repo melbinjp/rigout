@@ -55,9 +55,6 @@ def configure_console_output():
     sys.stderr = AsciiStatusStream(sys.stderr)
 
 
-configure_console_output()
-
-
 def validate_security_features() -> list[str]:
     """Validate security features are properly implemented"""
     issues = []
@@ -297,6 +294,117 @@ def run_basic_tests() -> list[str]:
     return issues
 
 
+def validate_required_quality_gates() -> list[str]:
+    """Run the same static gates that are required by branch protection."""
+    issues = []
+    commands = [
+        ("Ruff lint", [sys.executable, "-m", "ruff", "check", "."]),
+        ("Ruff format", [sys.executable, "-m", "ruff", "format", "--check", "."]),
+        ("Mypy", [sys.executable, "-m", "mypy", "src", "--ignore-missing-imports"]),
+    ]
+
+    for label, command in commands:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            issues.append(f"{label} timed out")
+            continue
+        except OSError as exc:
+            issues.append(f"{label} could not run: {exc}")
+            continue
+
+        if result.returncode != 0:
+            output = (result.stdout + "\n" + result.stderr).strip()
+            issues.append(f"{label} failed:\n{output}")
+
+    if not issues:
+        print("[OK] Required lint, format, and type-check gates passed")
+    return issues
+
+
+def validate_runtime_contracts() -> list[str]:
+    """Validate contracts that previously passed unit checks but failed live MCP use."""
+    issues = []
+
+    try:
+        import asyncio
+
+        from starlette.testclient import TestClient
+
+        from rigout import __version__
+        from rigout.mcp_http_server import create_app
+        from rigout.server import handle_call_tool_result, server
+
+        if getattr(server, "version", None) != __version__:
+            issues.append(f"MCP server version is {getattr(server, 'version', None)}, expected {__version__}")
+
+        unknown_result = asyncio.run(handle_call_tool_result("definitely_unknown_tool", {}))
+        if not unknown_result.isError:
+            issues.append("Unknown MCP tools are not marked with isError=true")
+
+        app = create_app(connection_file=None, setup_token="setup-check", auth_token="bearer-check")
+        with TestClient(app) as client:
+            unauthorized = client.get("/connection.json")
+            if unauthorized.status_code != 401:
+                issues.append("Unauthenticated connection metadata did not return HTTP 401")
+            if unauthorized.headers.get("www-authenticate") != "Bearer":
+                issues.append("HTTP 401 response is missing WWW-Authenticate: Bearer")
+            if unauthorized.headers.get("cache-control") != "no-store":
+                issues.append("HTTP 401 response is missing Cache-Control: no-store")
+
+            bootstrap = client.get("/connection.json?setup_token=setup-check")
+            if bootstrap.status_code != 200:
+                issues.append("Valid setup token could not bootstrap connection metadata")
+            if bootstrap.headers.get("cache-control") != "no-store":
+                issues.append("Credential-bearing connection metadata can be cached")
+
+        if not issues:
+            print("[OK] Live MCP auth, version, and error-result contracts passed")
+    except Exception as exc:
+        issues.append(f"Runtime contract validation error: {exc}")
+
+    return issues
+
+
+def validate_package_build() -> list[str]:
+    """Build and inspect fresh wheel and source-distribution artifacts."""
+    issues = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="rigout-build-") as output_dir:
+            build_result = subprocess.run(
+                [sys.executable, "-m", "build", "--outdir", output_dir],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if build_result.returncode != 0:
+                output = (build_result.stdout + "\n" + build_result.stderr).strip()
+                return [f"Package build failed:\n{output}"]
+
+            artifacts = [str(path) for path in Path(output_dir).glob("rigout-*")]
+            if not artifacts:
+                return ["Package build produced no Rigout artifacts"]
+
+            check_result = subprocess.run(
+                [sys.executable, "-m", "twine", "check", *artifacts],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if check_result.returncode != 0:
+                output = (check_result.stdout + "\n" + check_result.stderr).strip()
+                issues.append(f"Twine metadata check failed:\n{output}")
+
+        if not issues:
+            print("[OK] Fresh package build and metadata checks passed")
+    except subprocess.TimeoutExpired:
+        issues.append("Package build validation timed out")
+    except OSError as exc:
+        issues.append(f"Package build validation could not run: {exc}")
+
+    return issues
+
+
 def generate_production_report() -> dict[str, Any]:
     """Generate comprehensive production readiness report"""
 
@@ -312,6 +420,9 @@ def generate_production_report() -> dict[str, Any]:
         ("Error Handling", validate_error_handling),
         ("Logging System", validate_logging_system),
         ("Basic Tests", run_basic_tests),
+        ("Required Quality Gates", validate_required_quality_gates),
+        ("Runtime Contracts", validate_runtime_contracts),
+        ("Package Build", validate_package_build),
     ]
 
     all_issues = []
@@ -351,9 +462,11 @@ def generate_production_report() -> dict[str, Any]:
     success_rate = (passed_categories / total_categories) * 100
     print(f"Success rate: {success_rate:.1f}%")
 
-    if success_rate >= 90:
+    production_ready = not all_issues and passed_categories == total_categories
+
+    if production_ready:
         print("\n[OK] PRODUCTION READY")
-        print("Rigout meets the current production validation checks.")
+        print("Rigout passed every current production validation check.")
     elif success_rate >= 75:
         print("\n[WARN] MOSTLY READY")
         print("The server is mostly production-ready with minor issues to address.")
@@ -374,12 +487,13 @@ def generate_production_report() -> dict[str, Any]:
         "total_issues": len(all_issues),
         "issues": all_issues,
         "results": results,
-        "production_ready": success_rate >= 90,
+        "production_ready": production_ready,
     }
 
 
 def main():
     """Main validation function"""
+    configure_console_output()
     report = generate_production_report()
 
     # Save report to file

@@ -78,7 +78,8 @@ class TestIsTrustedAuthor:
         assert jules_review.is_trusted_author("random-stranger", "melbinjp") is False
 
     def test_env_override_extends_allowlist(self, monkeypatch):
-        monkeypatch.setenv("JULES_REVIEW_TRUSTED_AUTHORS", "melbinjp, trusted-bot")
+        monkeypatch.setenv("JULES_REVIEW_TRUSTED_AUTHORS", "trusted-bot")
+        assert jules_review.is_trusted_author("melbinjp", "melbinjp") is True
         assert jules_review.is_trusted_author("trusted-bot", "melbinjp") is True
         assert jules_review.is_trusted_author("random-stranger", "melbinjp") is False
 

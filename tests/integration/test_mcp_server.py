@@ -4,10 +4,11 @@ import tempfile
 from unittest.mock import patch
 
 import pytest
+from mcp.types import CallToolRequest, CallToolRequestParams
 
 from rigout.config_manager import ConfigManager
 from rigout.security_validator import SecurityValidator
-from rigout.server import handle_call_tool, handle_list_tools
+from rigout.server import handle_call_tool, handle_call_tool_result, handle_list_tools, server
 from rigout.ssh_manager import TunnelEndpoint, get_tunnel_manager
 
 
@@ -34,6 +35,7 @@ class TestMCPServerIntegration:
             "list_terminal_sessions",
             "close_terminal_session",
             "get_hardware_info",
+            "get_server_activity",
             "manage_tunnels",
             "install_software",
             "file_operations",
@@ -97,9 +99,20 @@ class TestMCPServerIntegration:
 
         # Test execute_command should fail gracefully when no endpoints are active
         with patch("rigout.ssh_manager.TunnelManager.auto_failover", return_value=None):
-            result = await handle_call_tool("execute_command", {"command": "ls"})
-            assert result and len(result) > 0
-            assert "No available hardware endpoints" in result[0].text
+            result = await handle_call_tool_result("execute_command", {"command": "ls"})
+            assert result.isError is True
+            assert "No available hardware endpoints" in result.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_registered_handler_preserves_mcp_error_flag(self):
+        """The SDK-facing handler must emit isError for unknown tools."""
+        handler = server.request_handlers[CallToolRequest]
+        response = await handler(
+            CallToolRequest(params=CallToolRequestParams(name="definitely_unknown_tool", arguments={}))
+        )
+
+        assert response.root.isError is True
+        assert "Unknown tool" in response.root.content[0].text
 
     @pytest.mark.asyncio
     async def test_live_endpoint_when_configured(self):

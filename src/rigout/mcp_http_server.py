@@ -9,31 +9,39 @@ at a URL, normally http://127.0.0.1:8765/mcp or a public tunnel URL.
 import argparse
 import hmac
 import json
+import logging
 import os
 import platform
 import secrets
 import socket
 import stat
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode
 
 import uvicorn
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
+from ._version import __version__
 from .server import server
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_PATH = "/mcp"
 DEFAULT_CONNECTION_FILE = "ai_agent_connection.json"
+DEFAULT_SETUP_TOKEN_TTL_SECONDS = 15 * 60
+BEARER_CHALLENGE_HEADERS = {"WWW-Authenticate": "Bearer"}
+NO_STORE_HEADERS = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+AUTH_FAILURE_HEADERS = {**BEARER_CHALLENGE_HEADERS, **NO_STORE_HEADERS}
 
 
 def tokens_match(provided: str | bytes | None, expected: str | bytes) -> bool:
@@ -43,6 +51,67 @@ def tokens_match(provided: str | bytes | None, expected: str | bytes) -> bool:
     provided_bytes = provided.encode() if isinstance(provided, str) else provided
     expected_bytes = expected.encode() if isinstance(expected, str) else expected
     return hmac.compare_digest(provided_bytes, expected_bytes)
+
+
+def unauthorized_response() -> JSONResponse:
+    """Return a standards-compliant bearer authentication challenge."""
+    return JSONResponse(
+        {"error": "unauthorized"},
+        status_code=401,
+        headers=AUTH_FAILURE_HEADERS,
+    )
+
+
+def redact_setup_token_query(query_string: bytes) -> bytes:
+    """Redact setup-token values before an HTTP access logger sees them."""
+    if not query_string:
+        return query_string
+
+    pairs = parse_qsl(query_string.decode("latin-1"), keep_blank_values=True)
+    if not any(key == "setup_token" for key, _ in pairs):
+        return query_string
+
+    redacted_pairs = [(key, "REDACTED" if key == "setup_token" else value) for key, value in pairs]
+    return urlencode(redacted_pairs).encode("ascii")
+
+
+class RedactSetupTokenQueryMiddleware:
+    """Hide setup credentials from Uvicorn's response-time access logging."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http" or not scope.get("query_string"):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_redacted_query(message) -> None:
+            if message.get("type") == "http.response.start":
+                scope["query_string"] = redact_setup_token_query(scope["query_string"])
+            await send(message)
+
+        await self.app(scope, receive, send_with_redacted_query)
+
+
+class ConciseMCPValidationFilter(logging.Filter):
+    """Replace verbose MCP SDK validation dumps with secret-free summaries."""
+
+    _MESSAGES = {
+        "Failed to validate request:": "Rejected malformed MCP request: invalid request parameters",
+        "Failed to validate notification:": ("Rejected malformed MCP notification: invalid notification parameters"),
+    }
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            for prefix, replacement in self._MESSAGES.items():
+                if record.msg.startswith(prefix):
+                    record.msg = replacement
+                    record.args = ()
+                    record.exc_info = None
+                    record.exc_text = None
+                    break
+        return True
 
 
 class BearerAuthASGIApp:
@@ -55,7 +124,7 @@ class BearerAuthASGIApp:
     async def __call__(self, scope, receive, send) -> None:
         headers = dict(scope.get("headers") or [])
         if not tokens_match(headers.get(b"authorization"), self.expected):
-            response = JSONResponse({"error": "unauthorized"}, status_code=401)
+            response = unauthorized_response()
             await response(scope, receive, send)
             return
         await self.app(scope, receive, send)
@@ -116,6 +185,7 @@ def build_connection_data(
 ) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     connection_data = {
+        "server": {"name": "rigout", "version": __version__},
         "mcp_server_type": "hardware_access",
         "connection_method": "mcp_streamable_http",
         "mcp_server_url": mcp_url,
@@ -134,11 +204,16 @@ def build_connection_data(
             "package_installation",
             "hardware_access",
             "terminal_sessions",
+            "server_activity",
         ],
         "security": {
             "ai_agent_mode": True,
             "bypass_security_available": True,
-            "audit_log": "mcp-hardware-server.log",
+            "activity_access": {
+                "tool": "get_server_activity",
+                "format": "json",
+                "maximum_lines": 200,
+            },
             "bind_host": host,
             "port": port,
             "auth": "bearer" if auth_token else "none",
@@ -148,6 +223,7 @@ def build_connection_data(
             "Configure the agent MCP client with mcp.url using streamable-http transport.",
             "Call manage_tunnels/add if remote SSH endpoints should be registered.",
             "Call manage_tunnels/list or system_monitoring to verify connectivity before heavy work.",
+            "Call get_server_activity to inspect bounded, sanitized Rigout runtime activity.",
         ],
         "setup_date": datetime.now().isoformat(),
     }
@@ -189,12 +265,16 @@ def create_app(
     public_url: str | None = None,
     connection_file: str | Path | None = None,
     setup_token: str | None = None,
+    setup_token_ttl_seconds: float = DEFAULT_SETUP_TOKEN_TTL_SECONDS,
     auth_token: str | None = None,
     json_response: bool = False,
     stateless: bool = False,
 ) -> Starlette:
     path = normalize_path(path)
     mcp_url = public_url or local_url(host, port, path)
+    if setup_token and setup_token_ttl_seconds <= 0:
+        raise ValueError("setup_token_ttl_seconds must be greater than zero")
+    setup_token_expires_at = time.monotonic() + setup_token_ttl_seconds if setup_token else None
 
     if connection_file:
         write_connection_file(connection_file, mcp_url, host, port, path, auth_token)
@@ -212,6 +292,7 @@ def create_app(
             {
                 "status": "ok",
                 "server": "enhanced-hardware-server",
+                "version": __version__,
                 "transport": "streamable-http",
                 "mcp_url": mcp_url,
                 "mcp_path": path,
@@ -227,12 +308,18 @@ def create_app(
         setup_token_query = request.query_params.get("setup_token")
         setup_authorized = bool(
             setup_token
+            and setup_token_expires_at is not None
+            and time.monotonic() < setup_token_expires_at
             and (tokens_match(setup_token_header, setup_token) or tokens_match(setup_token_query, setup_token))
         )
 
         if auth_token and not (bearer_authorized or setup_authorized):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse(build_connection_data(mcp_url, host, port, path, auth_token))
+            return unauthorized_response()
+        response_headers = NO_STORE_HEADERS if auth_token else None
+        return JSONResponse(
+            build_connection_data(mcp_url, host, port, path, auth_token),
+            headers=response_headers,
+        )
 
     async def root(_: Request) -> PlainTextResponse:
         return PlainTextResponse(
@@ -243,8 +330,22 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: Starlette):
-        async with session_manager.run():
-            yield
+        validation_filter = ConciseMCPValidationFilter()
+        root_logger = logging.getLogger()
+        mcp_session_logger = logging.getLogger("mcp.shared.session")
+        root_handlers = tuple(root_logger.handlers)
+        root_logger.addFilter(validation_filter)
+        mcp_session_logger.addFilter(validation_filter)
+        for handler in root_handlers:
+            handler.addFilter(validation_filter)
+        try:
+            async with session_manager.run():
+                yield
+        finally:
+            root_logger.removeFilter(validation_filter)
+            mcp_session_logger.removeFilter(validation_filter)
+            for handler in root_handlers:
+                handler.removeFilter(validation_filter)
 
     return Starlette(
         routes=[
@@ -254,6 +355,7 @@ def create_app(
             Route(path, endpoint=protected_mcp_app, methods=["GET", "POST", "DELETE"]),
         ],
         lifespan=lifespan,
+        middleware=[Middleware(RedactSetupTokenQueryMiddleware)],
     )
 
 
@@ -268,6 +370,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--setup-token",
         default=os.environ.get("RIGOUT_SETUP_TOKEN"),
         help="Allow this setup token to fetch /connection.json (or set RIGOUT_SETUP_TOKEN)",
+    )
+    parser.add_argument(
+        "--setup-token-ttl-seconds",
+        type=float,
+        default=DEFAULT_SETUP_TOKEN_TTL_SECONDS,
+        help=(f"Seconds before the setup token expires (default: {DEFAULT_SETUP_TOKEN_TTL_SECONDS})"),
     )
     parser.add_argument(
         "--auth-token",
@@ -297,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
         public_url=mcp_url,
         connection_file=connection_file,
         setup_token=args.setup_token,
+        setup_token_ttl_seconds=args.setup_token_ttl_seconds,
         auth_token=auth_token,
         json_response=args.json_response,
         stateless=args.stateless,

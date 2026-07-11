@@ -26,6 +26,12 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          # The reviewer runs with repository secrets and an approval-capable
+          # token. Always execute the trusted reviewer from the protected base
+          # commit, never a PR-modified copy of scripts/jules_review.py.
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v6
