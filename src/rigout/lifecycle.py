@@ -153,6 +153,12 @@ def remove_pid(paths: RuntimePaths, expected_pid: int | None = None) -> None:
         paths.pid_file.unlink()
 
 
+def _windows_kernel32() -> Any | None:
+    """Return the Windows kernel API without exposing platform-only attributes to mypy."""
+    loader = getattr(ctypes, "windll", None)
+    return getattr(loader, "kernel32", None) if loader is not None else None
+
+
 def process_is_running(pid: int | None) -> bool:
     """Return whether a process currently exists without changing it."""
     if not pid:
@@ -160,16 +166,19 @@ def process_is_running(pid: int | None) -> bool:
     if os.name == "nt":
         process_query_limited_information = 0x1000
         still_active = 259
-        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, pid)
+        kernel32 = _windows_kernel32()
+        if kernel32 is None:
+            return False
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
         if not handle:
             return False
         try:
             exit_code = ctypes.c_ulong()
-            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                 return False
             return bool(exit_code.value == still_active)
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(handle)
     try:
         stat_value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         if stat_value[stat_value.rfind(")") + 2 :].startswith("Z"):
@@ -193,11 +202,14 @@ def process_identity(pid: int | None) -> str | None:
         return None
     if os.name == "nt":
         process_query_limited_information = 0x1000
+        kernel32 = _windows_kernel32()
+        if kernel32 is None:
+            return None
 
         class FileTime(ctypes.Structure):
             _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
 
-        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, pid)
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
         if not handle:
             return None
         try:
@@ -205,7 +217,7 @@ def process_identity(pid: int | None) -> str | None:
             exit_time = FileTime()
             kernel = FileTime()
             user = FileTime()
-            succeeded = ctypes.windll.kernel32.GetProcessTimes(
+            succeeded = kernel32.GetProcessTimes(
                 handle,
                 ctypes.byref(creation),
                 ctypes.byref(exit_time),
@@ -216,7 +228,7 @@ def process_identity(pid: int | None) -> str | None:
                 return None
             return f"windows-filetime:{(creation.high << 32) | creation.low}"
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(handle)
 
     proc_stat = Path(f"/proc/{pid}/stat")
     try:
@@ -306,7 +318,9 @@ def launch_detached(
         "close_fds": True,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        create_process_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        kwargs["creationflags"] = create_process_group | create_no_window
     else:
         kwargs["start_new_session"] = True
 

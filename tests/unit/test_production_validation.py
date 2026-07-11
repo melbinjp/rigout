@@ -1,6 +1,13 @@
 """Regression coverage for the repository readiness decision."""
 
-import production_validation
+import importlib.util
+from pathlib import Path
+
+_SCRIPT = Path(__file__).resolve().parents[2] / "production_validation.py"
+_SPEC = importlib.util.spec_from_file_location("production_validation", _SCRIPT)
+production_validation = importlib.util.module_from_spec(_SPEC)
+assert _SPEC.loader is not None
+_SPEC.loader.exec_module(production_validation)
 
 
 def test_one_failed_category_can_never_be_declared_production_ready(monkeypatch):
