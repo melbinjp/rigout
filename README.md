@@ -56,6 +56,44 @@ If a step does not work, [TROUBLESHOOTING.md](TROUBLESHOOTING.md) covers the com
 
 ## Connect your agent
 
+### Give an agent your own machine
+
+On the machine the agent should control:
+
+```bash
+rigout --tunnel cloudflare
+```
+
+It prints one URL alone on a line and copies it to your clipboard. Everything the agent
+needs is behind that URL, so hand it over and nothing else. Two ways it gets used,
+depending on the client:
+
+- **The agent can fetch a URL for itself.** Paste the setup URL into the conversation and
+  ask it to configure an MCP server from it. It reads the endpoint and the bearer token
+  out of `connection.json` and registers them.
+- **The client wants server details typed in**, which is most desktop and editor clients.
+  Open the setup URL in a browser yourself. Put `mcp.url` in the client's MCP server
+  configuration as a streamable HTTP server, and `mcp.headers.Authorization` as a request
+  header on it.
+
+The setup token stops working 15 minutes after Rigout starts, so hand it over promptly.
+The bearer token it hands out does not expire; it lasts as long as that Rigout run.
+`Ctrl+C` ends the session and the URL stops resolving.
+
+### Give an agent a server you rent
+
+Identical, run over SSH on the server instead of locally. A quick tunnel is enough to try
+something; because its hostname changes on every restart and a new bearer token is
+generated each time, an agent configured against one stops working when the machine
+restarts. For anything you intend to keep, [DEPLOYMENT.md](DEPLOYMENT.md) covers a
+hostname you own, a token you choose, and starting again after a reboot.
+
+Whoever holds the setup URL can run commands on that machine for as long as it is
+running. That is the whole point of Rigout, and the reason to give the URL to one agent
+over a channel you trust rather than pasting it anywhere it might be logged.
+
+### What is in the connection file
+
 Rigout writes what a client needs into `connection.json` in the state directory. `rigout status` prints that path, and `rigout start --detach --output json` reports it as `connection_file`.
 
 The `mcp` object in that file describes the connection:
