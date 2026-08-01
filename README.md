@@ -180,7 +180,7 @@ Rigout exposes:
 - `docker_operations`: list, run, exec, stop, remove, build, pull, logs, and inspect containers.
 - `environment_setup`: create Python, Node, Docker, or Conda workspaces.
 - `install_software`: install packages with apt, yum, dnf, pacman, pip, npm, Homebrew, or Chocolatey. The default `auto` mode picks apt, yum, Homebrew, or Chocolatey from the endpoint platform; name any other manager explicitly.
-- `manage_tunnels`: add, remove, list, test, and fail over to SSH endpoints.
+- `manage_tunnels`: add, remove, list, test, and fail over to SSH endpoints. `add` takes an optional `port` for a host that does not answer SSH on 22, such as a container with SSH forwarded; `list` shows a non-default port beside the hostname.
 - `connect_hardware` and `get_hardware_info`: verify available hardware.
 - `get_server_activity`: return bounded, sanitized JSON containing managed lifecycle status and 1-200 recent activity lines.
 - `create_terminal_session`, `execute_in_terminal`, `list_terminal_sessions`, `close_terminal_session`: persistent terminal sessions that keep shell state between commands, on the local device or over SSH. `execute_in_terminal` takes the same `use_sudo` and `bypass_security` flags as `execute_command` and applies the same validation and output sanitization.
