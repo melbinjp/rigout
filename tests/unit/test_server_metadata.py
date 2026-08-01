@@ -13,14 +13,14 @@ from rigout.server import main, server
 
 @pytest.mark.unit
 def test_server_advertises_package_version():
-    assert __version__ == "0.2.0"
+    assert __version__ == "0.3.0"
     assert server.version == __version__
 
 
 @pytest.mark.unit
 def test_source_checkout_version_wins_over_stale_distribution_metadata():
     with patch.object(_version, "distribution_version", return_value="0.1.0"):
-        assert _version.resolve_version() == "0.2.0"
+        assert _version.resolve_version() == "0.3.0"
 
 
 @pytest.mark.unit

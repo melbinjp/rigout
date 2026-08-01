@@ -139,6 +139,8 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
         command = f"sudo yum install -y {quoted_packages}"
     elif package_manager == "dnf":
         command = f"sudo dnf install -y {quoted_packages}"
+    elif package_manager == "pacman":
+        command = f"sudo pacman -S --noconfirm {quoted_packages}"
     elif package_manager == "pip":
         command = f"pip install {quoted_packages}"
     elif package_manager == "npm":

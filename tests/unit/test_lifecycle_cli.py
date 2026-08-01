@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,7 @@ from rigout.lifecycle import (
     read_tail,
     redact_sensitive_text,
     runtime_status,
+    terminate_process,
     write_json_secure,
     write_pid,
 )
@@ -274,6 +276,252 @@ def test_detached_json_handoff_is_credential_free(tmp_path, capsys):
     assert env["RIGOUT_SETUP_TOKEN"] == "setup-secret"
     assert env["RIGOUT_AUTH_TOKEN"] == "bearer-secret"
     assert env["RIGOUT_INSTANCE_ID"] == "test-instance"
+
+
+class FakeChildProcess:
+    """Stand-in for a spawned launcher child (uvicorn or cloudflared)."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.stdout = iter(())
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.10", ""])
+def test_foreground_start_authenticates_a_non_loopback_bind(tmp_path, host):
+    """A LAN-reachable bind is public even without a tunnel, so it needs a bearer token."""
+    args = parse_args(["start", "--managed-child", "--state-dir", str(tmp_path), "--host", host])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+
+    with patch("rigout.mcp_url_launcher.start_server", side_effect=RuntimeError("startup stops here")):
+        exit_code = run_foreground(args, paths, managed=True)
+
+    assert exit_code == 1
+    assert args.auth_token
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "127.0.0.53", "127.1.2.3"])
+def test_foreground_start_leaves_a_loopback_bind_unauthenticated(tmp_path, host):
+    """All of 127.0.0.0/8 is loopback, not just 127.0.0.1."""
+    args = parse_args(["start", "--managed-child", "--state-dir", str(tmp_path), "--host", host])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+
+    with patch("rigout.mcp_url_launcher.start_server", side_effect=RuntimeError("startup stops here")):
+        exit_code = run_foreground(args, paths, managed=True)
+
+    assert exit_code == 1
+    assert args.auth_token is None
+
+
+@pytest.mark.unit
+def test_foreground_start_honors_no_auth_opt_out_but_says_so(tmp_path, capsys):
+    """--no-auth stays an honest opt-out on the new path, and must not disable auth silently."""
+    args = parse_args(["start", "--managed-child", "--state-dir", str(tmp_path), "--host", "0.0.0.0", "--no-auth"])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+
+    with patch("rigout.mcp_url_launcher.start_server", side_effect=RuntimeError("startup stops here")):
+        run_foreground(args, paths, managed=True)
+
+    assert args.auth_token is None
+    assert "--no-auth disables bearer authentication" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+def test_detached_start_warns_when_no_auth_exposes_a_non_loopback_bind(tmp_path, capsys):
+    with patch("rigout.mcp_url_launcher.start_detached", return_value=0):
+        main(["start", "--detach", "--state-dir", str(tmp_path), "--host", "0.0.0.0", "--no-auth"])
+
+    assert "--no-auth disables bearer authentication" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+def test_loopback_start_does_not_warn_about_no_auth(tmp_path, capsys):
+    with patch("rigout.mcp_url_launcher.start_detached", return_value=0):
+        main(["start", "--detach", "--state-dir", str(tmp_path), "--host", "127.0.0.1", "--no-auth"])
+
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.unit
+def test_explicit_auth_token_is_not_reported_as_unauthenticated(tmp_path, capsys):
+    """--no-auth alongside an explicit token still leaves the server authenticated."""
+    with patch("rigout.mcp_url_launcher.start_detached", return_value=0):
+        main(
+            [
+                "start",
+                "--detach",
+                "--state-dir",
+                str(tmp_path),
+                "--host",
+                "0.0.0.0",
+                "--no-auth",
+                "--auth-token",
+                "explicit-token",
+            ]
+        )
+
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("host", "expects_token"),
+    [
+        ("0.0.0.0", True),
+        ("::", True),
+        ("192.168.1.10", True),
+        ("127.0.0.1", False),
+        ("localhost", False),
+        ("127.0.0.53", False),
+    ],
+)
+def test_detached_start_authenticates_a_non_loopback_bind(tmp_path, host, expects_token):
+    """The detach path duplicates the public-mode decision and must agree with the foreground one."""
+    captured = {}
+
+    def capture(args, _paths):
+        captured["auth_token"] = args.auth_token
+        return 0
+
+    with patch("rigout.mcp_url_launcher.start_detached", side_effect=capture):
+        exit_code = main(["start", "--detach", "--state-dir", str(tmp_path), "--host", host])
+
+    assert exit_code == 0
+    assert bool(captured["auth_token"]) is expects_token
+
+
+@pytest.mark.unit
+def test_managed_start_records_child_pids_for_recovery(tmp_path):
+    """A launcher that dies without its handler must still leave its children findable."""
+    args = parse_args(["start", "--managed-child", "--state-dir", str(tmp_path), "--tunnel", "cloudflare"])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    server = FakeChildProcess(31415)
+    tunnel = FakeChildProcess(27182)
+
+    with (
+        patch(
+            "rigout.mcp_url_launcher.start_cloudflare_tunnel",
+            return_value=(tunnel, "https://example.trycloudflare.com"),
+        ),
+        patch("rigout.mcp_url_launcher.start_server", return_value=server),
+        patch("rigout.mcp_url_launcher.wait_for_health", return_value=False),
+    ):
+        exit_code = run_foreground(args, paths, managed=True)
+
+    runtime = json.loads(paths.runtime_file.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert runtime["server_pid"] == 31415
+    assert runtime["tunnel_pid"] == 27182
+
+
+@pytest.mark.unit
+def test_stop_reaps_children_recorded_by_a_crashed_launcher(tmp_path, capsys):
+    paths = RuntimePaths.resolve(tmp_path)
+    paths.prepare()
+    write_json_secure(
+        paths.runtime_file,
+        {
+            "status": "running",
+            "managed": True,
+            "server_pid": 31415,
+            "server_process_identity": "server-identity",
+            "tunnel_pid": 27182,
+            "tunnel_process_identity": "tunnel-identity",
+        },
+    )
+
+    with (
+        patch("rigout.mcp_url_launcher.process_is_running", return_value=True),
+        patch("rigout.mcp_url_launcher.process_matches_identity", return_value=True),
+        patch("rigout.mcp_url_launcher.terminate_process", return_value=True) as terminate,
+    ):
+        exit_code = main(["stop", "--state-dir", str(tmp_path), "--output", "json"])
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert sorted(output["stopped_children"]) == [27182, 31415]
+    assert {call.args[0] for call in terminate.call_args_list} == {27182, 31415}
+
+
+@pytest.mark.unit
+def test_stop_refuses_recorded_child_pid_that_was_recycled(tmp_path):
+    paths = RuntimePaths.resolve(tmp_path)
+    paths.prepare()
+    write_json_secure(
+        paths.runtime_file,
+        {"status": "running", "managed": True, "server_pid": 31415, "server_process_identity": "identity-from-a-child"},
+    )
+
+    with (
+        patch("rigout.mcp_url_launcher.process_is_running", return_value=True),
+        patch("rigout.mcp_url_launcher.process_matches_identity", return_value=False),
+        patch("rigout.mcp_url_launcher.terminate_process", return_value=True) as terminate,
+    ):
+        exit_code = main(["stop", "--state-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    terminate.assert_not_called()
+
+
+@pytest.mark.unit
+def test_terminate_escalates_to_the_process_group_on_posix():
+    """A detached launcher leads its own group, so SIGKILL must reach its whole tree."""
+    group_killed = {"value": False}
+    expected_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+    def kill_group(_pid, _signal_number):
+        group_killed["value"] = True
+
+    with (
+        patch("rigout.lifecycle.os.name", "posix"),
+        patch("rigout.lifecycle.process_is_running", side_effect=lambda _pid: not group_killed["value"]),
+        patch("rigout.lifecycle.os.kill") as kill,
+        patch("rigout.lifecycle.os.getpgid", return_value=4242, create=True),
+        patch("rigout.lifecycle.os.killpg", side_effect=kill_group, create=True) as killpg,
+    ):
+        stopped = terminate_process(4242, timeout=0.01)
+
+    assert stopped is True
+    assert killpg.call_args.args == (4242, expected_signal)
+    # Only the initial SIGTERM goes to the single PID; the escalation goes to the group
+    assert kill.call_args_list == [((4242, signal.SIGTERM),)]
+
+
+@pytest.mark.unit
+def test_terminate_does_not_signal_a_process_group_it_does_not_lead():
+    """A foreground launcher shares the caller's group, which must never be signalled."""
+    expected_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+    kill_calls: list[tuple[int, int]] = []
+
+    with (
+        patch("rigout.lifecycle.os.name", "posix"),
+        patch("rigout.lifecycle.process_is_running", side_effect=lambda _pid: len(kill_calls) < 2),
+        patch("rigout.lifecycle.os.kill", side_effect=lambda pid, number: kill_calls.append((pid, number))),
+        patch("rigout.lifecycle.os.getpgid", return_value=99, create=True),
+        patch("rigout.lifecycle.os.killpg", create=True) as killpg,
+    ):
+        terminate_process(4242, timeout=0.01)
+
+    killpg.assert_not_called()
+    assert kill_calls == [(4242, signal.SIGTERM), (4242, expected_signal)]
 
 
 @pytest.mark.unit

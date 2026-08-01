@@ -10,6 +10,7 @@ Examples:
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -63,6 +64,32 @@ from .mcp_http_server import (
 
 CLOUDFLARE_URL_PATTERN = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 CLOUDFLARED_DOWNLOAD_BASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download"
+LOOPBACK_HOST_NAMES = frozenset({"localhost"})
+NO_AUTH_WARNING = (
+    "Warning: --no-auth disables bearer authentication while binding {host}, "
+    "which is reachable beyond this machine. Anyone who can reach it can run commands."
+)
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return whether a bind address is reachable only from this machine.
+
+    All of 127.0.0.0/8 is loopback, so this cannot be string equality against 127.0.0.1.
+    Wildcard binds ("0.0.0.0", "::", "") and unparseable hosts are not loopback, which is
+    the safe answer: an unrecognized bind gets authentication rather than silence.
+    """
+    candidate = host.strip().strip("[]").lower()
+    if candidate in LOOPBACK_HOST_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False
+
+
+def is_public_start(args: argparse.Namespace) -> bool:
+    """Return whether a start reaches beyond loopback and therefore needs a bearer token."""
+    return bool(args.tunnel != "none" or args.public_url or not is_loopback_host(str(args.host or "")))
 
 
 def wait_for_health(url: str, timeout: int = 30) -> bool:
@@ -475,6 +502,39 @@ def runtime_metadata(
     return metadata
 
 
+def record_child_pids(
+    paths: RuntimePaths,
+    server_process: subprocess.Popen[str] | None,
+    tunnel_process: subprocess.Popen[str] | None,
+) -> None:
+    """Persist launcher child PIDs so a crashed launcher still leaves them recoverable."""
+    runtime = read_json(paths.runtime_file)
+    runtime["server_pid"] = server_process.pid if server_process else None
+    runtime["server_process_identity"] = process_identity(server_process.pid) if server_process else None
+    runtime["tunnel_pid"] = tunnel_process.pid if tunnel_process else None
+    runtime["tunnel_process_identity"] = process_identity(tunnel_process.pid) if tunnel_process else None
+    write_json_secure(paths.runtime_file, runtime)
+
+
+def stop_recorded_children(paths: RuntimePaths, timeout: float) -> list[int]:
+    """Stop recorded launcher children that outlived their launcher."""
+    runtime = read_json(paths.runtime_file)
+    recorded = (
+        (runtime.get("tunnel_pid"), runtime.get("tunnel_process_identity")),
+        (runtime.get("server_pid"), runtime.get("server_process_identity")),
+    )
+    stopped: list[int] = []
+    for child_pid, identity in recorded:
+        if not isinstance(child_pid, int) or not process_is_running(child_pid):
+            continue
+        # A recycled PID must never be killed, so require the recorded fingerprint
+        if not process_matches_identity(child_pid, identity):
+            continue
+        if terminate_process(child_pid, timeout=timeout):
+            stopped.append(child_pid)
+    return stopped
+
+
 def build_managed_child_command(args: argparse.Namespace, paths: RuntimePaths) -> list[str]:
     """Build a token-free command line for the detached launcher child."""
     command = [
@@ -641,9 +701,11 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
             print(f"Setup failed: Rigout is already running with PID {existing_pid}", file=sys.stderr)
             return 1
 
-    is_public = bool(args.tunnel != "none" or args.public_url)
+    is_public = is_public_start(args)
     if not args.auth_token and not args.no_auth and is_public:
         args.auth_token = secrets.token_urlsafe(32)
+    if is_public and args.no_auth and not args.auth_token:
+        print(NO_AUTH_WARNING.format(host=args.host), file=sys.stderr)
     setup_token = None
     if args.auth_token and is_public and not args.no_agent_setup_url:
         setup_token = args.setup_token or secrets.token_urlsafe(32)
@@ -684,6 +746,8 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
                 allow_download=not args.no_cloudflared_download,
                 activity_paths=activity_paths,
             )
+            if managed:
+                record_child_pids(paths, server_process, tunnel_process)
 
         mcp_url = resolve_public_mcp_url(args, tunnel_base_url)
         server_process = start_server(
@@ -694,6 +758,7 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
             runtime_cwd=paths.root if managed else None,
         )
         if managed:
+            record_child_pids(paths, server_process, tunnel_process)
             threading.Thread(
                 target=stream_process_output,
                 args=(server_process, None, activity_paths),
@@ -728,6 +793,7 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
                 }
             )
             write_json_secure(paths.runtime_file, running)
+            record_child_pids(paths, server_process, tunnel_process)
 
         report()
         report("Hardware MCP server is running.")
@@ -842,12 +908,19 @@ def handle_stop(args: argparse.Namespace, paths: RuntimePaths) -> int:
     status = runtime_status(paths)
     pid = read_pid(paths)
     if not pid or not process_is_running(pid):
+        # The launcher can die without running its shutdown handler, leaving its
+        # children serving; they stay recorded so stop can still reach them.
+        orphans = stop_recorded_children(paths, args.timeout)
         remove_pid(paths)
         result = {**status, "status": "stopped", "running": False, "pid": None}
+        if orphans:
+            result["stopped_children"] = orphans
         if args.output == "json":
             print_json(result)
         else:
             print("Rigout is not running.")
+            if orphans:
+                print(f"Stopped orphaned child processes: {', '.join(str(child) for child in orphans)}")
         return 0
 
     runtime = read_json(paths.runtime_file)
@@ -874,15 +947,20 @@ def handle_stop(args: argparse.Namespace, paths: RuntimePaths) -> int:
             print(message, file=sys.stderr)
         return 1
 
+    orphans = stop_recorded_children(paths, args.timeout)
     remove_pid(paths, pid)
     runtime = read_json(paths.runtime_file) or runtime
     runtime.update({"status": "stopped", "stopped_at": utc_now()})
     write_json_secure(paths.runtime_file, runtime)
     result = runtime_status(paths)
+    if orphans:
+        result["stopped_children"] = orphans
     if args.output == "json":
         print_json(result)
     else:
         print("Rigout stopped.")
+        if orphans:
+            print(f"Stopped orphaned child processes: {', '.join(str(child) for child in orphans)}")
         print(f"Activity log: {paths.log_file}")
     return 0
 
@@ -903,9 +981,11 @@ def main(argv: list[str] | None = None) -> int:
         print("--output json requires --detach for a finite, machine-readable startup result", file=sys.stderr)
         return 2
     if args.detach and not args.managed_child:
-        is_public = bool(args.tunnel != "none" or args.public_url)
+        is_public = is_public_start(args)
         if not args.auth_token and not args.no_auth and is_public:
             args.auth_token = secrets.token_urlsafe(32)
+        if is_public and args.no_auth and not args.auth_token:
+            print(NO_AUTH_WARNING.format(host=args.host), file=sys.stderr)
         if args.auth_token and is_public and not args.no_agent_setup_url and not args.setup_token:
             args.setup_token = secrets.token_urlsafe(32)
         return start_detached(args, paths)

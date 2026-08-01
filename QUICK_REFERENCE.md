@@ -6,6 +6,8 @@
 pip install rigout
 ```
 
+Requires Python 3.10 or newer.
+
 ## Run
 
 ```bash
@@ -23,7 +25,7 @@ python -m rigout.mcp_url_launcher --tunnel cloudflare
 
 `rigout --tunnel cloudflare` is the primary foreground shortcut. It prints the agent setup URL and runs until Ctrl+C. Cloudflare quick-tunnel URLs are ephemeral.
 
-## Managed Lifecycle
+## Managed lifecycle
 
 ```bash
 rigout start --tunnel cloudflare --detach
@@ -44,7 +46,7 @@ rigout stop --output json
 
 `--output json` startup requires `--detach`. `logs --follow` is text-only.
 
-## Source Checkout
+## Source checkout
 
 ```bash
 python -m pip install -e .
@@ -72,7 +74,7 @@ rigout-stdio
 
 Use `--state-dir PATH` or `RIGOUT_STATE_DIR` to override the state root. Managed files use owner-only modes on POSIX.
 
-## Agent Diagnostics
+## Agent diagnostics
 
 Call `get_server_activity` for bounded, sanitized JSON containing lifecycle status and the most recent 1-200 activity lines (default 50). MCP access does not automatically expose the host's raw terminal window.
 
@@ -87,7 +89,7 @@ python -m build
 python -m twine check dist/rigout-*
 ```
 
-## PyPI Release
+## PyPI release
 
 Rigout publishes from the GitHub Actions tag workflow through PyPI Trusted Publishing. No PyPI API token is required.
 
@@ -106,7 +108,7 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-## Cleanup Before Publishing
+## Cleanup before publishing
 
 ```bash
 git status --short

@@ -6,13 +6,15 @@ Rigout runs a Streamable HTTP MCP server on a device so an AI agent can control 
 
 Use Rigout only on hardware, VMs, or containers you are willing to let an agent control.
 
-## Quick Start
+## Quick start
 
 Install from PyPI:
 
 ```bash
 pip install rigout
 ```
+
+Rigout requires Python 3.10 or newer.
 
 For a cloud agent, start the foreground shortcut:
 
@@ -44,7 +46,7 @@ http://127.0.0.1:8765/mcp
 
 The launcher writes its connection and activity files under a per-user state directory. Give an agent the `mcp.url` and `mcp.headers` values only through an authorized channel. Public/tunnel mode automatically generates a bearer token unless `--no-auth` is explicitly used.
 
-## Background Lifecycle and JSON Output
+## Background lifecycle and JSON output
 
 The installed package includes lifecycle commands; the source-only shell wrappers are not required:
 
@@ -67,7 +69,7 @@ rigout stop --output json
 
 Detached startup JSON is finite and intentionally excludes credentials. It reports the MCP/health URLs, PID, lifecycle status, state directory, and paths to the connection and activity files. `rigout logs --follow` is a text stream and cannot be combined with `--output json`.
 
-JSON is the supported machine interface for connection data, lifecycle results, and activity snapshots: it preserves URL, header, boolean, number, and list types without YAML parser dialects or implicit type coercion. The default text output remains optimized for humans.
+JSON is the supported machine interface for connection data, lifecycle results, and activity snapshots. The default text output remains optimized for humans.
 
 The default state directory is:
 
@@ -77,7 +79,7 @@ The default state directory is:
 
 Override it with `--state-dir PATH` or `RIGOUT_STATE_DIR`. Managed state includes `connection.json`, `activity.log`, `runtime.json`, and `rigout.pid`. Rigout applies owner-only directory/file modes on POSIX; keep the directory private on every platform because the connection file contains the bearer token.
 
-## Source Checkout
+## Source checkout
 
 From a cloned repo:
 
@@ -86,21 +88,19 @@ python -m pip install -e .
 rigout --tunnel cloudflare
 ```
 
-The shell helpers are optional:
+The repository also ships `rigout.sh` and `rigout.ps1`, which start the launcher in the foreground without installing the package:
 
 ```bash
-./rigout.sh --background
-./rigout.sh status
-./rigout.sh stop
+./rigout.sh
 ```
 
 ```powershell
-.\rigout.ps1 -Background
-.\rigout.ps1 status
-.\rigout.ps1 stop
+.\rigout.ps1
 ```
 
-## MCP Tools
+Their `--background`, `status`, and `stop` modes still look for a connection file inside the checkout directory, which the launcher no longer writes there. Use `rigout start --detach`, `rigout status`, and `rigout stop` for background runs.
+
+## MCP tools
 
 Rigout exposes:
 
@@ -110,6 +110,7 @@ Rigout exposes:
 - `system_monitoring`: inspect CPU, memory, disk, network, processes, and GPU where available.
 - `docker_operations`: list, run, exec, stop, remove, build, pull, logs, and inspect containers.
 - `environment_setup`: create Python, Node, Docker, or Conda workspaces.
+- `install_software`: install packages with apt, yum, dnf, pacman, pip, npm, Homebrew, or Chocolatey. The default `auto` mode picks apt, yum, Homebrew, or Chocolatey from the endpoint platform; name any other manager explicitly.
 - `manage_tunnels`: add, remove, list, test, and fail over to SSH endpoints.
 - `connect_hardware` and `get_hardware_info`: verify available hardware.
 - `get_server_activity`: return bounded, sanitized JSON containing managed lifecycle status and 1-200 recent activity lines.
@@ -117,27 +118,27 @@ Rigout exposes:
 
 If no SSH endpoint is configured, Rigout uses a local-device endpoint. That makes a fresh one-command server immediately useful on the machine running Rigout.
 
-## Security Model
+## Security model
 
 Rigout is powerful by design. Treat the MCP URL and bearer token like remote shell credentials.
 
 Default controls:
 
 - Public/tunnel mode generates bearer auth unless `--no-auth` is passed.
-- Localhost mode has no bearer auth unless `--auth-token` is passed.
+- Localhost mode has no bearer auth unless `--auth-token` is passed or `RIGOUT_AUTH_TOKEN` is set.
 - Tokens are handed to the server process through environment variables, not command-line arguments, so they do not appear in the process list.
 - Managed connection and activity files live in a per-user state directory and are written with owner-only permissions on POSIX systems.
 - Setup tokens expire after 15 minutes by default, are redacted from Rigout-controlled access logs, and credential responses use `Cache-Control: no-store` and `Pragma: no-cache`.
 - HTTP 401 responses advertise `WWW-Authenticate: Bearer` without echoing credential material.
-- Command validation blocks common destructive patterns unless the caller explicitly uses `bypass_security`. Routine pipelines and command chains are allowed; unrecognized commands are logged for auditing rather than blocked.
-- Outputs are sanitized for common secret patterns before returning to the agent.
+- Command validation applies to the one-shot `execute_command` path, where it blocks common destructive patterns, allows routine pipelines and command chains, and logs unrecognized commands for auditing rather than blocking them. Two routes skip it: the caller passing `bypass_security`, and commands sent through a terminal session, which `execute_in_terminal` writes to the shell unvalidated.
+- Output of one-shot commands is sanitized for common secret patterns before returning to the agent. Terminal session output is returned as the shell produced it.
 - Managed runtime output is captured in `activity.log`; agents can read a bounded, sanitized view with `get_server_activity`.
 - Operational tool failures and unknown tools set MCP `isError: true` and preserve useful stderr or exit-status diagnostics.
-- Per-endpoint command rate limiting is enabled.
+- Per-endpoint command rate limiting is enabled: 60 command executions per minute for each endpoint, including the local-device endpoint.
 
 Do not expose Rigout publicly with `--no-auth` unless the network is private and trusted. For serious agent work, run Rigout inside an isolated VM or container.
 
-## Public URL Reliability
+## Public URL reliability
 
 Cloudflare quick tunnels are useful for one-command setup and testing, but their public URLs are ephemeral. For long-running or production use, put Rigout behind a stable tunnel or gateway such as a named Cloudflare Tunnel, Tailscale, a reverse proxy, or a dedicated VM with explicit network controls.
 
@@ -199,18 +200,20 @@ Check the package metadata:
 python -m twine check dist/rigout-*
 ```
 
-Development standards for future contributors and agents are in [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md).
+Rigout is written by AI coding agents working under human direction: the maintainer sets the product scope, safety boundaries, acceptance criteria, and release decisions, and agents write the implementation, tests, documentation, and release changes. Development standards for future contributors and agents are in [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md).
 
-## Project Layout
+## Project layout
 
 ```text
 src/rigout/
   server.py              # MCP tool definitions and stdio transport
   mcp_http_server.py     # Streamable HTTP MCP server
-  mcp_url_launcher.py    # one-command server/tunnel launcher
+  mcp_url_launcher.py    # one-command launcher and lifecycle CLI
   lifecycle.py           # per-user state and detached process management
   ssh_manager.py         # SSH endpoints and local fallback execution
   tools/                 # command, file, Docker, environment, monitoring tools
 tests/                   # pytest unit and integration coverage
 .github/workflows/       # CI and tagged release publishing
 ```
+
+An end-to-end walkthrough of how one request travels through Rigout, from arrival at the HTTP server to the tool response, is in [docs/REQUEST_PATH.md](docs/REQUEST_PATH.md).

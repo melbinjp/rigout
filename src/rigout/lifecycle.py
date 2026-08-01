@@ -330,6 +330,27 @@ def launch_detached(
         log.close()
 
 
+def posix_kill_tree(pid: int, signal_number: int) -> None:
+    """Signal a detached launcher's whole process group, falling back to the process itself.
+
+    `launch_detached` starts a new session, so a detached launcher leads its own group and
+    its children are reachable in one call. A launcher that does not lead a group shares the
+    caller's group, which must never be signalled.
+    """
+    get_process_group = getattr(os, "getpgid", None)
+    kill_process_group = getattr(os, "killpg", None)
+    if get_process_group is not None and kill_process_group is not None:
+        try:
+            if get_process_group(pid) == pid:
+                kill_process_group(pid, signal_number)
+                return
+        except OSError:
+            # A dead or foreign process falls through to the single-PID path below,
+            # which reports the same errors the caller already handles.
+            pass
+    os.kill(pid, signal_number)
+
+
 def terminate_process(pid: int, timeout: float = 10.0) -> bool:
     """Stop a managed launcher and wait for its process to disappear."""
     if not process_is_running(pid):
@@ -354,7 +375,7 @@ def terminate_process(pid: int, timeout: float = 10.0) -> bool:
 
     if os.name != "nt":
         try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            posix_kill_tree(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         except ProcessLookupError:
             return True
         deadline = time.time() + 2

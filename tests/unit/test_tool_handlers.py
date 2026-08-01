@@ -190,6 +190,23 @@ class TestToolHandlers:
         result = await handle_install_software(args)
         assert "completed successfully" in result.content[0].text
 
+    async def test_handle_install_software_pacman(self, mock_manager):
+        """The advertised pacman manager installs instead of erroring as unsupported"""
+        endpoint = MagicMock()
+        mock_manager.auto_failover.return_value = endpoint
+        mock_manager.execute_command.return_value = {
+            "success": True,
+            "endpoint": "test-host",
+            "stdout": "Installed successfully",
+        }
+
+        args = {"packages": ["curl", "git"], "package_manager": "pacman"}
+        result = await handle_install_software(args)
+
+        assert result.isError is False
+        assert "completed successfully" in result.content[0].text
+        assert mock_manager.execute_command.call_args.args[1] == "sudo pacman -S --noconfirm curl git"
+
     async def test_handle_docker_operations(self, mock_manager):
         """Test handle_docker_operations"""
         endpoint = MagicMock()
