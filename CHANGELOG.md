@@ -5,6 +5,37 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-02
+
+### Added
+- Every tool now declares what it does to the machine: `title`, and
+  `ToolAnnotations` with `readOnlyHint`, `destructiveHint`, `idempotentHint`
+  and `openWorldHint`. Rigout advertised fifteen tools identically, so reading a
+  CPU count and running an arbitrary command as root reached a client looking
+  the same and anything wanting to warn before the second had only the name to
+  go on. Four tools are read-only; the rest are destructive. Anything that runs
+  a caller's command is marked destructive and not idempotent, because what it
+  does is decided by the caller and cannot be known here.
+
+### Changed
+- The `mcp` bound widens to `>=1.0.0,<3`: Rigout now runs on both majors. 1.x
+  registers the tool handlers with decorators and 2.x removed them for explicit
+  `add_request_handler`, and that is the entire incompatibility - every tool
+  definition constructs unchanged, because 2.x renamed `Tool`'s fields while
+  keeping the camelCase spellings as aliases. Two reads did need care, since
+  the aliases cover construction and not attribute access: `CallToolResult`'s
+  error flag is `is_error` on 2.x and `isError` on 1.x, and the same holds for
+  annotation hints. Both are read through helpers that work either way.
+  Supporting both is deliberate rather than transitional - nobody is pushed onto
+  a major the week it appears, and nobody is stranded on the old one.
+- `VERSIONING.md` records which capabilities of the current MCP line Rigout
+  adopts and which it declines. Tasks - long-running work a client polls rather
+  than waits for - are declined despite addressing Rigout's oldest limitation,
+  because the API is deprecated in the version Rigout pins and
+  `mcp.server.experimental.task_support` raises `ModuleNotFoundError` on 2.0.0,
+  the version Rigout must move to next. The types survive there, which makes the
+  feature look available to anyone reading `mcp.types`.
+
 ## [0.3.0] - 2026-08-01
 
 ### Added
