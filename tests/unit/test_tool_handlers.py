@@ -142,6 +142,24 @@ class TestToolHandlers:
         assert "Terminal session created successfully" in result.content[0].text
         assert "sess-123" in result.content[0].text
 
+    async def test_duplicate_session_name_says_so_instead_of_failing_generically(self, mock_manager):
+        """A name already in use is recoverable; a shell that will not start is not.
+
+        create_terminal_session returns None for both, so "Failed to create terminal
+        session" told a caller neither which had happened nor what to do about it. The
+        recoverable case now names itself and offers the three ways out.
+        """
+        mock_manager.auto_failover.return_value = MagicMock()
+        mock_manager.terminal_sessions = {"build": MagicMock()}
+
+        result = await handle_create_terminal_session({"session_name": "build"})
+
+        assert result.isError is True
+        message = result.content[0].text
+        assert "already exists" in message and "build" in message
+        for way_out in ("execute_in_terminal", "close_terminal_session", "session_name"):
+            assert way_out in message, f"the message does not offer {way_out} as a next step"
+
     async def test_handle_execute_in_terminal(self, mock_manager):
         """Test handle_execute_in_terminal"""
         mock_manager.execute_in_session = AsyncMock(

@@ -56,6 +56,16 @@ async def handle_create_terminal_session(arguments: dict) -> CallToolResult:
     if not endpoint:
         return error_result("No available hardware endpoints")
 
+    # create_terminal_session returns None both for a name already in use and for a
+    # shell that would not start. Those need different responses from the caller, so
+    # the recoverable one is named here rather than reported as a failure.
+    if session_name and session_name in get_tunnel_manager().terminal_sessions:
+        return error_result(
+            f"Terminal session '{session_name}' already exists. Run commands in it with "
+            "execute_in_terminal, close it with close_terminal_session, or pass a different "
+            "session_name."
+        )
+
     session = await get_tunnel_manager().create_terminal_session(endpoint, session_name)
 
     if session:
@@ -66,7 +76,11 @@ async def handle_create_terminal_session(arguments: dict) -> CallToolResult:
         result_text += "You can now execute commands in this persistent session using execute_in_terminal."
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
-        return error_result("Failed to create terminal session")
+        return error_result(
+            f"Failed to start a terminal session on {endpoint.hostname}. The endpoint is "
+            "reachable, so the shell itself did not start; check the activity log for the "
+            "underlying error."
+        )
 
 
 async def handle_execute_in_terminal(arguments: dict) -> CallToolResult:
