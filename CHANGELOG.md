@@ -5,6 +5,27 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [Unreleased]
+
+### Added
+- Every tool now declares what it does to the machine: `title`, and
+  `ToolAnnotations` with `readOnlyHint`, `destructiveHint`, `idempotentHint`
+  and `openWorldHint`. Rigout advertised fifteen tools identically, so reading a
+  CPU count and running an arbitrary command as root reached a client looking
+  the same and anything wanting to warn before the second had only the name to
+  go on. Four tools are read-only; the rest are destructive. Anything that runs
+  a caller's command is marked destructive and not idempotent, because what it
+  does is decided by the caller and cannot be known here.
+
+### Changed
+- `VERSIONING.md` records which capabilities of the current MCP line Rigout
+  adopts and which it declines. Tasks - long-running work a client polls rather
+  than waits for - are declined despite addressing Rigout's oldest limitation,
+  because the API is deprecated in the version Rigout pins and
+  `mcp.server.experimental.task_support` raises `ModuleNotFoundError` on 2.0.0,
+  the version Rigout must move to next. The types survive there, which makes the
+  feature look available to anyone reading `mcp.types`.
+
 ## [0.3.0] - 2026-08-01
 
 ### Added

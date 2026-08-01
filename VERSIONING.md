@@ -79,6 +79,40 @@ Two things watch this so it does not become permanent:
 - The same workflow reports which dependencies are held back and by how far, so an
   overdue major is visible rather than forgotten.
 
+## What Rigout adopts from a new MCP, and what it declines
+
+Being behind on a major does not mean ignoring what the current line offers. Two
+capabilities were assessed against mcp 1.29 in August 2026, and they went opposite ways.
+
+**Tool annotations: adopted.** `Tool.title` and `ToolAnnotations` - `readOnlyHint`,
+`destructiveHint`, `idempotentHint`, `openWorldHint` - let a client tell a question apart
+from an action before it runs one, which matters more here than in most servers: reading
+a CPU count and running an arbitrary command as root are both tools Rigout offers. The
+fields are in the specification, present in 1.x and 2.x alike, and additive to clients
+that ignore them.
+
+**Tasks: declined, and this is worth stating so it is not rediscovered.** `Tool.execution`
+with `taskSupport`, the `Task` type, `tasks/get` and its siblings, and
+`mcp.server.experimental.task_support` together describe long-running work a client polls
+rather than waits for. That addresses Rigout's oldest limitation directly - a command
+that outlives its timeout fails, and builds, installs and downloads all can.
+
+It is not adopted, because the API says of itself:
+
+> The experimental tasks API is deprecated and will be removed in mcp 2.0: tasks
+> (SEP-1686) were removed from the MCP specification and are expected to return as a
+> separate MCP extension.
+
+Checked rather than taken on the warning's word: `mcp.server.experimental.task_support`
+raises `ModuleNotFoundError` on 2.0.0. The types survive there, which makes the feature
+look available to anyone reading `mcp.types`, but the server half is gone.
+
+Building on it would mean shipping a feature on an interface that is deprecated in the
+version Rigout pins and absent from the version it must move to next. That is the same
+trade as the unbounded `mcp>=1.0.0` in 0.2.0: it works until someone else's release day.
+When tasks return as an extension, this is worth revisiting, and the reason to revisit is
+recorded above.
+
 ## Releasing
 
 ```bash
