@@ -11,10 +11,12 @@ Use Rigout only on hardware, VMs, or containers you are willing to let an agent 
 Install from PyPI:
 
 ```bash
-pip install rigout
+pipx install rigout
 ```
 
 Rigout requires Python 3.10 or newer.
+
+`pipx` is the recommendation because Rigout is an application rather than a library: it gets its own environment, and its dependency bounds - which are deliberate, see [VERSIONING.md](VERSIONING.md) - cannot then conflict with anything else you have installed. `uv tool install rigout` does the same. `pip install rigout` works and is fine in a virtual environment of its own; in a shared one, its `mcp<2` bound and another package's requirements have to be satisfiable together.
 
 For a cloud agent, start the foreground shortcut:
 

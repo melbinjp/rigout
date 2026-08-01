@@ -34,6 +34,11 @@ All notable changes to this project are documented here. Format follows
   unknown tools, connection-endpoint auth headers); and a wheel/sdist build.
 - `build_write_command` is exported from the package root. It builds the
   command that writes content to a path, and spells append as well as write.
+- `VERSIONING.md` explains the dependency caps and what they cost. `mcp` 1.x
+  speaks MCP protocol `2025-11-25` where 2.x speaks `2026-07-28`, so a capped
+  installation negotiates the older revision; that is deliberate, and smaller
+  than the alternative that 0.2.0 demonstrated, where an install broke because
+  someone else published a major. Majors are adopted in a release of their own.
 - `DEPLOYMENT.md`, covering what a permanent deployment needs, which was one
   sentence of documentation before. A quick tunnel's hostname changes on every
   restart and a public start mints a new bearer token unless one is supplied, so
@@ -81,6 +86,10 @@ All notable changes to this project are documented here. Format follows
   Disable it with `--no-copy-url`.
 
 ### Changed
+- `pipx install rigout` is the documented install. Rigout is an application, not
+  a library, and its own environment is where its dependency bounds cannot
+  collide with anything else installed alongside it. `pip install rigout` is
+  unchanged and still works.
 - `rigout` with no arguments now says what to do next. It started a local server
   and stopped there, which is the shortest thing anyone types and left them with
   a running process and no indication of how to use it; it now names the two

@@ -46,6 +46,39 @@ section to decide which bump the release needed. A breaking change described wit
 either marker and shipped as a patch is the one mistake this cannot catch, which is why
 the sentence naming the affected caller matters more than the label.
 
+## Dependency caps, and why Rigout is not always on the newest
+
+Every runtime dependency has an upper bound:
+
+```toml
+mcp>=1.0.0,<2      starlette>=0.37.0,<2
+uvicorn>=0.29.0,<1  paramiko>=3.0.0,<6
+```
+
+0.2.0 required `mcp>=1.0.0` with no upper bound. When `mcp` 2.0.0 was published, a
+plain `pip install rigout` resolved it and every install broke on startup with
+`AttributeError: 'Server' object has no attribute 'list_tools'` - the decorators that
+register tools were removed in that major. Nothing in the release had changed; the
+world moved and the install followed it.
+
+A cap means Rigout is deliberately behind. `mcp` 1.x speaks MCP protocol `2025-11-25`
+where 2.x speaks `2026-07-28`, so an installation on the capped line negotiates the
+older revision and does not offer whatever the newer one adds. That is the cost, and it
+is smaller than the alternative: a caller whose install breaks without them changing
+anything.
+
+Majors are adopted deliberately, in a release of their own, never as a side effect of
+someone else publishing. The migration is checked, run, and released on its own, because
+a transport change is exactly the kind that passes a test suite and fails in use.
+
+Two things watch this so it does not become permanent:
+
+- `.github/workflows/scheduled-ci.yml` builds a wheel weekly and installs it into a
+  clean environment that resolves from PyPI, catching a breaking release *within* a cap
+  that the pinned development environment would not see.
+- The same workflow reports which dependencies are held back and by how far, so an
+  overdue major is visible rather than forgotten.
+
 ## Releasing
 
 ```bash
