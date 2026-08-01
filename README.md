@@ -78,10 +78,23 @@ The installed package includes lifecycle commands; the source-only shell wrapper
 ```bash
 rigout start --tunnel cloudflare --detach
 rigout status
+rigout url
 rigout logs --tail 100
 rigout logs --follow
 rigout stop
 ```
+
+`rigout url` reprints the agent setup URL. In the foreground the URL that `start` prints scrolls away behind activity, and Ctrl+C in that terminal stops the server rather than copying anything; this reads the value back from the connection file, works whether Rigout was started in the foreground or detached, and does not touch the running server.
+
+Nothing but the URL goes to stdout, so it can be moved without selecting it out of a terminal:
+
+```bash
+rigout url > setup-url.txt
+rigout url | xclip -selection clipboard
+ssh HOST rigout url
+```
+
+On macOS pipe to `pbcopy`, and on Windows to `clip.exe`. Use `--which mcp` or `--which health` for the other two endpoints. Only the setup URL is credential-equivalent, and the warning saying so goes to stderr, so a pipe stays clean.
 
 Use JSON for automation and agent-to-agent handoff:
 

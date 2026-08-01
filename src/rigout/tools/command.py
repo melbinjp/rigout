@@ -46,6 +46,11 @@ async def handle_execute_command(arguments: dict) -> CallToolResult:
         result_text += f"Command: {result['command']}\n"
         result_text += f"Exit Code: {result.get('exit_code', 'N/A')}\n"
         result_text += f"Error: {failure_detail(result, 'Command execution failed')}"
+        # A failing command still produces stdout, and it is often the only record of
+        # how far the work got: `build && test` that fails in test discards the whole
+        # build log otherwise. Reported after the error so the failure stays first.
+        if result.get("stdout"):
+            result_text += f"\n\nOutput:\n{result['stdout']}"
         return error_result(result_text)
 
 
@@ -190,4 +195,8 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
         result_text = "Software installation failed\n\n"
         result_text += f"Packages: {', '.join(packages)}\n"
         result_text += f"Error: {failure_detail(result, 'Software installation failed')}"
+        # The package manager's own output names the conflict or the missing
+        # repository; without it the caller only learns that installing failed.
+        if result.get("stdout"):
+            result_text += f"\n\nOutput:\n{result['stdout']}"
         return error_result(result_text)

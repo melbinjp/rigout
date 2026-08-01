@@ -30,6 +30,7 @@ python -m rigout.mcp_url_launcher --tunnel cloudflare
 ```bash
 rigout start --tunnel cloudflare --detach
 rigout status
+rigout url
 rigout logs --tail 100
 rigout logs --follow
 rigout stop
@@ -37,6 +38,8 @@ rigout stop --force
 ```
 
 `stop --force` clears recorded state that cannot be verified as Rigout's. It signals no process.
+
+`rigout url` prints the agent setup URL alone on one line and nothing else, so it can be redirected or piped instead of selected out of a running terminal: `rigout url | xclip -selection clipboard`, `rigout url > url.txt`, or `ssh HOST rigout url`. It reads the connection file, so it works in foreground and detached mode alike and never touches the running server. `--which mcp` and `--which health` print the other endpoints. The "treat this like a password" warning goes to stderr, keeping stdout pipeable.
 
 Machine-readable commands:
 

@@ -1313,6 +1313,14 @@ def documented_command_lines() -> list[tuple[Path, int, str]]:
     return found
 
 
+# Where a documented command line stops being rigout's and becomes the shell's.
+# `rigout url | xclip` and `rigout url > url.txt` document real usage, and the tokens
+# after the operator belong to another program; feeding them to rigout's parser would
+# report a documentation error that is not one. Everything before the operator is still
+# checked, which is the part this test exists to check.
+SHELL_OPERATORS = frozenset({"|", "||", "&&", "&", ";", ">", ">>", "<", "<<", "2>", "2>&1"})
+
+
 def launcher_arguments(command_line: str) -> list[str] | None:
     """Argument list for a documented command line, or None if it is not the launcher."""
     try:
@@ -1321,6 +1329,10 @@ def launcher_arguments(command_line: str) -> list[str] | None:
         return None
     while tokens and ENV_ASSIGNMENT_RE.match(tokens[0]):
         tokens = tokens[1:]
+    for index, token in enumerate(tokens):
+        if token in SHELL_OPERATORS or token.startswith("#"):
+            tokens = tokens[:index]
+            break
     if not tokens:
         return None
     if tokens[0] == "rigout":

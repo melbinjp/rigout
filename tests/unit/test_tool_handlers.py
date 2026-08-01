@@ -105,6 +105,31 @@ class TestToolHandlers:
         assert "Command failed" in result.content[0].text
         assert "No such file or directory" in result.content[0].text
 
+    async def test_handle_execute_command_failure_keeps_the_output_it_produced(self, mock_manager):
+        """A failing command's stdout is often the only record of how far it got.
+
+        `make && ./run-tests` that fails in the tests discarded the whole build log,
+        and a compound command whose last step failed reported nothing but that last
+        error. The failure stays first; the output it produced follows.
+        """
+        mock_manager.auto_failover.return_value = MagicMock()
+        mock_manager.execute_command.return_value = {
+            "success": False,
+            "endpoint": "test-host",
+            "command": "make && ./run-tests",
+            "exit_code": 1,
+            "stdout": "compiled 41 objects\nlinked target\n",
+            "stderr": "3 tests failed",
+        }
+
+        result = await handle_execute_command({"command": "make && ./run-tests"})
+        text = result.content[0].text
+
+        assert result.isError is True
+        assert "compiled 41 objects" in text
+        assert "3 tests failed" in text
+        assert text.index("3 tests failed") < text.index("compiled 41 objects")
+
     async def test_handle_execute_command_failure_falls_back_to_exit_status(self, mock_manager):
         """A silent nonzero command still returns a deterministic diagnostic."""
         mock_manager.auto_failover.return_value = MagicMock()
@@ -265,6 +290,47 @@ class TestToolHandlers:
 
         assert result.isError is True
         assert "Command exited with status 127" in result.content[0].text
+
+    async def test_handle_docker_failure_keeps_the_output_it_produced(self, mock_manager):
+        """Docker writes pull progress and container logs to stdout before it fails."""
+        mock_manager.auto_failover.return_value = MagicMock()
+        mock_manager.execute_command.return_value = {
+            "success": False,
+            "endpoint": "test-host",
+            "command": "docker logs app",
+            "exit_code": 1,
+            "stdout": "app listening on 8080\nOOMKilled\n",
+            "stderr": "container exited",
+        }
+
+        result = await handle_docker_operations({"operation": "logs", "container_name": "app"})
+
+        assert result.isError is True
+        assert "OOMKilled" in result.content[0].text
+
+    async def test_handle_environment_setup_failure_names_the_step_that_failed(self, mock_manager):
+        """environment_setup runs an `&&` chain, so stdout is what says which step got there.
+
+        Without it, a missing interpreter and a single requirement that would not
+        build are the same message.
+        """
+        mock_manager.auto_failover.return_value = MagicMock()
+        mock_manager.execute_command.return_value = {
+            "success": False,
+            "endpoint": "test-host",
+            "command": "python3 -m venv ... && pip install ...",
+            "exit_code": 1,
+            "stdout": "created venv\ncollecting numpy\n",
+            "stderr": "no matching distribution for numpy==999",
+        }
+
+        result = await handle_environment_setup(
+            {"environment_type": "python", "workspace_path": "/tmp/ws", "requirements": ["numpy==999"]}
+        )
+
+        assert result.isError is True
+        assert "created venv" in result.content[0].text
+        assert "no matching distribution" in result.content[0].text
 
     async def test_handle_environment_setup(self, mock_manager):
         """Test handle_environment_setup"""

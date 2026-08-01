@@ -34,8 +34,29 @@ All notable changes to this project are documented here. Format follows
   unknown tools, connection-endpoint auth headers); and a wheel/sdist build.
 - `build_write_command` is exported from the package root. It builds the
   command that writes content to a path, and spells append as well as write.
+- `rigout url`, which prints one URL and nothing else on stdout. The setup URL
+  that `start` prints scrolls away in the foreground, and Ctrl+C in that
+  terminal stops the server rather than copying anything; this reads the value
+  back from the connection file, works in foreground and detached mode alike,
+  and does not touch the running server. Being alone on stdout is the point:
+  `rigout url | xclip -selection clipboard`, `rigout url > url.txt` and
+  `ssh HOST rigout url` all work, because every warning stays on stderr.
+  `--which mcp` and `--which health` select the other endpoints, `--copy`
+  copies to the clipboard, and `--output json` reports all three at once.
+- The agent setup URL is copied to the system clipboard when one is reachable,
+  using `clip` on Windows, `pbcopy` on macOS, and `wl-copy`, `xclip`, `xsel`
+  or `clip.exe` on Linux and WSL. It is written to the tool's stdin rather
+  than passed as an argument, because arguments are readable by any local user
+  through `ps` and this URL can fetch the bearer token. Where no clipboard
+  tool exists the start is unaffected and the URL is printed for selection.
+  Disable it with `--no-copy-url`.
 
 ### Changed
+- The agent setup URL is printed alone at the left margin, under a line naming
+  it as the one to hand to an agent, while the informational MCP and health
+  URLs stay labelled. Three URLs previously appeared in the same shape with no
+  indication of which one an agent needed, and selecting the URL's line
+  selected its label along with it.
 - `connection.json` and `/health` now report the running package version, and
   `connection.json` advertises the `server_activity` capability.
 - GitHub Actions bumped: `checkout` v4 to v7, `setup-python` v5 to v6,
@@ -90,6 +111,12 @@ All notable changes to this project are documented here. Format follows
   Windows, where `st_mode` reports `0o666` whatever the ACLs say.
 
 ### Fixed
+- A failing command no longer discards the output it produced.
+  `execute_command`, `install_software`, `docker_operations` and
+  `environment_setup` reported only the error, so `make && ./run-tests` that
+  failed in the tests returned nothing about the build, and a failed
+  `environment_setup` could not be traced to the step of its `&&` chain that
+  got there. The failure is still reported first, with the output after it.
 - Setup-token handling: tokens expire after 15 minutes by default, are
   redacted from Rigout-controlled access logs, and protected connection
   responses include no-store/no-cache headers. Unauthorized responses now

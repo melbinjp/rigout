@@ -40,6 +40,7 @@ from rigout.mcp_url_launcher import (
     main,
     parse_args,
     prepare_start_args,
+    print_start_result,
     run_foreground,
     runtime_metadata,
     start_detached,
@@ -1488,3 +1489,196 @@ def test_stop_refuses_live_pid_with_mismatched_process_identity(tmp_path, capsys
     assert exit_code == 1
     assert "Refusing to stop" in output["error"]
     assert process_is_running(os.getpid()) is True
+
+
+SETUP_URL = "https://example.trycloudflare.com/connection.json?setup_token=TOKEN123"
+
+
+def write_connection(paths, *, setup_url=SETUP_URL):
+    """Write a connection file shaped like the one a public start produces."""
+    paths.prepare()
+    connection = {
+        "server": {"name": "rigout", "version": __version__},
+        "mcp": {
+            "transport": "streamable-http",
+            "url": "https://example.trycloudflare.com/mcp",
+            "health_url": "https://example.trycloudflare.com/health",
+        },
+    }
+    if setup_url:
+        connection["agent_setup_url"] = setup_url
+    paths.connection_file.write_text(json.dumps(connection), encoding="utf-8")
+    return paths
+
+
+@pytest.mark.unit
+def test_url_prints_only_the_url_on_stdout(tmp_path, capsys):
+    """The point of the command: stdout is pipeable, so it carries the URL and nothing else.
+
+    `rigout url | xclip` and `rigout url > file` are the reason this command exists.
+    Any label, banner or warning on stdout would end up in the clipboard with it.
+    """
+    write_connection(RuntimePaths.resolve(tmp_path))
+
+    exit_code = main(["url", "--state-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == f"{SETUP_URL}\n"
+    assert "password" in captured.err
+
+
+@pytest.mark.unit
+def test_url_works_without_any_runtime_state(tmp_path, capsys):
+    """A foreground start records no runtime file, and that is the case that needs it most."""
+    paths = write_connection(RuntimePaths.resolve(tmp_path))
+    assert not paths.runtime_file.exists()
+
+    exit_code = main(["url", "--state-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out.strip() == SETUP_URL
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("which", "expected"),
+    [
+        ("mcp", "https://example.trycloudflare.com/mcp"),
+        ("health", "https://example.trycloudflare.com/health"),
+    ],
+)
+def test_url_selects_the_requested_endpoint(tmp_path, capsys, which, expected):
+    write_connection(RuntimePaths.resolve(tmp_path))
+
+    exit_code = main(["url", "--state-dir", str(tmp_path), "--which", which])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == f"{expected}\n"
+    # Only the setup URL is credential-equivalent, so only it carries the warning.
+    assert "password" not in captured.err
+
+
+@pytest.mark.unit
+def test_url_reports_a_missing_connection_file_without_polluting_stdout(tmp_path, capsys):
+    exit_code = main(["url", "--state-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert "Start Rigout first" in captured.err
+
+
+@pytest.mark.unit
+def test_url_explains_that_a_loopback_server_has_no_setup_url(tmp_path, capsys):
+    write_connection(RuntimePaths.resolve(tmp_path), setup_url=None)
+
+    exit_code = main(["url", "--state-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert "--which mcp" in captured.err
+
+
+@pytest.mark.unit
+def test_url_json_output_is_one_parseable_object(tmp_path, capsys):
+    write_connection(RuntimePaths.resolve(tmp_path))
+
+    exit_code = main(["url", "--state-dir", str(tmp_path), "--output", "json"])
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert output["setup_url"] == SETUP_URL
+    assert output["mcp_url"] == "https://example.trycloudflare.com/mcp"
+
+
+@pytest.mark.unit
+def test_url_is_parsed_as_a_command_not_a_flagless_start():
+    assert parse_args(["url"]).command == "url"
+
+
+@pytest.mark.unit
+def test_started_url_is_printed_alone_on_its_own_line(capsys):
+    """Selectability is the whole point: a label on the URL's line gets copied with it.
+
+    Three URLs are on screen after a tunnel start and only one is the one to hand over.
+    It is printed bare at the left margin, so a double- or triple-click selects the URL
+    and nothing else, and so it is visually distinct from the two that are informational.
+    """
+    result = {
+        "pid": 4321,
+        "connection_file": "/state/connection.json",
+        "activity_log": "/state/activity.log",
+        "mcp_url": "https://example.trycloudflare.com/mcp",
+        "health_url": "https://example.trycloudflare.com/health",
+    }
+
+    with patch("rigout.mcp_url_launcher.copy_to_clipboard", return_value=None):
+        print_start_result(result, SETUP_URL, "text")
+
+    lines = capsys.readouterr().out.splitlines()
+    assert SETUP_URL in lines, "the setup URL must occupy a line by itself"
+    # The informational URLs stay labelled; only the actionable one stands alone.
+    assert result["mcp_url"] not in lines
+    assert result["health_url"] not in lines
+
+
+@pytest.mark.unit
+def test_started_url_is_copied_to_the_clipboard_by_default(capsys):
+    result = {"pid": 1, "connection_file": "c", "activity_log": "a"}
+
+    with patch("rigout.mcp_url_launcher.copy_to_clipboard", return_value="pbcopy") as copy:
+        print_start_result(result, SETUP_URL, "text")
+
+    copy.assert_called_once_with(SETUP_URL)
+    assert "Already copied to your clipboard (via pbcopy)" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_no_copy_url_leaves_the_clipboard_alone(capsys):
+    """Copying a credential-equivalent URL must be refusable."""
+    result = {"pid": 1, "connection_file": "c", "activity_log": "a"}
+
+    with patch("rigout.mcp_url_launcher.copy_to_clipboard") as copy:
+        print_start_result(result, SETUP_URL, "text", copy_url=False)
+
+    copy.assert_not_called()
+    assert SETUP_URL in capsys.readouterr().out.splitlines()
+
+
+@pytest.mark.unit
+def test_no_copy_url_flag_is_accepted_and_defaults_to_copying():
+    assert parse_args(["--tunnel", "cloudflare"]).copy_url is True
+    assert parse_args(["--no-copy-url"]).copy_url is False
+    assert parse_args(["start", "--no-copy-url"]).copy_url is False
+
+
+@pytest.mark.unit
+def test_json_startup_output_never_prints_the_url_banner(capsys):
+    """`--output json` must stay one parseable object; a banner would corrupt it."""
+    result = {"pid": 1, "connection_file": "c", "activity_log": "a"}
+
+    with patch("rigout.mcp_url_launcher.copy_to_clipboard") as copy:
+        print_start_result(result, SETUP_URL, "json")
+
+    copy.assert_not_called()
+    assert json.loads(capsys.readouterr().out) == result
+
+
+@pytest.mark.unit
+def test_url_command_copies_only_when_asked(tmp_path, capsys):
+    write_connection(RuntimePaths.resolve(tmp_path))
+
+    with patch("rigout.mcp_url_launcher.copy_to_clipboard", return_value="xclip") as copy:
+        main(["url", "--state-dir", str(tmp_path)])
+        copy.assert_not_called()
+
+        main(["url", "--state-dir", str(tmp_path), "--copy"])
+        copy.assert_called_once_with(SETUP_URL)
+
+    captured = capsys.readouterr()
+    # stdout stays pipeable: the URL twice, and the copy report on stderr.
+    assert captured.out == f"{SETUP_URL}\n{SETUP_URL}\n"
+    assert "Copied to the clipboard via xclip." in captured.err

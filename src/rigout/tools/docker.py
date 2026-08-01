@@ -124,4 +124,9 @@ async def handle_docker_operations(arguments: dict) -> CallToolResult:
         result_text += f"Output:\n{bounded_output(str(result['stdout']))}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
-        return error_result(f"Docker operation '{operation}' failed: {failure_detail(result, 'Docker command failed')}")
+        result_text = f"Docker operation '{operation}' failed: {failure_detail(result, 'Docker command failed')}"
+        # Docker writes pull progress and container logs to stdout before it fails.
+        # Dropping them leaves the caller with a bare "failed" and nothing to act on.
+        if result.get("stdout"):
+            result_text += f"\n\nOutput:\n{bounded_output(str(result['stdout']))}"
+        return error_result(result_text)

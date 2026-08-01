@@ -221,7 +221,7 @@ The setup token is a separate, short-lived credential and it protects exactly on
   `headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}`. So the setup
   URL is a one-shot, time-boxed way to hand an agent its real credential. That warning is
   printed by `print_start_result` in `mcp_url_launcher.py`, at
-  `Treat the agent setup URL like a password`.
+  `Treat it like a password: it can fetch the bearer token.`.
 - `/connection.json` is only protected when a bearer token exists, at
   `if auth_token and not (bearer_authorized or setup_authorized)`. With no bearer token it is
   public.

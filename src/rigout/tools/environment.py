@@ -168,9 +168,13 @@ async def handle_environment_setup(arguments: dict) -> CallToolResult:
     result = await get_tunnel_manager().execute_command(endpoint, full_command, timeout=300, allow_sudo=True)
 
     if not result["success"]:
-        return error_result(
-            f"Environment setup '{env_type}' failed: {failure_detail(result, 'Environment command failed')}"
-        )
+        message = f"Environment setup '{env_type}' failed: {failure_detail(result, 'Environment command failed')}"
+        # This is an `&&` chain, so the failure is at one step of several and stdout
+        # is what identifies which one got there. Without it the caller cannot tell a
+        # missing interpreter from a single requirement that would not build.
+        if result.get("stdout"):
+            message += f"\n\nSetup output:\n{result['stdout']}"
+        return error_result(message)
 
     result_text = f"Environment setup '{env_type}' completed successfully\n\n"
     result_text += f"Workspace: {workspace_path}\n"

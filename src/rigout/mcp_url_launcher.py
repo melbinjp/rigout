@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from ._version import __version__
+from .clipboard import copy_to_clipboard
 from .lifecycle import (
     MAX_LOG_TAIL_LINES,
     RuntimePaths,
@@ -72,7 +73,7 @@ NO_AUTH_WARNING = (
     "Warning: --no-auth disables bearer authentication while binding {host}, "
     "which is reachable beyond this machine. Anyone who can reach it can run commands."
 )
-LIFECYCLE_COMMANDS = frozenset({"start", "status", "logs", "stop"})
+LIFECYCLE_COMMANDS = frozenset({"start", "status", "logs", "stop", "url"})
 STARTUP_TIMEOUT_SECONDS = 90
 STARTUP_POLL_SECONDS = 0.2
 FOLLOW_POLL_SECONDS = 0.25
@@ -430,6 +431,12 @@ def add_start_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Do not generate a credential-bearing setup URL for public/tunnel mode",
     )
+    parser.add_argument(
+        "--no-copy-url",
+        dest="copy_url",
+        action="store_false",
+        help="Do not copy the agent setup URL to the system clipboard when it is printed",
+    )
     parser.add_argument("--cloudflared-path", help="Use this cloudflared binary instead of PATH/cache lookup")
     parser.add_argument(
         "--no-cloudflared-download",
@@ -509,7 +516,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser = argparse.ArgumentParser(
             prog="rigout start" if explicit_lifecycle else "rigout",
             description="Set up and run a URL-based hardware MCP server",
-            epilog=("Lifecycle commands: rigout start [--detach], rigout status, rigout logs [--follow], rigout stop"),
+            epilog=(
+                "Lifecycle commands: rigout start [--detach], rigout status, rigout url, "
+                "rigout logs [--follow], rigout stop"
+            ),
             formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         )
         add_start_arguments(parser)
@@ -520,6 +530,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         )
         add_management_arguments(parser)
+    elif command == "url":
+        parser = argparse.ArgumentParser(
+            prog="rigout url",
+            description="Print the running server's URL, alone on one line",
+            epilog=(
+                "Prints nothing but the URL to stdout, so it can be copied without selecting "
+                "it out of a busy terminal: `rigout url > url.txt`, `rigout url | xclip -selection clipboard`, "
+                "or `ssh HOST rigout url` from the machine you are actually working on. Reading it "
+                "does not touch the running server."
+            ),
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
+        add_management_arguments(parser)
+        parser.add_argument(
+            "--which",
+            choices=["setup", "mcp", "health"],
+            default="setup",
+            help="Which URL to print; setup is the one an agent needs to fetch the bearer token",
+        )
+        parser.add_argument(
+            "--copy",
+            action="store_true",
+            help="Also copy the URL to the system clipboard",
+        )
     elif command == "logs":
         parser = argparse.ArgumentParser(
             prog="rigout logs",
@@ -705,7 +739,7 @@ def print_json(value: dict[str, Any]) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
-def print_start_result(result: dict[str, Any], setup_url: str | None, output: str) -> None:
+def print_start_result(result: dict[str, Any], setup_url: str | None, output: str, *, copy_url: bool = True) -> None:
     """Print detached startup state for an agent or human."""
     if output == "json":
         print_json(result)
@@ -720,9 +754,19 @@ def print_start_result(result: dict[str, Any], setup_url: str | None, output: st
     print(f"Connection file: {result['connection_file']}")
     print(f"Activity log: {result['activity_log']}")
     if setup_url:
-        print(f"Agent setup URL: {setup_url}")
-        print("Treat the agent setup URL like a password; it can fetch the bearer token.")
-    print("Use `rigout status`, `rigout logs --follow`, and `rigout stop` to manage it.")
+        # Same layout as the foreground start: the URL alone at the left margin, so it
+        # can be selected on its own and nothing else is copied with it.
+        print()
+        print("  Give your AI agent this URL:")
+        print()
+        print(setup_url)
+        print()
+        copied_with = copy_to_clipboard(setup_url) if copy_url else None
+        if copied_with:
+            print(f"  Already copied to your clipboard (via {copied_with}); just paste it.")
+        print("  Treat it like a password: it can fetch the bearer token.")
+        print("  `rigout url` prints it again, alone on one line.")
+    print("Use `rigout status`, `rigout url`, `rigout logs --follow`, and `rigout stop` to manage it.")
 
 
 def reserve_detached_start(
@@ -794,7 +838,7 @@ def start_detached(args: argparse.Namespace, paths: RuntimePaths) -> int:
             if runtime.get("running"):
                 safe_connection, setup_url = connection_summary(runtime["connection_file"])
                 result = {**runtime, **safe_connection}
-                print_start_result(result, setup_url, args.output)
+                print_start_result(result, setup_url, args.output, copy_url=args.copy_url)
                 return 0
         if owns_runtime and record.get("status") == "failed":
             runtime = runtime_status(paths)
@@ -1000,11 +1044,32 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
         else:
             report("Auth: none, and none needed: bound to loopback, reachable only from this machine")
         if setup_url and not detached_child:
-            report(f"Agent setup URL: {setup_url}")
-            report("Paste this URL to your AI agent so it can configure itself.")
-            report("Treat the agent setup URL like a password; it can fetch the bearer token.")
+            # Three URLs are on screen by this point and only one of them is the one to
+            # hand over. It is printed alone at the left margin, with everything else
+            # indented, so it is both unmistakable and selectable by itself: a
+            # double- or triple-click gets the URL and no label. Nothing is added to
+            # this line, because anything added would be copied along with it.
+            report()
+            report("  Give your AI agent this URL:")
+            report()
+            report(setup_url)
+            report()
+            copied_with = copy_to_clipboard(setup_url) if args.copy_url else None
+            if copied_with:
+                report(f"  Already copied to your clipboard (via {copied_with}); just paste it.")
+            elif args.copy_url:
+                # Naming the tools turns a dead end into one command to run.
+                report("  No clipboard tool found here, so select the URL above to copy it.")
+                report("  Installing wl-clipboard, xclip, or xsel lets Rigout copy it for you.")
+            report("  Treat it like a password: it can fetch the bearer token.")
+            # Ctrl+C in this terminal stops the server rather than copying, and on a
+            # remote box this is often the only terminal. Both ways out are named here,
+            # before the operator has to go looking for one.
+            report("  Lost it? `rigout url` prints it again, alone on one line.")
+            report("  Only one terminal? Ctrl+C, then start again with --detach to free this one.")
         elif setup_url:
             report("Agent setup URL: stored in the owner-readable connection file")
+            report("Run `rigout url` to print it.")
         report("Press Ctrl+C to stop.")
 
         while server_process.poll() is None:
@@ -1071,6 +1136,68 @@ def handle_status(args: argparse.Namespace, paths: RuntimePaths) -> int:
         print(f"Connection file: {status['connection_file']}")
         print(f"Activity log: {status['activity_log']}")
     return 0 if status["running"] else 1
+
+
+def handle_url(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    """Print one URL for the running server, alone on a line.
+
+    `start` prints the setup URL once, and in the foreground it then scrolls away
+    behind activity. Recovering it meant selecting a long token out of a live
+    terminal, where Ctrl+C stops the server rather than copying anything. This reads
+    the same value back from the connection file, so it works in either mode and as
+    many times as needed.
+
+    Nothing but the URL goes to stdout, which is what makes `rigout url | xclip` and
+    `ssh HOST rigout url` work; every explanation and warning goes to stderr.
+    """
+    status = runtime_status(paths)
+    connection_file = Path(status.get("connection_file") or paths.connection_file)
+    if not connection_file.exists():
+        print(
+            f"No connection file at {connection_file}. Start Rigout first, or pass --state-dir "
+            "if it was started with one.",
+            file=sys.stderr,
+        )
+        return 1
+
+    summary, setup_url = connection_summary(connection_file)
+    urls = {"setup": setup_url, "mcp": summary.get("mcp_url"), "health": summary.get("health_url")}
+
+    if args.output == "json":
+        print_json({"connection_file": str(connection_file), **{f"{k}_url": v for k, v in urls.items()}})
+        return 0 if urls[args.which] else 1
+
+    chosen = urls[args.which]
+    if not chosen:
+        if args.which == "setup":
+            # A local-only server has no setup URL by design, so say which case this
+            # is rather than reporting the value as merely missing.
+            print(
+                "This server has no agent setup URL. One exists only for a server that is "
+                "reachable off this machine and has an auth token; a loopback server does not "
+                "need one. Use `rigout url --which mcp` for the MCP endpoint.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"No {args.which} URL recorded in {connection_file}.", file=sys.stderr)
+        return 1
+
+    print(chosen)
+    if args.copy:
+        copied_with = copy_to_clipboard(chosen)
+        # Both outcomes go to stderr: stdout carries the URL and nothing else, which is
+        # what makes this command safe to pipe.
+        if copied_with:
+            print(f"Copied to the clipboard via {copied_with}.", file=sys.stderr)
+        else:
+            print(
+                "No clipboard tool was found, so nothing was copied. Install wl-clipboard, "
+                "xclip, or xsel, or redirect this command's output instead.",
+                file=sys.stderr,
+            )
+    if args.which == "setup":
+        print("Treat this like a password; it can fetch the bearer token.", file=sys.stderr)
+    return 0
 
 
 def sanitize_activity_line(line: str) -> str:
@@ -1280,6 +1407,8 @@ def run_command(argv: list[str] | None = None) -> int:
 
     if args.command == "status":
         return handle_status(args, paths)
+    if args.command == "url":
+        return handle_url(args, paths)
     if args.command == "logs":
         return handle_logs(args, paths)
     if args.command == "stop":
