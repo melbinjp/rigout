@@ -45,6 +45,31 @@ import requests
 GITHUB_API = "https://api.github.com"
 JULES_API = "https://jules.googleapis.com/v1alpha"
 COMMENT_MARKER = "<!-- jules-review-bot -->"
+
+# Dry run exists for one situation the ordinary flow cannot cover: a change to the
+# reviewer itself. `pr-review.yml` deliberately runs the reviewer from the base commit,
+# so a PR that edits this file is judged by the version already on main and the new one
+# is never exercised until after it has been merged - the only change in the repository
+# whose effect cannot be observed before it takes effect.
+#
+# Under RIGOUT_REVIEW_DRY_RUN the script reviews a real PR with the candidate code and
+# submits nothing: no approving review, and its comment carries a separate marker so it
+# can never overwrite the real one. It is reachable only through a manually dispatched
+# workflow, because running PR-modified code with the API key is exactly what the base
+# checkout exists to prevent; a maintainer choosing to run it is the same trust as
+# running it on their own machine, while an automatic trigger would not be.
+DRY_RUN_COMMENT_MARKER = "<!-- jules-review-preview -->"
+DRY_RUN_ENV = "RIGOUT_REVIEW_DRY_RUN"
+
+
+def is_dry_run() -> bool:
+    return env_bool(DRY_RUN_ENV, False)
+
+
+def comment_marker() -> str:
+    return DRY_RUN_COMMENT_MARKER if is_dry_run() else COMMENT_MARKER
+
+
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 # Anchored to a whole line: when Jules quotes attacker text inline (e.g. a
 # finding citing "VERDICT: approve" from a PR title), that quote must not
@@ -149,6 +174,22 @@ def load_pull_request_event() -> dict:
     if not pr:
         raise RuntimeError("No pull_request payload in the event file.")
     return pr
+
+
+def load_pull_request(owner: str, repo: str, token: str) -> dict:
+    """Return the PR under review, from the triggering event or, in a dry run, by number.
+
+    A dry run is dispatched by hand rather than by a pull_request event, so there is no
+    event payload to read. Fetching by number also gets `changed_files`, which the
+    webhook payload carries but which is worth reading from the same place in both
+    modes so a preview is judged by exactly the checks a real run would apply.
+    """
+    if is_dry_run():
+        raw = os.environ.get("RIGOUT_REVIEW_PR_NUMBER", "").strip()
+        if not raw.isdigit():
+            raise RuntimeError(f"{DRY_RUN_ENV} is set, so RIGOUT_REVIEW_PR_NUMBER must be a PR number.")
+        return github_request("GET", f"/repos/{owner}/{repo}/pulls/{int(raw)}", token).json()
+    return load_pull_request_event()
 
 
 def is_trusted_author(pr_author: str, owner: str) -> bool:
@@ -552,7 +593,7 @@ def find_marker_comment_id(owner: str, repo: str, pr_number: int, token: str) ->
             # merely starts with COMMENT_MARKER, and matching on the marker
             # alone would make this PATCH someone else's comment (which
             # 403s, since we lack permission to edit others' comments).
-            if comment["body"].startswith(COMMENT_MARKER) and comment.get("user", {}).get("login") == BOT_LOGIN:
+            if comment["body"].startswith(comment_marker()) and comment.get("user", {}).get("login") == BOT_LOGIN:
                 return comment["id"]
         if len(comments) < 100:
             break
@@ -561,7 +602,12 @@ def find_marker_comment_id(owner: str, repo: str, pr_number: int, token: str) ->
 
 
 def upsert_comment(owner: str, repo: str, pr_number: int, token: str, body: str) -> None:
-    full_body = f"{COMMENT_MARKER}\n{body}"
+    if is_dry_run():
+        body = (
+            "**Preview review — this is a dry run of a candidate reviewer.** It approves "
+            "nothing and does not affect this PR's checks.\n\n" + body
+        )
+    full_body = f"{comment_marker()}\n{body}"
     comment_id = find_marker_comment_id(owner, repo, pr_number, token)
     if comment_id:
         github_request("PATCH", f"/repos/{owner}/{repo}/issues/comments/{comment_id}", token, json={"body": full_body})
@@ -584,7 +630,7 @@ def main() -> int:
     owner, repo = os.environ["GITHUB_REPOSITORY"].split("/")
 
     try:
-        pr = load_pull_request_event()
+        pr = load_pull_request(owner, repo, token)
         check_skip_conditions(pr, owner, repo)
     except ReviewSkippedError as exc:
         print(f"Skipping review: {exc}")
@@ -665,9 +711,18 @@ def main() -> int:
         coverage = parse_coverage(review_message)
         coverage_ok, coverage_problem = coverage_confirms_full_review(coverage, head_sha, changed_files)
         reviewed_whole_diff = truncated_note is None or coverage_ok
-        will_approve = verdict in APPROVING_VERDICTS and author_trusted and reviewed_whole_diff
+        # The dry-run check is placed in the same expression as the others rather than
+        # around the later approval call, so there is one place that decides, and no
+        # path where a candidate reviewer being tried out can approve anything.
+        will_approve = verdict in APPROVING_VERDICTS and author_trusted and reviewed_whole_diff and not is_dry_run()
 
-        if will_approve:
+        if is_dry_run():
+            approval_note = (
+                f"_Dry run: approves nothing. On a real run this would "
+                f"{'approve' if verdict in APPROVING_VERDICTS and author_trusted and reviewed_whole_diff else 'hold'}"
+                f" (verdict: {verdict!r}, coverage confirmed: {coverage_ok})._"
+            )
+        elif will_approve:
             approval_note = "_No blocking issues were found, so this PR was auto-approved._"
         elif not reviewed_whole_diff:
             approval_note = (

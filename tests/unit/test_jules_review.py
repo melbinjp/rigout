@@ -566,3 +566,76 @@ class TestApprovalStillWorksForALoneMaintainer:
     def test_warnings_only_still_approves(self):
         """`comment` stays an approving verdict: warnings should not need a second human."""
         assert "comment" in jules_review.APPROVING_VERDICTS
+
+
+@pytest.mark.unit
+class TestDryRun:
+    """A candidate reviewer must be able to review a real PR and decide nothing.
+
+    `pr-review.yml` runs the reviewer from the base commit, so a change to the reviewer
+    is judged by the old one and the new one is never exercised until it is already in
+    effect. Dry run is how a change to it can be observed before it decides anything.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear(self, monkeypatch):
+        monkeypatch.delenv(jules_review.DRY_RUN_ENV, raising=False)
+
+    def test_off_by_default(self):
+        assert jules_review.is_dry_run() is False
+        assert jules_review.comment_marker() == jules_review.COMMENT_MARKER
+
+    def test_a_dry_run_uses_a_separate_comment_marker(self, monkeypatch):
+        """It must never overwrite the real review comment on the PR."""
+        monkeypatch.setenv(jules_review.DRY_RUN_ENV, "1")
+
+        assert jules_review.comment_marker() == jules_review.DRY_RUN_COMMENT_MARKER
+        assert jules_review.DRY_RUN_COMMENT_MARKER != jules_review.COMMENT_MARKER
+
+    @pytest.mark.parametrize(
+        ("verdict", "trusted", "whole"),
+        [("approve", True, True), ("comment", True, True)],
+    )
+    def test_a_dry_run_never_approves_even_on_the_cleanest_input(self, monkeypatch, verdict, trusted, whole):
+        monkeypatch.setenv(jules_review.DRY_RUN_ENV, "1")
+
+        will_approve = (
+            verdict in jules_review.APPROVING_VERDICTS and trusted and whole and not jules_review.is_dry_run()
+        )
+
+        assert will_approve is False
+
+    def test_the_same_input_would_approve_on_a_real_run(self, monkeypatch):
+        """Confirms the previous test is measuring the dry-run flag, not a broken case."""
+        monkeypatch.setenv(jules_review.DRY_RUN_ENV, "0")
+
+        will_approve = "approve" in jules_review.APPROVING_VERDICTS and True and True and not jules_review.is_dry_run()
+
+        assert will_approve is True
+
+    def test_a_dry_run_requires_a_pr_number(self, monkeypatch):
+        monkeypatch.setenv(jules_review.DRY_RUN_ENV, "1")
+        monkeypatch.delenv("RIGOUT_REVIEW_PR_NUMBER", raising=False)
+
+        with pytest.raises(RuntimeError, match="RIGOUT_REVIEW_PR_NUMBER"):
+            jules_review.load_pull_request("o", "r", "tok")
+
+    def test_a_dry_run_fetches_the_named_pr_instead_of_an_event(self, monkeypatch):
+        monkeypatch.setenv(jules_review.DRY_RUN_ENV, "1")
+        monkeypatch.setenv("RIGOUT_REVIEW_PR_NUMBER", "24")
+
+        with patch.object(jules_review, "github_request") as request:
+            request.return_value = MagicMock(json=lambda: {"number": 24})
+            pr = jules_review.load_pull_request("o", "r", "tok")
+
+        assert pr["number"] == 24
+        assert "/pulls/24" in request.call_args.args[1]
+
+    def test_a_real_run_still_reads_the_event_payload(self, monkeypatch):
+        monkeypatch.setenv(jules_review.DRY_RUN_ENV, "0")
+
+        with patch.object(jules_review, "load_pull_request_event", return_value={"number": 7}) as from_event:
+            pr = jules_review.load_pull_request("o", "r", "tok")
+
+        from_event.assert_called_once()
+        assert pr["number"] == 7

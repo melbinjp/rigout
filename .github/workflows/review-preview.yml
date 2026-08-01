@@ -1,0 +1,62 @@
+name: Jules Review Preview
+
+# Try a candidate reviewer against a real PR without letting it decide anything.
+#
+# `pr-review.yml` runs the reviewer from the base commit on purpose, so a PR that
+# changes scripts/jules_review.py is judged by the version already on main and the new
+# version is never exercised until after it is merged. That makes the reviewer the one
+# thing in this repository whose behaviour cannot be observed before it takes effect.
+# This workflow closes that gap: it checks out a chosen ref, reviews a chosen PR with
+# it, and posts the result under a separate marker.
+#
+# Manually dispatched, never automatic. Running PR-modified code with JULES_API_KEY is
+# exactly what the base checkout in pr-review.yml prevents; a maintainer choosing to run
+# it is the same trust as running it on their own machine, and an automatic trigger on
+# every PR would not be. It also holds no approval permission, and the script refuses to
+# submit a review while RIGOUT_REVIEW_DRY_RUN is set, so the two are independent.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+        type: string
+      reviewer_ref:
+        description: "Branch, tag or SHA to take scripts/jules_review.py from"
+        required: true
+        default: "main"
+        type: string
+
+jobs:
+  preview:
+    name: Review Preview (approves nothing)
+    runs-on: ubuntu-latest
+    # No pull-requests: write. This job can comment through the issues API but
+    # cannot submit a review, so it cannot satisfy a required review even if the
+    # script's own dry-run guard were somehow bypassed.
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Check out the candidate reviewer
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.reviewer_ref }}
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade requests
+
+      - name: Preview the review
+        env:
+          JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RIGOUT_REVIEW_DRY_RUN: "1"
+          RIGOUT_REVIEW_PR_NUMBER: ${{ inputs.pr_number }}
+        run: python scripts/jules_review.py
