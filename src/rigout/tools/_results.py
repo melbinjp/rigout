@@ -90,3 +90,16 @@ def failure_detail(result: Mapping[str, Any], fallback: str = "Operation failed"
     if exit_code is not None:
         return f"Command exited with status {exit_code}"
     return fallback
+
+
+def result_is_error(result: CallToolResult) -> bool:
+    """Whether a tool result is an error, on either mcp major.
+
+    2.x renamed the field to `is_error` while keeping `isError` as a construction alias,
+    so building a result works on both but reading `.isError` off one raises on 2.x. The
+    read is what has to be spelled carefully; the writes elsewhere do not.
+    """
+    flag = getattr(result, "isError", None)
+    if flag is None:
+        flag = getattr(result, "is_error", None)
+    return bool(flag)

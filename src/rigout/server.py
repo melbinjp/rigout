@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sys
 from collections.abc import Sequence
+from typing import Any
 
 from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
@@ -34,7 +35,7 @@ from .tools import (
     handle_manage_tunnels,
     handle_system_monitoring,
 )
-from .tools._results import transport_safe_result
+from .tools._results import result_is_error, transport_safe_result
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,6 @@ def annotate(tools: list[Tool]) -> list[Tool]:
     return tools
 
 
-@server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     """List available tools for AI agents"""
     return annotate(
@@ -487,13 +487,49 @@ def _error_message(name: str, content: Sequence[ContentBlock]) -> str:
     return "\n".join(parts) or f"Tool '{name}' failed"
 
 
-@server.call_tool()
 async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle tool calls from MCP clients."""
     result = await _handle_call_tool_result(name, arguments)
-    if result.isError:
+    if result_is_error(result):
         raise RuntimeError(_error_message(name, result.content))
     return result.content  # type: ignore
+
+
+# mcp 1.x registers these with decorators; 2.x removed them for explicit registration.
+# That is the entire incompatibility between the two majors - every tool definition above
+# constructs unchanged, because 2.x renamed Tool's fields but kept the camelCase
+# spellings as aliases, and stdio, streamable_http_manager, models and types all survive.
+#
+# Supporting both is deliberate rather than transitional. The fork is four lines wide and
+# lets the dependency bound span both majors, so nobody is pushed onto a major the week it
+# appears and nobody is stranded on the old one either. Which of the two is in use is
+# decided by what is installed, not by a setting, so there is nothing to configure wrong.
+def register_tool_handlers() -> None:
+    """Register the tool handlers against whichever mcp major is installed."""
+    if hasattr(server, "list_tools"):
+        server.list_tools()(handle_list_tools)
+        server.call_tool()(handle_call_tool)
+        return
+
+    from mcp.types import CallToolRequestParams, ListToolsResult, PaginatedRequestParams
+
+    async def list_tools_request(_context: Any, _params: Any) -> ListToolsResult:
+        return ListToolsResult(tools=await handle_list_tools())
+
+    async def call_tool_request(_context: Any, params: Any) -> CallToolResult:
+        # Returned rather than raised. 1.x needs an error re-raised as RuntimeError for the
+        # SDK to rebuild it; 2.x takes the result as it is, so isError survives directly.
+        return await _handle_call_tool_result(params.name, params.arguments or {})
+
+    # Guarded by the hasattr above: this branch only runs on the major that has these,
+    # and the type checker sees whichever mcp is installed, so one of the two branches is
+    # always unknown to it. Ignoring here rather than loosening the annotation keeps the
+    # rest of the file checked.
+    server.add_request_handler("tools/list", PaginatedRequestParams, list_tools_request)  # type: ignore[attr-defined]
+    server.add_request_handler("tools/call", CallToolRequestParams, call_tool_request)  # type: ignore[attr-defined]
+
+
+register_tool_handlers()
 
 
 async def handle_call_tool_result(name: str, arguments: dict) -> CallToolResult:

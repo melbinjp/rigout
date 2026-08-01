@@ -16,14 +16,14 @@ from rigout.server import handle_list_tools, main, server
 
 @pytest.mark.unit
 def test_server_advertises_package_version():
-    assert __version__ == "0.3.0"
+    assert __version__ == "0.3.1"
     assert server.version == __version__
 
 
 @pytest.mark.unit
 def test_source_checkout_version_wins_over_stale_distribution_metadata():
     with patch.object(_version, "distribution_version", return_value="0.1.0"):
-        assert _version.resolve_version() == "0.3.0"
+        assert _version.resolve_version() == "0.3.1"
 
 
 @pytest.mark.unit
@@ -108,6 +108,17 @@ def test_import_does_not_create_a_cwd_log_file(tmp_path):
     assert not (tmp_path / "mcp-hardware-server.log").exists()
 
 
+def hints(tool):
+    """Annotation hints by their wire names, on either mcp major.
+
+    2.x renamed the attributes to snake_case while keeping the camelCase spellings as
+    construction aliases, so reading `.readOnlyHint` off the model works on 1.x and
+    raises on 2.x. Dumping by alias gives the names the protocol actually uses, which
+    are the same on both.
+    """
+    return tool.annotations.model_dump(by_alias=True)
+
+
 @pytest.mark.unit
 class TestToolAnnotations:
     """Every tool must say what it does to the machine before a client runs it.
@@ -154,8 +165,8 @@ class TestToolAnnotations:
     def test_tools_that_change_the_machine_are_marked_destructive(self, name):
         tool = next(t for t in self._tools() if t.name == name)
 
-        assert tool.annotations.readOnlyHint is False
-        assert tool.annotations.destructiveHint is True
+        assert hints(tool)["readOnlyHint"] is False
+        assert hints(tool)["destructiveHint"] is True
 
     @pytest.mark.parametrize(
         "name", ["get_hardware_info", "get_server_activity", "system_monitoring", "list_terminal_sessions"]
@@ -163,19 +174,19 @@ class TestToolAnnotations:
     def test_tools_that_only_look_are_marked_read_only(self, name):
         tool = next(t for t in self._tools() if t.name == name)
 
-        assert tool.annotations.readOnlyHint is True
-        assert tool.annotations.destructiveHint is False
+        assert hints(tool)["readOnlyHint"] is True
+        assert hints(tool)["destructiveHint"] is False
 
     def test_anything_running_a_callers_command_is_not_idempotent(self):
         """What such a tool does is decided by the caller and cannot be known here, so
         claiming a repeat call changes nothing would be a guess stated as a fact."""
         for name in ("execute_command", "execute_in_terminal"):
             tool = next(t for t in self._tools() if t.name == name)
-            assert tool.annotations.idempotentHint is False
+            assert hints(tool)["idempotentHint"] is False
 
     def test_read_only_tools_are_never_also_destructive(self):
         """The two contradict each other, and a client reading either alone would be
         told something untrue."""
         for tool in self._tools():
-            if tool.annotations.readOnlyHint:
-                assert tool.annotations.destructiveHint is False, tool.name
+            if hints(tool)["readOnlyHint"]:
+                assert hints(tool)["destructiveHint"] is False, tool.name
