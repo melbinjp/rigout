@@ -19,6 +19,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -128,11 +129,70 @@ def interruptible_sleep(seconds: float) -> None:
         time.sleep(min(0.1, remaining))
 
 
-def wait_for_health(url: str, timeout: int = 30) -> bool:
+class ServerExitedError(RuntimeError):
+    """The server process ended before it began answering."""
+
+
+class AddressInUseError(RuntimeError):
+    """Something is already listening where this server was asked to listen."""
+
+
+def ensure_address_available(host: str, port: int) -> None:
+    """Refuse to start when the address is already taken, before starting anything.
+
+    Checked in advance rather than inferred afterwards, because afterwards is too late
+    to tell. A health check only proves something is listening: when the port is already
+    held, our child fails to bind and exits while the process holding it answers health
+    checks immediately, so the launcher reported a healthy start and wrote a connection
+    file describing a server it had not started. Waiting for the child to die does not
+    close that: the foreign answer arrives first.
+
+    A bind that succeeds here can still lose the port before the child claims it, so the
+    child's exit is still watched. This turns the ordinary case into an immediate,
+    accurate message rather than a wrong one.
+    """
+    # Asked by connecting rather than by binding. A trial bind seems the obvious test and
+    # is the wrong one: uvicorn binds with SO_REUSEADDR and a probe without it fails on
+    # the TIME_WAIT connections an earlier run leaves behind, so stopping Rigout and
+    # starting it again would be refused when the address was in fact free. Nothing
+    # accepts connections on a port held only by TIME_WAIT, so connecting distinguishes
+    # a live listener from the wreckage of a dead one.
+    target = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host.strip("[]")
+    try:
+        with socket.create_connection((target, port), timeout=1.5):
+            pass
+    except OSError:
+        return
+
+    raise AddressInUseError(
+        f"{host}:{port} already has something listening on it, so Rigout did not start. "
+        f"Whatever is answering there is not this server, and starting anyway would have "
+        f"produced a connection file describing it. Run `rigout status` to see whether it "
+        f"is another Rigout, or start this one with a different --port."
+    )
+
+
+def wait_for_health(url: str, timeout: int = 30, process: subprocess.Popen | None = None) -> bool:
+    """Wait until the server answers, and stop early if the server we started has died.
+
+    `process` matters more than it looks. A 200 from this URL only proves that something
+    is listening on that port, not that it is ours: when the port is already taken, our
+    child fails to bind and exits while the process that holds it keeps answering health
+    checks. Without this the launcher reported a healthy start, wrote a connection file,
+    and handed the caller a URL and a token belonging to a server it did not start and
+    whose auth may be different or absent.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if STARTUP_INTERRUPTED.is_set():
             return False
+        if process is not None and process.poll() is not None:
+            raise ServerExitedError(
+                f"The MCP server exited with status {process.returncode} before it started serving. "
+                "The usual cause is that the address is already in use, in which case anything "
+                "already listening there is not this server; check with `rigout status`, or start "
+                "with a different --port."
+            )
         try:
             with urllib.request.urlopen(url, timeout=2) as response:
                 return bool(response.status == 200)
@@ -979,6 +1039,9 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
                 record_child_pids(paths, instance_id, server_process, tunnel_process)
 
         mcp_url = resolve_public_mcp_url(args, tunnel_base_url)
+        # Before anything is spawned: a taken port is reported as a taken port, not as a
+        # healthy start against somebody else's server.
+        ensure_address_available(args.host, args.port)
         server_process = start_server(
             args,
             public_url=mcp_url,
@@ -994,7 +1057,7 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
                 daemon=True,
             ).start()
         local_health_url = health_url_from_mcp_url(local_url(args.host, args.port, args.path), args.path)
-        if not wait_for_health(local_health_url):
+        if not wait_for_health(local_health_url, process=server_process):
             if STARTUP_INTERRUPTED.is_set():
                 raise StartupInterruptedError
             raise RuntimeError(f"MCP server did not become healthy at {local_health_url}")
@@ -1043,6 +1106,13 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
             report("      Stop it with `rigout stop` and restart without --no-auth to require a token.")
         else:
             report("Auth: none, and none needed: bound to loopback, reachable only from this machine")
+            # `rigout` with no arguments is the shortest thing anyone types, and it left
+            # them with a running server and nothing about what to do with it. The two
+            # next steps are the two that exist: point a local client at the URL above,
+            # or expose it to an agent that is somewhere else.
+            report("Next: give the MCP URL above to a client on this machine,")
+            report("      or restart with `rigout --tunnel cloudflare` for an agent elsewhere.")
+            report("      `rigout --help` lists every option.")
         if setup_url and not detached_child:
             # Three URLs are on screen by this point and only one of them is the one to
             # hand over. It is printed alone at the left margin, with everything else

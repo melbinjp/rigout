@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import time
 from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -34,9 +35,12 @@ from rigout.lifecycle import (
 )
 from rigout.mcp_url_launcher import (
     STARTUP_INTERRUPTED,
+    AddressInUseError,
+    ServerExitedError,
     StartupInterruptedError,
     build_managed_child_command,
     download_file,
+    ensure_address_available,
     main,
     parse_args,
     prepare_start_args,
@@ -211,6 +215,9 @@ def test_detached_child_does_not_refuse_parent_reserved_pid(tmp_path, monkeypatc
 
     with (
         patch("rigout.mcp_url_launcher.runtime_status", return_value=already_reserved),
+        # The address check is real, and leaving it live would make this test depend on
+        # whether port 8765 happens to be free on the machine running it.
+        patch("rigout.mcp_url_launcher.ensure_address_available"),
         patch("rigout.mcp_url_launcher.start_server", side_effect=RuntimeError("child reached startup")) as start,
     ):
         exit_code = run_foreground(args, paths, managed=True)
@@ -572,6 +579,7 @@ def test_managed_start_records_child_pids_for_recovery(tmp_path):
             "rigout.mcp_url_launcher.start_cloudflare_tunnel",
             return_value=(tunnel, "https://example.trycloudflare.com"),
         ),
+        patch("rigout.mcp_url_launcher.ensure_address_available"),
         patch("rigout.mcp_url_launcher.start_server", return_value=server),
         patch("rigout.mcp_url_launcher.wait_for_health", return_value=False),
     ):
@@ -898,6 +906,7 @@ def test_a_real_interrupt_ends_a_stalled_tunnel_wait(tmp_path, capsys):
     with (
         patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
         patch("rigout.mcp_url_launcher.subprocess.Popen", side_effect=cloudflared_only(SilentCloudflared())),
+        patch("rigout.mcp_url_launcher.ensure_address_available"),
         patch("rigout.mcp_url_launcher.start_server") as start_server_call,
     ):
         threading.Timer(0.5, lambda: signal.raise_signal(signal.SIGINT)).start()
@@ -1076,6 +1085,7 @@ def test_the_running_banner_always_states_the_auth_posture(tmp_path, capsys, ext
     prepare_start_args(args, paths)
 
     with (
+        patch("rigout.mcp_url_launcher.ensure_address_available"),
         patch("rigout.mcp_url_launcher.start_server", return_value=ExitingChildProcess()),
         patch("rigout.mcp_url_launcher.wait_for_health", return_value=True),
         patch("rigout.mcp_url_launcher.write_connection_file"),
@@ -1358,6 +1368,7 @@ def test_a_managed_child_refuses_a_directory_another_instance_already_runs(tmp_p
 
     with (
         patch.dict(os.environ, {"RIGOUT_DETACHED_CHILD": "1", "RIGOUT_INSTANCE_ID": "the-loser"}),
+        patch("rigout.mcp_url_launcher.ensure_address_available"),
         patch("rigout.mcp_url_launcher.start_server") as start,
     ):
         exit_code = run_foreground(args, paths, managed=True)
@@ -1388,6 +1399,9 @@ def test_a_shutdown_does_not_overwrite_a_record_another_instance_now_owns(tmp_pa
 
     with (
         patch.dict(os.environ, {"RIGOUT_DETACHED_CHILD": "1", "RIGOUT_INSTANCE_ID": "the-loser"}),
+        # This test simulates losing the address inside start_server, which is the race
+        # the pre-flight check cannot close; the check itself is not what is under test.
+        patch("rigout.mcp_url_launcher.ensure_address_available"),
         patch("rigout.mcp_url_launcher.start_server", side_effect=lose_the_directory),
     ):
         exit_code = run_foreground(args, paths, managed=True)
@@ -1416,6 +1430,7 @@ def test_child_pids_are_not_recorded_against_another_instances_record(tmp_path, 
     with (
         patch.dict(os.environ, {"RIGOUT_DETACHED_CHILD": "1", "RIGOUT_INSTANCE_ID": "the-loser"}),
         patch("rigout.mcp_url_launcher.start_cloudflare_tunnel", side_effect=lose_the_directory),
+        patch("rigout.mcp_url_launcher.ensure_address_available"),
         patch("rigout.mcp_url_launcher.start_server", return_value=FakeChildProcess(31415)),
         patch("rigout.mcp_url_launcher.wait_for_health", return_value=False),
     ):
@@ -1686,3 +1701,92 @@ def test_url_command_copies_only_when_asked(tmp_path, capsys):
     # stdout stays pipeable: the URL twice, and the copy report on stderr.
     assert captured.out == f"{SETUP_URL}\n{SETUP_URL}\n"
     assert "Copied to the clipboard via xclip." in captured.err
+
+
+@pytest.mark.unit
+def test_health_wait_fails_when_the_server_we_started_has_died():
+    """A 200 proves something is listening, not that it is ours.
+
+    When the port is already taken our child fails to bind and exits while whatever
+    holds the port keeps answering health checks. Without this the launcher reported a
+    healthy start and wrote a connection file describing a server it did not start,
+    whose auth token may differ from the one it just told the caller to use.
+    """
+    dead = Mock()
+    dead.poll.return_value = 1
+    dead.returncode = 1
+
+    with pytest.raises(ServerExitedError, match="already in use"):
+        wait_for_health("http://127.0.0.1:8765/health", timeout=5, process=dead)
+
+
+@pytest.mark.unit
+def test_health_wait_does_not_consult_a_living_process():
+    """A server that is still starting must be waited for, not judged."""
+    alive = Mock()
+    alive.poll.return_value = None
+
+    with patch("rigout.mcp_url_launcher.urllib.request.urlopen") as urlopen:
+        urlopen.return_value.__enter__.return_value.status = 200
+        assert wait_for_health("http://127.0.0.1:8765/health", timeout=5, process=alive) is True
+
+
+@pytest.mark.unit
+def test_health_wait_without_a_process_behaves_as_before():
+    """Callers that have no child to watch keep the original contract."""
+    with patch("rigout.mcp_url_launcher.urllib.request.urlopen") as urlopen:
+        urlopen.return_value.__enter__.return_value.status = 200
+        assert wait_for_health("http://127.0.0.1:8765/health", timeout=5) is True
+
+
+@pytest.mark.unit
+class TestAddressAvailability:
+    """Starting on a taken port must fail as a taken port, not as a healthy start.
+
+    A health check only proves something is listening. When the address is already held,
+    the server exits while the process holding it answers immediately, and the launcher
+    used to write a connection file naming a URL and token belonging to a server it had
+    not started - whose auth may differ, or be absent.
+    """
+
+    def test_a_live_listener_is_refused(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            with pytest.raises(AddressInUseError, match="already has something listening"):
+                ensure_address_available("127.0.0.1", port)
+        finally:
+            listener.close()
+
+    def test_a_free_address_is_allowed(self):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+
+        ensure_address_available("127.0.0.1", port)
+
+    def test_the_check_asks_by_connecting_not_by_binding(self):
+        """Binding would refuse a restart the real server would accept.
+
+        uvicorn binds with SO_REUSEADDR; a probe bind without it fails on the TIME_WAIT
+        connections a previous run leaves, so `rigout stop` followed by `rigout start`
+        would be refused on an address that was free.
+        """
+        with patch("rigout.mcp_url_launcher.socket.create_connection") as connect:
+            connect.side_effect = OSError("nothing there")
+            ensure_address_available("127.0.0.1", 8765)
+
+        connect.assert_called_once()
+
+    @pytest.mark.parametrize("wildcard", ["0.0.0.0", "", "::"])
+    def test_a_wildcard_bind_is_checked_on_loopback(self, wildcard):
+        """A listener on a wildcard address also answers on loopback, so that is where
+        the question can actually be asked."""
+        with patch("rigout.mcp_url_launcher.socket.create_connection") as connect:
+            connect.side_effect = OSError("nothing there")
+            ensure_address_available(wildcard, 8765)
+
+        assert connect.call_args.args[0] == ("127.0.0.1", 8765)

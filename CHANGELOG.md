@@ -81,6 +81,11 @@ All notable changes to this project are documented here. Format follows
   Disable it with `--no-copy-url`.
 
 ### Changed
+- `rigout` with no arguments now says what to do next. It started a local server
+  and stopped there, which is the shortest thing anyone types and left them with
+  a running process and no indication of how to use it; it now names the two
+  steps that exist, pointing a local client at the URL or restarting with a
+  tunnel for an agent elsewhere, and mentions `rigout --help`.
 - The Jules PR review now obtains the change from its own checkout instead of
   reading a diff pasted into its prompt, and reports the commit and file count
   it examined so that coverage is checked against what GitHub reports. On a
@@ -164,6 +169,17 @@ All notable changes to this project are documented here. Format follows
   Windows, where `st_mode` reports `0o666` whatever the ACLs say.
 
 ### Fixed
+- Starting on an address that is already in use is refused instead of being
+  reported as a healthy start. A health check only proves that something is
+  listening: when the port was held, Rigout's own server exited while the
+  process holding it answered immediately, so the launcher announced success
+  and wrote a `connection.json` naming a URL and bearer token belonging to a
+  server it had not started, whose auth may differ or be absent. The address is
+  now checked before anything is spawned, and the server process is watched
+  while waiting for health. The check connects rather than binding, because a
+  trial bind without `SO_REUSEADDR` fails on the TIME_WAIT connections a
+  previous run leaves behind and would refuse a restart on an address that was
+  free.
 - A strict-mode refusal now says how to resolve itself. Paramiko reports an
   unrecorded host as `Server '[host]:port' not found in known_hosts`, which
   states the refusal and nothing else; it is the first thing anyone meets after
