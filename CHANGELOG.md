@@ -86,6 +86,13 @@ All notable changes to this project are documented here. Format follows
   Disable it with `--no-copy-url`.
 
 ### Changed
+- The README states what an installation environment does and does not isolate.
+  Commands an agent runs are children of the Rigout process and inherit its
+  environment, so what decides their `python` and `PATH` is the environment
+  Rigout was started in, not where its own packages live. A `pipx` shim does not
+  activate anything, so the agent sees the same interpreter the operator does;
+  starting from an activated virtual environment does change what every command
+  sees, which is sometimes intended and worth knowing either way.
 - `pipx install rigout` is the documented install. Rigout is an application, not
   a library, and its own environment is where its dependency bounds cannot
   collide with anything else installed alongside it. `pip install rigout` is
