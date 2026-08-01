@@ -3,7 +3,7 @@ from pathlib import Path, PureWindowsPath
 
 from mcp.types import CallToolResult, TextContent
 
-from ..ssh_manager import get_tunnel_manager, heredoc_redirect, shell_quote
+from ..ssh_manager import build_write_command, get_tunnel_manager, shell_quote
 from ._platform import is_windows_platform
 from ._results import error_result, failure_detail
 
@@ -150,7 +150,7 @@ async def handle_environment_setup(arguments: dict) -> CallToolResult:
                 return error_result(f"Environment setup 'docker' failed: cannot write Dockerfile: {exc}")
             notes.append(f"Dockerfile written: {dockerfile}")
         else:
-            commands.append(heredoc_redirect(content, "Dockerfile"))
+            commands.append(build_write_command(content, "Dockerfile"))
             notes.append("Dockerfile written: Dockerfile")
 
     elif env_type == "conda":
