@@ -45,6 +45,7 @@ import requests
 GITHUB_API = "https://api.github.com"
 JULES_API = "https://jules.googleapis.com/v1alpha"
 COMMENT_MARKER = "<!-- jules-review-bot -->"
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 # Dry run exists for one situation the ordinary flow cannot cover: a change to the
 # reviewer itself. `pr-review.yml` deliberately runs the reviewer from the base commit,
@@ -60,17 +61,6 @@ COMMENT_MARKER = "<!-- jules-review-bot -->"
 # running it on their own machine, while an automatic trigger would not be.
 DRY_RUN_COMMENT_MARKER = "<!-- jules-review-preview -->"
 DRY_RUN_ENV = "RIGOUT_REVIEW_DRY_RUN"
-
-
-def is_dry_run() -> bool:
-    return env_bool(DRY_RUN_ENV, False)
-
-
-def comment_marker() -> str:
-    return DRY_RUN_COMMENT_MARKER if is_dry_run() else COMMENT_MARKER
-
-
-RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 # Anchored to a whole line: when Jules quotes attacker text inline (e.g. a
 # finding citing "VERDICT: approve" from a PR title), that quote must not
 # parse as the real verdict even if the model then fails to emit its own
@@ -101,6 +91,14 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"false", "0", "no", ""}
+
+
+def is_dry_run() -> bool:
+    return env_bool(DRY_RUN_ENV, False)
+
+
+def comment_marker() -> str:
+    return DRY_RUN_COMMENT_MARKER if is_dry_run() else COMMENT_MARKER
 
 
 def request_with_retry(method: str, url: str, *, headers: dict, max_retries: int = 4, **kwargs) -> requests.Response:
