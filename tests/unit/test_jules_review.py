@@ -639,3 +639,31 @@ class TestDryRun:
 
         from_event.assert_called_once()
         assert pr["number"] == 7
+
+
+@pytest.mark.unit
+class TestTrustFollowsWriteAccess:
+    """Trust is keyed off write access rather than a name, so that a second maintainer
+    needs repository access and nothing else - no workflow edited, no list to drift."""
+
+    @pytest.mark.parametrize("association", ["OWNER", "MEMBER", "COLLABORATOR"])
+    def test_write_access_is_trusted(self, association):
+        assert jules_review.is_trusted_author("someone-else", "melbinjp", association) is True
+
+    @pytest.mark.parametrize("association", ["CONTRIBUTOR", "NONE", "FIRST_TIME_CONTRIBUTOR", ""])
+    def test_without_write_access_a_stranger_is_not_trusted(self, association):
+        """The verdict is a model's judgement over content the author controls, so it
+        must not be the only thing between a stranger's PR and an approval."""
+        assert jules_review.is_trusted_author("a-stranger", "melbinjp", association) is False
+
+    def test_the_owner_is_trusted_even_with_no_association_supplied(self):
+        """A caller that cannot supply one must not be locked out of its own repository."""
+        assert jules_review.is_trusted_author("melbinjp", "melbinjp") is True
+
+    def test_the_explicit_allowlist_still_adds_accounts_without_write_access(self, monkeypatch):
+        monkeypatch.setenv("JULES_REVIEW_TRUSTED_AUTHORS", "a-bot")
+
+        assert jules_review.is_trusted_author("a-bot", "melbinjp", "CONTRIBUTOR") is True
+
+    def test_association_is_matched_case_insensitively(self):
+        assert jules_review.is_trusted_author("someone", "melbinjp", "collaborator") is True

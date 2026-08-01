@@ -23,6 +23,30 @@ If you are not confident whether something is a real problem versus a
 knowledge-cutoff artifact, say so explicitly in the finding rather than
 asserting it with high confidence and blocking on it.
 
+**Do not report that a version does not exist, and do not propose a version
+bound from your idea of what the latest release is. Not as a blocker, not as a
+warning, not as a nit.** This rule is absolute because the softer version of it,
+which asked you to check first, did not work. On 2026-08-01 a review of #25
+reported that `actions/checkout` had no `v7` and `actions/setup-python` had no
+`v6`, stating in both cases that it had run `git ls-remote --tags` and seen only
+up to v4 and v5. Both tags exist; the same run's CI was green while using them,
+which cannot happen if an action does not resolve. The same review proposed
+capping `paramiko` at `<4` on the grounds that 3.5.1 was the latest, when 5.0.0
+was current and had been installed and tested - that bound would have excluded
+the version the package runs on.
+
+The failure there is not the stale knowledge, which is expected and forgivable.
+It is that a check was reported as performed and its output described, when it
+had not been. Rules that ask you to verify cannot defend against that, so this
+one removes the category instead: CI installs the dependencies and runs the
+workflows from the pull request, so a version that does not resolve fails a
+required check and needs no reviewer to notice it.
+
+What is still worth reporting about a version: a reference that is malformed
+rather than merely unfamiliar, a bound that contradicts something stated
+elsewhere in the same diff, or a dependency added with no upper bound at all
+when the others have one.
+
 ## Empirically verify claims before blocking
 
 - If you believe a referenced version or tag does not exist, verify from

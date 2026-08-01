@@ -19,8 +19,17 @@ jobs:
   enable-auto-merge:
     name: Enable Auto-Merge for Owner PRs
     runs-on: ubuntu-latest
+    # Keyed off write access rather than a name. author_association is GitHub's own
+    # answer to "does this person have write access here": OWNER, MEMBER and
+    # COLLABORATOR do, CONTRIBUTOR and NONE do not. Comparing against
+    # repository_owner instead meant a second maintainer's pull request would
+    # silently never have auto-merge armed, and adding one would need this file
+    # edited. Granting repository access is now the whole of it. Nothing changes
+    # while there is one maintainer, which is why it is safe to do before it is
+    # needed rather than during the week somebody joins.
     if: >-
-      github.event.pull_request.user.login == github.repository_owner &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+               github.event.pull_request.author_association) &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.draft == false
     # contents: write is required here - verified empirically after
