@@ -1,19 +1,24 @@
 import json
 import os
 import signal
+import stat
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from rigout import lifecycle
 from rigout.lifecycle import (
     RuntimePaths,
     default_state_dir,
     process_is_running,
     read_tail,
+    redact_home_path,
     redact_sensitive_text,
     runtime_status,
+    secure_descriptor,
+    secure_directory,
     terminate_process,
     write_json_secure,
     write_pid,
@@ -522,6 +527,79 @@ def test_terminate_does_not_signal_a_process_group_it_does_not_lead():
 
     killpg.assert_not_called()
     assert kill_calls == [(4242, signal.SIGTERM), (4242, expected_signal)]
+
+
+@pytest.mark.unit
+def test_secure_directory_tightens_only_a_directory_rigout_created(tmp_path):
+    """A fresh per-user state directory is still made owner-only."""
+    fresh = tmp_path / "state"
+
+    with patch("rigout.lifecycle.os.name", "posix"), patch.object(Path, "chmod") as chmod:
+        secure_directory(fresh)
+
+    assert fresh.is_dir()
+    assert chmod.call_args.args == (stat.S_IRWXU,)
+
+
+@pytest.mark.unit
+def test_secure_directory_leaves_a_shared_directory_alone(tmp_path, capsys):
+    """`--state-dir /tmp` must not reset the permissions of a directory everyone shares."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared_mode = stat.S_IFDIR | 0o777
+    lifecycle._SHARED_DIRECTORY_WARNINGS.discard(str(shared))
+
+    with (
+        patch("rigout.lifecycle.os.name", "posix"),
+        patch("rigout.lifecycle.os.stat", return_value=os.stat_result((shared_mode,) + (0,) * 9)),
+        patch.object(Path, "chmod") as chmod,
+    ):
+        secure_directory(shared)
+
+    chmod.assert_not_called()
+    warning = capsys.readouterr().err
+    assert "reachable by other users" in warning
+    assert "drwxrwxrwx" in warning
+
+
+@pytest.mark.unit
+def test_secure_directory_stays_quiet_about_an_existing_owner_only_directory(tmp_path, capsys):
+    """The normal case, a state directory from an earlier run, must not nag the operator."""
+    existing = tmp_path / "state"
+    existing.mkdir()
+    lifecycle._SHARED_DIRECTORY_WARNINGS.discard(str(existing))
+
+    with (
+        patch("rigout.lifecycle.os.name", "posix"),
+        patch("rigout.lifecycle.os.stat", return_value=os.stat_result((stat.S_IFDIR | 0o700,) + (0,) * 9)),
+        patch.object(Path, "chmod") as chmod,
+    ):
+        secure_directory(existing)
+
+    chmod.assert_not_called()
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.unit
+def test_secure_descriptor_applies_owner_only_mode():
+    """Runtime files carrying credentials are restricted before they are published."""
+    with (
+        patch("rigout.lifecycle.os.name", "posix"),
+        patch("rigout.lifecycle.os.fchmod", create=True) as fchmod,
+    ):
+        secure_descriptor(7)
+
+    assert fchmod.call_args.args == (7, stat.S_IRUSR | stat.S_IWUSR)
+
+
+@pytest.mark.unit
+def test_redact_home_path_hides_the_account_name_without_touching_other_paths():
+    home = str(Path.home())
+
+    with patch.object(Path, "home", return_value=Path(home)):
+        assert redact_home_path(f"{home}{os.sep}rigout{os.sep}state") == f"~{os.sep}rigout{os.sep}state"
+        assert redact_home_path(f"{home}-other{os.sep}state") == f"{home}-other{os.sep}state"
+        assert redact_home_path(f"{os.sep}srv{os.sep}rigout") == f"{os.sep}srv{os.sep}rigout"
 
 
 @pytest.mark.unit

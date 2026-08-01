@@ -77,7 +77,7 @@ The default state directory is:
 - macOS: `~/Library/Application Support/rigout`
 - Linux: `$XDG_STATE_HOME/rigout`, or `~/.local/state/rigout`
 
-Override it with `--state-dir PATH` or `RIGOUT_STATE_DIR`. Managed state includes `connection.json`, `activity.log`, `runtime.json`, and `rigout.pid`. Rigout applies owner-only directory/file modes on POSIX; keep the directory private on every platform because the connection file contains the bearer token.
+Override it with `--state-dir PATH` or `RIGOUT_STATE_DIR`. Managed state includes `connection.json`, `activity.log`, `runtime.json`, and `rigout.pid`. On POSIX, Rigout creates its own state directory owner-only and writes runtime files owner-only; a directory it did not create is left as it found it, with a warning on stderr if it is group- or world-reachable. Keep the directory private on every platform because the connection file contains the bearer token.
 
 ## Source checkout
 
@@ -114,7 +114,7 @@ Rigout exposes:
 - `manage_tunnels`: add, remove, list, test, and fail over to SSH endpoints.
 - `connect_hardware` and `get_hardware_info`: verify available hardware.
 - `get_server_activity`: return bounded, sanitized JSON containing managed lifecycle status and 1-200 recent activity lines.
-- `create_terminal_session`, `execute_in_terminal`, `list_terminal_sessions`, `close_terminal_session`: persistent terminal sessions that keep shell state between commands, on the local device or over SSH.
+- `create_terminal_session`, `execute_in_terminal`, `list_terminal_sessions`, `close_terminal_session`: persistent terminal sessions that keep shell state between commands, on the local device or over SSH. `execute_in_terminal` takes the same `use_sudo` and `bypass_security` flags as `execute_command` and applies the same validation and output sanitization.
 
 If no SSH endpoint is configured, Rigout uses a local-device endpoint. That makes a fresh one-command server immediately useful on the machine running Rigout.
 
@@ -130,11 +130,11 @@ Default controls:
 - Managed connection and activity files live in a per-user state directory and are written with owner-only permissions on POSIX systems.
 - Setup tokens expire after 15 minutes by default, are redacted from Rigout-controlled access logs, and credential responses use `Cache-Control: no-store` and `Pragma: no-cache`.
 - HTTP 401 responses advertise `WWW-Authenticate: Bearer` without echoing credential material.
-- Command validation applies to the one-shot `execute_command` path, where it blocks common destructive patterns, allows routine pipelines and command chains, and logs unrecognized commands for auditing rather than blocking them. Two routes skip it: the caller passing `bypass_security`, and commands sent through a terminal session, which `execute_in_terminal` writes to the shell unvalidated.
-- Output of one-shot commands is sanitized for common secret patterns before returning to the agent. Terminal session output is returned as the shell produced it.
+- Command validation applies to both command paths, one-shot `execute_command` and `execute_in_terminal`. It blocks common destructive patterns, gates `sudo` behind `use_sudo`, allows routine pipelines and command chains, and logs unrecognized commands for auditing rather than blocking them. One route skips it, the same on either path: the caller passing `bypass_security`, which is recorded as a security event.
+- Command output is sanitized for common secret patterns before returning to the agent, on the one-shot path and in terminal sessions, local and over SSH. Sanitization is pattern matching, not a guarantee that output contains no secrets.
 - Managed runtime output is captured in `activity.log`; agents can read a bounded, sanitized view with `get_server_activity`.
 - Operational tool failures and unknown tools set MCP `isError: true` and preserve useful stderr or exit-status diagnostics.
-- Per-endpoint command rate limiting is enabled: 60 command executions per minute for each endpoint, including the local-device endpoint.
+- Per-endpoint command rate limiting is enabled: 60 command executions per minute for each endpoint, including the local-device endpoint. One-shot commands and commands run inside a terminal session draw on that same per-endpoint budget; `bypass_security` does not lift it.
 
 Do not expose Rigout publicly with `--no-auth` unless the network is private and trusted. For serious agent work, run Rigout inside an isolated VM or container.
 

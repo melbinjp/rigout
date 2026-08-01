@@ -72,8 +72,19 @@ async def handle_execute_in_terminal(arguments: dict) -> CallToolResult:
     session_id = arguments["session_id"]
     command = arguments["command"]
     timeout = arguments.get("timeout", 30)
+    use_sudo = arguments.get("use_sudo", False)
+    bypass_security = arguments.get("bypass_security", False)
 
-    result = await get_tunnel_manager().execute_in_session(session_id, command, timeout)
+    if use_sudo and not command.startswith("sudo"):
+        command = f"sudo {command}"
+
+    result = await get_tunnel_manager().execute_in_session(
+        session_id,
+        command,
+        timeout,
+        allow_sudo=use_sudo,
+        bypass_security=bypass_security,
+    )
 
     if result["success"]:
         result_text = f"Command executed in session {session_id}\n\n"

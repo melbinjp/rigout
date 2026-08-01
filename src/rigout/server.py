@@ -116,6 +116,16 @@ async def handle_list_tools() -> list[Tool]:
                     "session_id": {"type": "string", "description": "Terminal session ID"},
                     "command": {"type": "string", "description": "Command to execute in session"},
                     "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 30},
+                    "use_sudo": {
+                        "type": "boolean",
+                        "description": "Whether to use sudo for elevated privileges",
+                        "default": False,
+                    },
+                    "bypass_security": {
+                        "type": "boolean",
+                        "description": "Bypass security validation for advanced AI agent operations",
+                        "default": False,
+                    },
                 },
                 "required": ["session_id", "command"],
             },

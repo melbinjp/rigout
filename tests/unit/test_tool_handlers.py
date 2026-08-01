@@ -1,9 +1,15 @@
 import asyncio
+import json
+import os
+import tempfile
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from mcp.types import CallToolResult
 
+from rigout.ssh_manager import TunnelManager
+from rigout.terminal_session import LocalTerminalSession
 from rigout.tools import (
     handle_bulk_file_transfer,
     handle_close_terminal_session,
@@ -387,3 +393,168 @@ class TestToolHandlers:
         result = await handle_manage_tunnels({"action": "list"})
         assert "Configured Tunnel Endpoints" in result.content[0].text
         assert "test-host" in result.content[0].text
+
+
+class StubLocalSession(LocalTerminalSession):
+    """A LocalTerminalSession that records commands instead of running a shell."""
+
+    def __init__(self, session_id: str = "sess-local", output: str = ""):
+        self.session_id = session_id
+        self.endpoint = MagicMock()
+        self.created = datetime.now()
+        self.last_activity = datetime.now()
+        self.is_interactive = True
+        self.output = output
+        self.executed: list[str] = []
+
+    def execute(self, command: str, timeout: int = 30) -> dict:
+        self.executed.append(command)
+        return {
+            "success": True,
+            "exit_code": 0,
+            "output": self.output,
+            "session_id": self.session_id,
+            "command": command,
+        }
+
+
+def make_ssh_session(output: str) -> MagicMock:
+    """A non-local terminal session whose channel replays one chunk of output."""
+    session = MagicMock()
+    session.channel.recv_ready.return_value = True
+    session.channel.recv.return_value = f"{output}\nuser@host:~$ ".encode()
+    return session
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestTerminalSessionSecurity:
+    """Terminal sessions must validate commands and sanitize output like execute_command"""
+
+    @pytest.fixture
+    def temp_config_file(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            config = {
+                "server_config": {"name": "test-server", "version": "1.0.0"},
+                "ssh_config": {"private_key_path": "/test/key", "username": "testuser"},
+                "cloudflare_config": {"domain": "test.com"},
+                "security_config": {"ai_agent_mode": True},
+                "endpoints": [],
+            }
+            json.dump(config, f)
+            f.flush()
+            yield f.name
+        if os.path.exists(f.name):
+            os.unlink(f.name)
+
+    @pytest.fixture
+    def real_manager(self, temp_config_file):
+        """The real TunnelManager, wired into the command tool handlers."""
+        with (
+            patch("rigout.ssh_manager.TunnelManager._start_background_tasks"),
+            patch("rigout.tools.command.get_tunnel_manager") as mock_get_command,
+        ):
+            manager = TunnelManager(config_file=temp_config_file)
+            mock_get_command.return_value = manager
+            yield manager
+
+    async def test_local_terminal_output_is_sanitized(self, real_manager):
+        """Secrets in local terminal session output are redacted before reaching the agent."""
+        session = StubLocalSession(output="DB_PASSWORD=hunter2\napi_key=sk-live-abcdef\n")
+        real_manager.terminal_sessions["sess-local"] = session
+
+        result = await handle_execute_in_terminal({"session_id": "sess-local", "command": "env"})
+
+        assert result.isError is False
+        assert "hunter2" not in result.content[0].text
+        assert "sk-live-abcdef" not in result.content[0].text
+        assert "password=***" in result.content[0].text
+        assert "api_key=***" in result.content[0].text
+
+    async def test_ssh_terminal_output_is_sanitized(self, real_manager):
+        """Secrets in SSH terminal session output are redacted before reaching the agent."""
+        real_manager.terminal_sessions["sess-ssh"] = make_ssh_session("DB_PASSWORD=hunter2 token=abc123")
+
+        result = await handle_execute_in_terminal({"session_id": "sess-ssh", "command": "env"})
+
+        assert result.isError is False
+        assert "hunter2" not in result.content[0].text
+        assert "abc123" not in result.content[0].text
+        assert "password=***" in result.content[0].text
+        assert "token=***" in result.content[0].text
+
+    async def test_destructive_command_in_terminal_is_rejected(self, real_manager):
+        """A destructive command never reaches the session shell."""
+        session = StubLocalSession()
+        real_manager.terminal_sessions["sess-local"] = session
+
+        result = await handle_execute_in_terminal({"session_id": "sess-local", "command": "rm -rf /"})
+
+        assert result.isError is True
+        assert "Security validation failed" in result.content[0].text
+        assert session.executed == []
+
+    async def test_bypass_security_runs_destructive_command_in_terminal(self, real_manager):
+        """The documented escape hatch works the same way as on the one-shot path."""
+        session = StubLocalSession(output="removed")
+        real_manager.terminal_sessions["sess-local"] = session
+
+        result = await handle_execute_in_terminal(
+            {"session_id": "sess-local", "command": "rm -rf /", "bypass_security": True}
+        )
+
+        assert result.isError is False
+        assert session.executed == ["rm -rf /"]
+
+    async def test_sudo_in_terminal_requires_use_sudo(self, real_manager):
+        """Sudo is gated by use_sudo in a session, exactly as on the one-shot path."""
+        session = StubLocalSession(output="restarted")
+        real_manager.terminal_sessions["sess-local"] = session
+
+        blocked = await handle_execute_in_terminal(
+            {"session_id": "sess-local", "command": "sudo systemctl restart nginx"}
+        )
+
+        assert blocked.isError is True
+        assert "Sudo commands not allowed" in blocked.content[0].text
+        assert session.executed == []
+
+        allowed = await handle_execute_in_terminal(
+            {"session_id": "sess-local", "command": "systemctl restart nginx", "use_sudo": True}
+        )
+
+        assert allowed.isError is False
+        assert session.executed == ["sudo systemctl restart nginx"]
+
+    async def test_terminal_session_commands_are_rate_limited(self, real_manager):
+        """Commands in a session are counted, exactly as one-shot commands are."""
+        session = StubLocalSession(output="agent")
+        real_manager.terminal_sessions["sess-local"] = session
+        real_manager._max_requests_per_minute = 2
+
+        for _ in range(2):
+            allowed = await handle_execute_in_terminal({"session_id": "sess-local", "command": "whoami"})
+            assert allowed.isError is False
+
+        limited = await handle_execute_in_terminal({"session_id": "sess-local", "command": "whoami"})
+
+        assert limited.isError is True
+        assert "Rate limit exceeded" in limited.content[0].text
+        assert session.executed == ["whoami", "whoami"]
+
+    async def test_terminal_session_shares_the_endpoint_command_budget(self, real_manager):
+        """A session does not get a second budget of its own on top of the endpoint's."""
+        endpoint = real_manager.get_local_endpoint()
+        session = StubLocalSession(output="agent")
+        session.endpoint = endpoint
+        real_manager.terminal_sessions["sess-local"] = session
+        real_manager._max_requests_per_minute = 1
+
+        # Spend the endpoint's only slot the way execute_command would
+        assert real_manager._check_rate_limit(real_manager._execute_rate_limit_key(endpoint)) is True
+
+        limited = await handle_execute_in_terminal({"session_id": "sess-local", "command": "whoami"})
+
+        assert limited.isError is True
+        assert "Rate limit exceeded" in limited.content[0].text
+        assert session.executed == []

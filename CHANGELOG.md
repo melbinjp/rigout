@@ -104,6 +104,18 @@ All notable changes to this project are documented here. Format follows
   `AttributeError` and every entry point failed to start. Installs of 0.2.0
   and earlier are affected from the point 2.0.0 became the latest release;
   pin `mcp<2` or upgrade. Rigout is verified against 1.29.0, the newest 1.x.
+- `--state-dir` and `RIGOUT_STATE_DIR` no longer rewrite the permissions of a
+  directory Rigout did not create. The state directory was created tolerating
+  an existing one and then set to owner-only unconditionally, so pointing
+  Rigout at a shared directory such as `/tmp` narrowed it for every other user
+  on the machine. Rigout now creates its own directory owner-only and leaves
+  an existing one as it found it, warning on stderr when runtime state lands
+  somewhere group- or world-reachable. New in 0.3.0: the state directory ships
+  for the first time in this release.
+- `get_server_activity` reports its state directory and activity log
+  home-relative rather than absolute, so a remote agent no longer learns the
+  operator's account name from the path. New in 0.3.0: the tool ships for the
+  first time in this release.
 
 ### Security
 - `rigout start` bound to a non-loopback host served every tool without
@@ -121,6 +133,29 @@ All notable changes to this project are documented here. Format follows
   there and warns that the bind is reachable beyond this machine. Loopback is
   classified from the address rather than by string comparison, so all of
   127.0.0.0/8 and IPv6 loopback stay token-free.
+- Commands run through `execute_in_terminal` skipped protections that
+  `execute_command` applied. A terminal session never validated the command,
+  so destructive-command blocking did not apply even when the caller had not
+  asked to skip it; never sanitized the output, so a session reading
+  environment variables returned credentials verbatim where the one-shot path
+  scrubbed them; and never drew on the endpoint's rate-limit budget. The
+  scrubber is the one that reaches furthest, because that output flows into an
+  agent's context and onward to whatever model serves it. This affects 0.2.0
+  and earlier, where the session path takes neither a validation nor a bypass
+  argument, so there was no way to ask for the protection it skipped. The
+  session path now validates, sanitizes on both the local and SSH branches,
+  and shares the endpoint's one-shot rate-limit budget. `execute_in_terminal`
+  gained the same explicit `bypass_security` opt-in the one-shot tool already
+  had, so a deliberately dangerous command remains possible but has to be
+  asked for. That opt-out covers the command check only: output is scrubbed
+  either way.
+- The connection file was created with default permissions and narrowed to
+  owner-only immediately afterwards, so on POSIX a file holding the bearer
+  token existed briefly at its final path readable by whatever the umask
+  allowed. It is now written through the same atomic helper the other runtime
+  files use, which creates the file owner-only and moves it into place, so the
+  token is never present at the destination under loose permissions. This
+  affects 0.2.0 and earlier.
 
 ## [0.2.0] - 2026-07-09
 

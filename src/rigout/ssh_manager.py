@@ -357,6 +357,12 @@ class TunnelManager:
         self._rate_limiter[identifier].append(now)
         return True
 
+    def _execute_rate_limit_key(self, endpoint: "TunnelEndpoint") -> str:
+        """One command budget per endpoint, shared by one-shot and terminal-session commands."""
+        if self._is_local_endpoint(endpoint):
+            return "execute_local"
+        return f"execute_{endpoint.hostname}"
+
     def load_config(self):
         """Load configuration with security validation"""
         try:
@@ -662,7 +668,7 @@ class TunnelManager:
             )
 
         # Rate limiting check
-        if not self._check_rate_limit(f"execute_{endpoint.hostname}"):
+        if not self._check_rate_limit(self._execute_rate_limit_key(endpoint)):
             return {
                 "success": False,
                 "error": "Rate limit exceeded",
@@ -884,15 +890,63 @@ class TunnelManager:
             logger.error(f"Failed to create terminal session: {e}")
             return None
 
-    async def execute_in_session(self, session_id: str, command: str, timeout: int = 30) -> dict[str, Any]:
-        """Execute command in existing terminal session"""
+    async def execute_in_session(
+        self,
+        session_id: str,
+        command: str,
+        timeout: int = 30,
+        allow_sudo: bool = False,
+        bypass_security: bool = False,
+    ) -> dict[str, Any]:
+        """Execute command in existing terminal session with security validation"""
         if session_id not in self.terminal_sessions:
             return {"success": False, "error": f"Terminal session {session_id} not found"}
 
         session = self.terminal_sessions[session_id]
 
+        # Rate limiting check, sharing the endpoint's one-shot budget
+        if not self._check_rate_limit(self._execute_rate_limit_key(session.endpoint)):
+            return {
+                "success": False,
+                "error": "Rate limit exceeded",
+                "session_id": session_id,
+                "command": command,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        # Security validation (can be bypassed for AI agents)
+        if security_validator is not None:
+            if not bypass_security:
+                is_safe, error_msg = security_validator.validate_command(command, allow_sudo)
+                if not is_safe:
+                    security_validator.log_security_event(
+                        "BLOCKED_SESSION_COMMAND",
+                        f"Blocked dangerous command in terminal session {session_id}: {command}",
+                        "WARNING",
+                    )
+                    return {
+                        "success": False,
+                        "error": f"Security validation failed: {error_msg}. "
+                        "Pass bypass_security=true if this command is intentional.",
+                        "session_id": session_id,
+                        "command": command,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+            else:
+                security_validator.log_security_event(
+                    "SESSION_SECURITY_BYPASS",
+                    f"AI agent bypassed security for terminal session command: {command[:50]}...",
+                    "INFO",
+                )
+
         if isinstance(session, LocalTerminalSession):
-            return await asyncio.to_thread(session.execute, command, timeout)
+            local_result = await asyncio.to_thread(session.execute, command, timeout)
+
+            # Sanitize output for security
+            if security_validator is not None and local_result.get("output"):
+                local_result["output"] = security_validator.sanitize_command_output(local_result["output"])
+
+            return local_result
 
         try:
             # Send command
@@ -913,6 +967,10 @@ class TunnelManager:
                         break
                 else:
                     await asyncio.sleep(0.1)
+
+            # Sanitize output for security
+            if security_validator is not None:
+                output = security_validator.sanitize_command_output(output)
 
             return {
                 "success": True,
@@ -1002,7 +1060,7 @@ class TunnelManager:
         environment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Execute a command on the Rigout host without SSH."""
-        if not self._check_rate_limit("execute_local"):
+        if not self._check_rate_limit(self._execute_rate_limit_key(endpoint)):
             return {
                 "success": False,
                 "error": "Rate limit exceeded",

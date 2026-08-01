@@ -51,9 +51,63 @@ def default_state_dir(override: str | Path | None = None) -> Path:
     return (base / "rigout").resolve()
 
 
+def redact_home_path(value: str) -> str:
+    """Replace the current user's home directory prefix with `~`.
+
+    Runtime paths are reported to remote agents, and an absolute path under a home
+    directory names the operating system account that runs Rigout.
+    """
+    try:
+        home = str(Path.home())
+    except (OSError, RuntimeError):
+        return value
+    if not home or len(value) < len(home):
+        return value
+
+    prefix = value[: len(home)]
+    matches = prefix.lower() == home.lower() if os.name == "nt" else prefix == home
+    remainder = value[len(home) :]
+    if not matches or (remainder and remainder[0] not in {"/", "\\"}):
+        return value
+    return f"~{remainder}"
+
+
+_SHARED_DIRECTORY_WARNINGS: set[str] = set()
+
+
+def warn_about_shared_directory(path: Path) -> None:
+    """Warn once when runtime state lives in a directory other users can reach."""
+    if os.name != "posix" or str(path) in _SHARED_DIRECTORY_WARNINGS:
+        return
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    if not mode & (stat.S_IRWXG | stat.S_IRWXO):
+        return
+    _SHARED_DIRECTORY_WARNINGS.add(str(path))
+    print(
+        f"rigout: warning: runtime directory {redact_home_path(str(path))} is reachable by other users "
+        f"(mode {stat.filemode(mode)}). Rigout will not change permissions on a directory it did not "
+        "create; runtime files are still written owner-only.",
+        file=sys.stderr,
+    )
+
+
 def secure_directory(path: Path) -> None:
-    """Create a user-state directory with owner-only POSIX permissions."""
-    path.mkdir(parents=True, exist_ok=True)
+    """Create a user-state directory with owner-only POSIX permissions.
+
+    Permissions are only tightened on a directory Rigout created. A caller that points
+    `--state-dir` or `--connection-file` at an existing shared directory such as /tmp must
+    not have that directory's mode rewritten for everyone else on the machine.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=False, mode=stat.S_IRWXU)
+    except FileExistsError:
+        if not path.is_dir():
+            raise
+        warn_about_shared_directory(path)
+        return
     if os.name == "posix":
         path.chmod(stat.S_IRWXU)
 
