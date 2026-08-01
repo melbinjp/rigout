@@ -11,6 +11,7 @@ from mcp.types import (
     ContentBlock,
     TextContent,
     Tool,
+    ToolAnnotations,
 )
 
 from ._version import __version__
@@ -50,297 +51,368 @@ if not logging.getLogger().handlers:
 server = Server("enhanced-hardware-server", version=__version__)
 
 
+# What each tool does to the machine, in the terms MCP defines, so a client can tell a
+# question apart from an action before it runs one. Rigout spans the whole range - a tool
+# that reads a CPU count and a tool that runs arbitrary commands as root are both here -
+# and until now it advertised them identically, leaving every client to guess.
+#
+# The fields mean what the specification says they mean, and the honest reading is the
+# conservative one:
+#   read_only     the tool does not change the machine at all
+#   destructive   it may overwrite or remove something, not merely add
+#   idempotent    calling it again with the same arguments changes nothing further
+#   open_world    it reaches something outside this machine: a remote host, a registry
+#
+# Anything that can run a caller's command is destructive and not idempotent, because
+# what it does is decided by the caller and cannot be known here.
+TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool, bool, bool]] = {
+    # name: (title, read_only, destructive, idempotent, open_world)
+    "connect_hardware": ("Connect to hardware", False, False, True, True),
+    "execute_command": ("Run a command", False, True, False, True),
+    "create_terminal_session": ("Open a terminal session", False, False, False, True),
+    "execute_in_terminal": ("Run a command in a session", False, True, False, True),
+    "list_terminal_sessions": ("List terminal sessions", True, False, True, False),
+    "close_terminal_session": ("Close a terminal session", False, True, True, True),
+    "get_hardware_info": ("Read hardware information", True, False, True, True),
+    "get_server_activity": ("Read Rigout's activity", True, False, True, False),
+    "manage_tunnels": ("Manage SSH endpoints", False, True, False, True),
+    "install_software": ("Install packages", False, True, False, True),
+    "file_operations": ("Read and change files", False, True, False, True),
+    "system_monitoring": ("Read system metrics", True, False, True, True),
+    "docker_operations": ("Manage Docker", False, True, False, True),
+    "bulk_file_transfer": ("Transfer files", False, True, False, True),
+    "environment_setup": ("Prepare a development environment", False, True, False, True),
+}
+
+
+def annotate(tools: list[Tool]) -> list[Tool]:
+    """Attach the declared annotations and title to each tool.
+
+    Applied here rather than written into each definition so that the classification is
+    one table somebody can read and argue with, instead of fifteen scattered arguments
+    where a missing one is invisible. A tool with no entry keeps none, and the metadata
+    test fails, which is what stops a new tool shipping unclassified.
+    """
+    for tool in tools:
+        entry = TOOL_ANNOTATIONS.get(tool.name)
+        if entry is None:
+            continue
+        title, read_only, destructive, idempotent, open_world = entry
+        tool.title = title
+        tool.annotations = ToolAnnotations(
+            title=title,
+            readOnlyHint=read_only,
+            destructiveHint=destructive,
+            idempotentHint=idempotent,
+            openWorldHint=open_world,
+        )
+    return tools
+
+
 @server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     """List available tools for AI agents"""
-    return [
-        Tool(
-            name="connect_hardware",
-            description="Connect to remote hardware with automatic failover",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "preferred_platform": {
-                        "type": "string",
-                        "description": "Preferred platform (windows, linux, docker)",
-                        "enum": ["windows", "linux", "docker", "any"],
-                    }
-                },
-            },
-        ),
-        Tool(
-            name="execute_command",
-            description="Execute command on remote hardware with full system access",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Command to execute (full sudo access available)"},
-                    "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 30},
-                    "use_sudo": {
-                        "type": "boolean",
-                        "description": "Whether to use sudo for elevated privileges",
-                        "default": False,
-                    },
-                    "working_directory": {
-                        "type": "string",
-                        "description": "Working directory for command execution",
-                        "default": "~",
-                    },
-                    "environment": {
-                        "type": "object",
-                        "description": "Environment variables for command",
-                        "default": {},
-                    },
-                    "bypass_security": {
-                        "type": "boolean",
-                        "description": "Bypass security validation for advanced AI agent operations",
-                        "default": False,
-                    },
-                },
-                "required": ["command"],
-            },
-        ),
-        Tool(
-            name="create_terminal_session",
-            description="Create a persistent interactive terminal session",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "session_name": {"type": "string", "description": "Optional name for the terminal session"}
-                },
-            },
-        ),
-        Tool(
-            name="execute_in_terminal",
-            description="Execute command in existing terminal session (maintains state)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "session_id": {"type": "string", "description": "Terminal session ID"},
-                    "command": {"type": "string", "description": "Command to execute in session"},
-                    "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 30},
-                    "use_sudo": {
-                        "type": "boolean",
-                        "description": "Whether to use sudo for elevated privileges",
-                        "default": False,
-                    },
-                    "bypass_security": {
-                        "type": "boolean",
-                        "description": "Bypass security validation for advanced AI agent operations",
-                        "default": False,
-                    },
-                },
-                "required": ["session_id", "command"],
-            },
-        ),
-        Tool(
-            name="list_terminal_sessions",
-            description="List all active terminal sessions",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        Tool(
-            name="close_terminal_session",
-            description="Close a terminal session",
-            inputSchema={
-                "type": "object",
-                "properties": {"session_id": {"type": "string", "description": "Terminal session ID to close"}},
-                "required": ["session_id"],
-            },
-        ),
-        Tool(
-            name="get_hardware_info",
-            description="Get detailed hardware information from remote system",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "refresh": {
-                        "type": "boolean",
-                        "description": "Force refresh hardware information",
-                        "default": False,
-                    }
-                },
-            },
-        ),
-        Tool(
-            name="get_server_activity",
-            description="Read bounded, sanitized Rigout lifecycle status and recent activity",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "lines": {
-                        "type": "integer",
-                        "description": "Number of recent activity lines to return",
-                        "default": 50,
-                        "minimum": 1,
-                        "maximum": 200,
-                    }
-                },
-            },
-        ),
-        Tool(
-            name="manage_tunnels",
-            description="Manage tunnel endpoints (add, remove, test, failover)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "Action to perform",
-                        "enum": ["add", "remove", "test", "list", "failover"],
-                    },
-                    "hostname": {"type": "string", "description": "Hostname for add/remove actions"},
-                    "username": {"type": "string", "description": "Username for SSH connection"},
-                    "private_key_path": {"type": "string", "description": "Path to SSH private key"},
-                    "port": {
-                        "type": "integer",
-                        "description": "SSH port for the add action (default 22)",
-                        "minimum": 1,
-                        "maximum": 65535,
-                        "default": 22,
-                    },
-                    "platform": {
-                        "type": "string",
-                        "description": "Platform type",
-                        "enum": ["windows", "linux", "docker", "macos"],
-                    },
-                },
-                "required": ["action"],
-            },
-        ),
-        Tool(
-            name="install_software",
-            description="Install software packages on remote hardware",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "packages": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of packages to install",
-                    },
-                    "package_manager": {
-                        "type": "string",
-                        "description": "Package manager to use",
-                        "enum": ["apt", "yum", "dnf", "pacman", "brew", "choco", "pip", "npm", "auto"],
-                        "default": "auto",
-                    },
-                },
-                "required": ["packages"],
-            },
-        ),
-        Tool(
-            name="file_operations",
-            description="Perform file operations on remote hardware",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "description": "File operation to perform",
-                        "enum": ["read", "write", "append", "delete", "copy", "move", "chmod", "chown"],
-                    },
-                    "path": {"type": "string", "description": "File or directory path"},
-                    "content": {"type": "string", "description": "Content for write/append operations"},
-                    "destination": {"type": "string", "description": "Destination path for copy/move operations"},
-                    "permissions": {"type": "string", "description": "Permissions for chmod operation (e.g., '755')"},
-                    "owner": {"type": "string", "description": "Owner for chown operation (e.g., 'user:group')"},
-                    "recursive": {
-                        "type": "boolean",
-                        "description": "Required to delete a directory and everything inside it",
-                        "default": False,
-                    },
-                },
-                "required": ["operation", "path"],
-            },
-        ),
-        Tool(
-            name="system_monitoring",
-            description="Monitor system resources and performance",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "metrics": {
-                        "type": "array",
-                        "items": {
+    return annotate(
+        [
+            Tool(
+                name="connect_hardware",
+                description="Connect to remote hardware with automatic failover",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "preferred_platform": {
                             "type": "string",
-                            "enum": ["cpu", "memory", "disk", "network", "gpu", "processes", "all"],
+                            "description": "Preferred platform (windows, linux, docker)",
+                            "enum": ["windows", "linux", "docker", "any"],
+                        }
+                    },
+                },
+            ),
+            Tool(
+                name="execute_command",
+                description="Execute command on remote hardware with full system access",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Command to execute (full sudo access available)"},
+                        "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 30},
+                        "use_sudo": {
+                            "type": "boolean",
+                            "description": "Whether to use sudo for elevated privileges",
+                            "default": False,
                         },
-                        "description": "Metrics to monitor",
-                        "default": ["all"],
+                        "working_directory": {
+                            "type": "string",
+                            "description": "Working directory for command execution",
+                            "default": "~",
+                        },
+                        "environment": {
+                            "type": "object",
+                            "description": "Environment variables for command",
+                            "default": {},
+                        },
+                        "bypass_security": {
+                            "type": "boolean",
+                            "description": "Bypass security validation for advanced AI agent operations",
+                            "default": False,
+                        },
                     },
-                    "duration": {"type": "integer", "description": "Monitoring duration in seconds", "default": 10},
+                    "required": ["command"],
                 },
-            },
-        ),
-        Tool(
-            name="docker_operations",
-            description="Manage Docker containers and images for AI agent workflows",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "description": "Docker operation to perform",
-                        "enum": ["list", "run", "exec", "stop", "remove", "build", "pull", "logs", "inspect"],
-                    },
-                    "container_name": {"type": "string", "description": "Container name or ID"},
-                    "image": {"type": "string", "description": "Docker image name"},
-                    "command": {"type": "string", "description": "Command to run in container"},
-                    "options": {"type": "object", "description": "Additional Docker options", "default": {}},
-                },
-                "required": ["operation"],
-            },
-        ),
-        Tool(
-            name="bulk_file_transfer",
-            description="Transfer multiple files or directories for AI agent workflows",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "description": "Transfer operation",
-                        "enum": ["upload", "download", "sync"],
-                    },
-                    "source": {"type": "string", "description": "Source path or content"},
-                    "destination": {"type": "string", "description": "Destination path"},
-                    "files": {"type": "array", "items": {"type": "string"}, "description": "List of files to transfer"},
-                    "compress": {"type": "boolean", "description": "Compress files during transfer", "default": True},
-                },
-                "required": ["operation", "source", "destination"],
-            },
-        ),
-        Tool(
-            name="environment_setup",
-            description="Set up development environments for AI agent projects",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "environment_type": {
-                        "type": "string",
-                        "description": "Type of environment to set up",
-                        "enum": ["python", "node", "docker", "conda", "custom"],
-                    },
-                    "requirements": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of requirements or dependencies",
-                    },
-                    "workspace_path": {
-                        "type": "string",
-                        "description": "Path to set up the workspace",
-                        "default": "/tmp/ai_workspace",
-                    },
-                    "configuration": {
-                        "type": "object",
-                        "description": "Additional configuration options",
-                        "default": {},
+            ),
+            Tool(
+                name="create_terminal_session",
+                description="Create a persistent interactive terminal session",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_name": {"type": "string", "description": "Optional name for the terminal session"}
                     },
                 },
-                "required": ["environment_type"],
-            },
-        ),
-    ]
+            ),
+            Tool(
+                name="execute_in_terminal",
+                description="Execute command in existing terminal session (maintains state)",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "Terminal session ID"},
+                        "command": {"type": "string", "description": "Command to execute in session"},
+                        "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 30},
+                        "use_sudo": {
+                            "type": "boolean",
+                            "description": "Whether to use sudo for elevated privileges",
+                            "default": False,
+                        },
+                        "bypass_security": {
+                            "type": "boolean",
+                            "description": "Bypass security validation for advanced AI agent operations",
+                            "default": False,
+                        },
+                    },
+                    "required": ["session_id", "command"],
+                },
+            ),
+            Tool(
+                name="list_terminal_sessions",
+                description="List all active terminal sessions",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="close_terminal_session",
+                description="Close a terminal session",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"session_id": {"type": "string", "description": "Terminal session ID to close"}},
+                    "required": ["session_id"],
+                },
+            ),
+            Tool(
+                name="get_hardware_info",
+                description="Get detailed hardware information from remote system",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "refresh": {
+                            "type": "boolean",
+                            "description": "Force refresh hardware information",
+                            "default": False,
+                        }
+                    },
+                },
+            ),
+            Tool(
+                name="get_server_activity",
+                description="Read bounded, sanitized Rigout lifecycle status and recent activity",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "lines": {
+                            "type": "integer",
+                            "description": "Number of recent activity lines to return",
+                            "default": 50,
+                            "minimum": 1,
+                            "maximum": 200,
+                        }
+                    },
+                },
+            ),
+            Tool(
+                name="manage_tunnels",
+                description="Manage tunnel endpoints (add, remove, test, failover)",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "Action to perform",
+                            "enum": ["add", "remove", "test", "list", "failover"],
+                        },
+                        "hostname": {"type": "string", "description": "Hostname for add/remove actions"},
+                        "username": {"type": "string", "description": "Username for SSH connection"},
+                        "private_key_path": {"type": "string", "description": "Path to SSH private key"},
+                        "port": {
+                            "type": "integer",
+                            "description": "SSH port for the add action (default 22)",
+                            "minimum": 1,
+                            "maximum": 65535,
+                            "default": 22,
+                        },
+                        "platform": {
+                            "type": "string",
+                            "description": "Platform type",
+                            "enum": ["windows", "linux", "docker", "macos"],
+                        },
+                    },
+                    "required": ["action"],
+                },
+            ),
+            Tool(
+                name="install_software",
+                description="Install software packages on remote hardware",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "packages": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of packages to install",
+                        },
+                        "package_manager": {
+                            "type": "string",
+                            "description": "Package manager to use",
+                            "enum": ["apt", "yum", "dnf", "pacman", "brew", "choco", "pip", "npm", "auto"],
+                            "default": "auto",
+                        },
+                    },
+                    "required": ["packages"],
+                },
+            ),
+            Tool(
+                name="file_operations",
+                description="Perform file operations on remote hardware",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "description": "File operation to perform",
+                            "enum": ["read", "write", "append", "delete", "copy", "move", "chmod", "chown"],
+                        },
+                        "path": {"type": "string", "description": "File or directory path"},
+                        "content": {"type": "string", "description": "Content for write/append operations"},
+                        "destination": {"type": "string", "description": "Destination path for copy/move operations"},
+                        "permissions": {
+                            "type": "string",
+                            "description": "Permissions for chmod operation (e.g., '755')",
+                        },
+                        "owner": {"type": "string", "description": "Owner for chown operation (e.g., 'user:group')"},
+                        "recursive": {
+                            "type": "boolean",
+                            "description": "Required to delete a directory and everything inside it",
+                            "default": False,
+                        },
+                    },
+                    "required": ["operation", "path"],
+                },
+            ),
+            Tool(
+                name="system_monitoring",
+                description="Monitor system resources and performance",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "metrics": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["cpu", "memory", "disk", "network", "gpu", "processes", "all"],
+                            },
+                            "description": "Metrics to monitor",
+                            "default": ["all"],
+                        },
+                        "duration": {"type": "integer", "description": "Monitoring duration in seconds", "default": 10},
+                    },
+                },
+            ),
+            Tool(
+                name="docker_operations",
+                description="Manage Docker containers and images for AI agent workflows",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "description": "Docker operation to perform",
+                            "enum": ["list", "run", "exec", "stop", "remove", "build", "pull", "logs", "inspect"],
+                        },
+                        "container_name": {"type": "string", "description": "Container name or ID"},
+                        "image": {"type": "string", "description": "Docker image name"},
+                        "command": {"type": "string", "description": "Command to run in container"},
+                        "options": {"type": "object", "description": "Additional Docker options", "default": {}},
+                    },
+                    "required": ["operation"],
+                },
+            ),
+            Tool(
+                name="bulk_file_transfer",
+                description="Transfer multiple files or directories for AI agent workflows",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "description": "Transfer operation",
+                            "enum": ["upload", "download", "sync"],
+                        },
+                        "source": {"type": "string", "description": "Source path or content"},
+                        "destination": {"type": "string", "description": "Destination path"},
+                        "files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of files to transfer",
+                        },
+                        "compress": {
+                            "type": "boolean",
+                            "description": "Compress files during transfer",
+                            "default": True,
+                        },
+                    },
+                    "required": ["operation", "source", "destination"],
+                },
+            ),
+            Tool(
+                name="environment_setup",
+                description="Set up development environments for AI agent projects",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "environment_type": {
+                            "type": "string",
+                            "description": "Type of environment to set up",
+                            "enum": ["python", "node", "docker", "conda", "custom"],
+                        },
+                        "requirements": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of requirements or dependencies",
+                        },
+                        "workspace_path": {
+                            "type": "string",
+                            "description": "Path to set up the workspace",
+                            "default": "/tmp/ai_workspace",
+                        },
+                        "configuration": {
+                            "type": "object",
+                            "description": "Additional configuration options",
+                            "default": {},
+                        },
+                    },
+                    "required": ["environment_type"],
+                },
+            ),
+        ]
+    )
 
 
 async def _handle_call_tool_result(name: str, arguments: dict) -> CallToolResult:

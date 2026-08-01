@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import contextlib
 import os
 import subprocess
@@ -105,3 +106,76 @@ def test_import_does_not_create_a_cwd_log_file(tmp_path):
     )
 
     assert not (tmp_path / "mcp-hardware-server.log").exists()
+
+
+@pytest.mark.unit
+class TestToolAnnotations:
+    """Every tool must say what it does to the machine before a client runs it.
+
+    Rigout spans the whole range - a tool that reads a CPU count and a tool that runs
+    arbitrary commands as root - and advertised them identically until now, leaving each
+    client to guess which was which.
+    """
+
+    @staticmethod
+    def _tools():
+        return asyncio.run(rigout_server.handle_list_tools())
+
+    def test_every_advertised_tool_is_classified(self):
+        """A tool added without an entry ships unclassified, which is the failure this
+        test exists to prevent; the table is easy to forget and invisible when missed."""
+        missing = [t.name for t in self._tools() if t.annotations is None]
+
+        assert not missing, f"tools with no annotations: {missing}"
+
+    def test_every_tool_has_a_human_readable_title(self):
+        assert all(t.title for t in self._tools())
+
+    def test_the_table_has_no_entries_for_tools_that_do_not_exist(self):
+        """A rename that updates one place and not the other leaves a dead entry and an
+        unclassified tool, and both are silent."""
+        advertised = {t.name for t in self._tools()}
+
+        assert set(rigout_server.TOOL_ANNOTATIONS) == advertised
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "execute_command",
+            "execute_in_terminal",
+            "install_software",
+            "file_operations",
+            "docker_operations",
+            "bulk_file_transfer",
+            "environment_setup",
+            "manage_tunnels",
+        ],
+    )
+    def test_tools_that_change_the_machine_are_marked_destructive(self, name):
+        tool = next(t for t in self._tools() if t.name == name)
+
+        assert tool.annotations.readOnlyHint is False
+        assert tool.annotations.destructiveHint is True
+
+    @pytest.mark.parametrize(
+        "name", ["get_hardware_info", "get_server_activity", "system_monitoring", "list_terminal_sessions"]
+    )
+    def test_tools_that_only_look_are_marked_read_only(self, name):
+        tool = next(t for t in self._tools() if t.name == name)
+
+        assert tool.annotations.readOnlyHint is True
+        assert tool.annotations.destructiveHint is False
+
+    def test_anything_running_a_callers_command_is_not_idempotent(self):
+        """What such a tool does is decided by the caller and cannot be known here, so
+        claiming a repeat call changes nothing would be a guess stated as a fact."""
+        for name in ("execute_command", "execute_in_terminal"):
+            tool = next(t for t in self._tools() if t.name == name)
+            assert tool.annotations.idempotentHint is False
+
+    def test_read_only_tools_are_never_also_destructive(self):
+        """The two contradict each other, and a client reading either alone would be
+        told something untrue."""
+        for tool in self._tools():
+            if tool.annotations.readOnlyHint:
+                assert tool.annotations.destructiveHint is False, tool.name
