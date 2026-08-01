@@ -6,8 +6,44 @@ on:
       - 'v*.*.*'
 
 jobs:
+  # Runs before anything is built, because every failure it catches produces an
+  # artifact that looks correct: a tag naming a version the package does not carry, a
+  # release with no changelog entry, a breaking change shipped as a patch bump, or a
+  # tag placed on a commit that never reached main. None of those fail a build.
+  check-release:
+    name: Check Version, Tag and Changelog
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          # Tags and main are both needed: one to compare this version against the
+          # last released one, the other to prove the tagged commit is on main.
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check version, tag and changelog agree
+        run: python scripts/check_release.py --tag "${GITHUB_REF_NAME}"
+
+      - name: Check the tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at a commit that is not on main." >&2
+            echo "Publishing it would ship code that no merged branch contains." >&2
+            exit 1
+          fi
+          echo "Tagged commit is on main."
+
   ci:
     name: Run CI Pipeline
+    needs: check-release
     uses: ./.github/workflows/ci.yml
 
   build-release:
