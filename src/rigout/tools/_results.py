@@ -15,6 +15,22 @@ from mcp.types import CallToolResult, TextContent
 # line break and should still read as one. Windows command output is full of them.
 CARRIAGE_RETURNS = re.compile(r"\r\n?")
 
+# Terminal escape sequences are removed whole, before the character-level pass below.
+# Ordinary tools colour their output when they think a terminal is watching - pytest,
+# npm, cargo, git - and every one of those sequences starts with an ESC that the pass
+# below would replace, turning `\x1b[31mFAILED\x1b[0m` into `?[31mFAILED?[0m`: noisier
+# than what arrived. Removing the sequence leaves `FAILED`, which is what the caller
+# wanted from it. Three forms: CSI (colour, cursor movement), OSC (window titles, and
+# hyperlinks, terminated by BEL or ST), and the two-character escapes.
+ANSI_ESCAPE_SEQUENCES = re.compile(
+    r"""
+    \x1b \[ [0-?]* [ -/]* [@-~]      # CSI: ESC [ ... final byte
+    | \x1b \] .*? (?: \x07 | \x1b\\ )  # OSC: ESC ] ... BEL or ST
+    | \x1b [@-Z\\-_]                 # two-character escapes
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
 # The rest carry no meaning in a tool result. They are replaced rather than dropped, so
 # output that contained them still shows that something was there.
 UNSAFE_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -29,7 +45,8 @@ MAX_RESULT_CHARS = 2_000_000
 
 def transport_safe_text(text: str) -> str:
     """Make one tool result string safe to send and bounded in size."""
-    cleaned = UNSAFE_CONTROL_CHARACTERS.sub(CONTROL_REPLACEMENT, CARRIAGE_RETURNS.sub("\n", text))
+    cleaned = ANSI_ESCAPE_SEQUENCES.sub("", text)
+    cleaned = UNSAFE_CONTROL_CHARACTERS.sub(CONTROL_REPLACEMENT, CARRIAGE_RETURNS.sub("\n", cleaned))
     if len(cleaned) > MAX_RESULT_CHARS:
         dropped = len(cleaned) - MAX_RESULT_CHARS
         cleaned = f"{cleaned[:MAX_RESULT_CHARS]}\n\n[output truncated: {dropped} more characters]"

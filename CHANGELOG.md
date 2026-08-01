@@ -52,6 +52,11 @@ All notable changes to this project are documented here. Format follows
   Disable it with `--no-copy-url`.
 
 ### Changed
+- Terminal escape sequences are removed from tool output rather than returned.
+  Ordinary tools colour their output when they think a terminal is watching, so
+  `pytest`, `npm`, `cargo` and `git` all emit them; the caller wanted the words.
+  Colour, cursor movement, window titles and hyperlinks are all removed, and
+  progress bars redrawn with carriage returns arrive as successive lines.
 - `execute_command`, `execute_in_terminal` and `install_software` bound their
   output to 200,000 characters and state the truncation, where they previously
   returned it whole; a live server returned five million characters from one
