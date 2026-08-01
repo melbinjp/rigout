@@ -17,6 +17,7 @@ around and leaves out the rest. Nothing is implied by an omission.
 |   |-- unit/
 |   `-- integration/
 |-- docs/
+|   |-- MERGE_GATE.md
 |-- .github/workflows/
 |   |-- ci.yml
 |   |-- scheduled-ci.yml

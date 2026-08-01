@@ -34,6 +34,15 @@ All notable changes to this project are documented here. Format follows
   unknown tools, connection-endpoint auth headers); and a wheel/sdist build.
 - `build_write_command` is exported from the package root. It builds the
   command that writes content to a path, and spells append as well as write.
+- `docs/MERGE_GATE.md` records how a change reaches `main`, and the trap a
+  sole-maintainer repository configuration creates: with a required review, the
+  last-push rule, admin enforcement and no bypass allowance, the only maintainer
+  cannot merge their own work when the review bot declines - and the reachable
+  response is to switch branch protection off, which disables the required
+  checks and the force-push protection along with the rule that was in the way,
+  and leaves no record of which commits landed that way. The document gives the
+  bypass allowance that waives only the review requirement, and says which parts
+  of the gate must not be relaxed instead.
 - `VERSIONING.md` explains the dependency caps and what they cost. `mcp` 1.x
   speaks MCP protocol `2025-11-25` where 2.x speaks `2026-07-28`, so a capped
   installation negotiates the older revision; that is deliberate, and smaller
