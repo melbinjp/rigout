@@ -1541,6 +1541,28 @@ def test_managed_state_filenames_are_documented(tmp_path):
     )
 
 
+def test_status_json_keys_are_documented(tmp_path):
+    """Every key `status --output json` emits is named in README.md.
+
+    That key set is the automation contract: it is stable across states, so a caller
+    reads a field without checking first and gets null rather than a KeyError. A key
+    shipped without documentation is a promise nobody made deliberately. Deriving the
+    truth from `runtime_status` rather than a hardcoded list means adding a field to
+    the payload fails this test until someone writes it down.
+    """
+    emitted = set(lifecycle.runtime_status(lifecycle.RuntimePaths.resolve(tmp_path)))
+    assert emitted, "runtime_status produced no keys; this check needs rewriting"
+
+    documented = set(re.findall(r"`([a-z_]+)`", read(README)))
+    missing = sorted(key for key in emitted if key not in documented)
+
+    assert not missing, (
+        "status --output json emits keys README.md does not document: "
+        + ", ".join(missing)
+        + ". Add them to the key table, or stop emitting them."
+    )
+
+
 def test_documented_default_state_directory_matches_the_code(monkeypatch):
     """The per-platform state directory in README.md is the one the code resolves."""
     monkeypatch.delenv("RIGOUT_STATE_DIR", raising=False)

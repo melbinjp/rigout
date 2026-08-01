@@ -96,6 +96,17 @@ Detached startup JSON is finite and intentionally excludes credentials. It repor
 
 JSON is the supported machine interface for connection data, lifecycle results, and activity snapshots. The default text output remains optimized for humans.
 
+`status --output json` always reports the same keys, whether or not Rigout is running, so a caller can read a field without first checking the state. Fields that do not apply are `null` rather than absent:
+
+| Key | Meaning |
+| --- | --- |
+| `status`, `running` | Lifecycle state, and whether a managed server is live |
+| `pid` | Process ID of the managed launcher, or `null` |
+| `mcp_url`, `health_url`, `local_health_url` | Endpoint URLs, or `null` before a start |
+| `host`, `port`, `path`, `tunnel` | How the running server was started, or `null` |
+| `state_dir`, `connection_file`, `activity_log` | Where managed state lives |
+| `started_at`, `stopped_at`, `last_error` | Timestamps and the most recent failure, or `null` |
+
 The default state directory is:
 
 - Windows: `%LOCALAPPDATA%\rigout\state`
