@@ -190,13 +190,30 @@ def load_pull_request(owner: str, repo: str, token: str) -> dict:
     return load_pull_request_event()
 
 
-def is_trusted_author(pr_author: str, owner: str) -> bool:
-    """Auto-approval requires more than a clean verdict: the PR author must
-    also be trusted. Defaults to just the repo owner, since Jules' verdict
-    alone is an LLM judgement over attacker-influenceable content (diff,
-    title, description) and shouldn't be the only thing standing between a
-    stranger's PR and an approval. Override with a comma-separated
-    JULES_REVIEW_TRUSTED_AUTHORS to add collaborators."""
+# GitHub's own answer to "does this account have write access to this repository",
+# carried on every pull request. Anyone in these three can already push branches here,
+# so gating auto-approval on them draws the line where the repository already draws it.
+WRITE_ACCESS_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+
+def is_trusted_author(pr_author: str, owner: str, association: str = "") -> bool:
+    """Whether an approving review may be submitted for this author's pull request.
+
+    Auto-approval needs more than a clean verdict, because the verdict is a language
+    model's judgement over content the author controls - the diff, the title, the
+    description. It should not be the only thing between a stranger's pull request and
+    an approval.
+
+    Trust follows write access rather than a name. Hard-coding the owner meant a second
+    maintainer's pull request could never be auto-approved and nobody would be told why;
+    keying off `author_association` means adding a maintainer is granting repository
+    access and nothing else. The owner is still trusted when no association is supplied,
+    so a caller that cannot provide one is not locked out, and
+    JULES_REVIEW_TRUSTED_AUTHORS still adds accounts that have no write access but are
+    trusted anyway.
+    """
+    if association.upper() in WRITE_ACCESS_ASSOCIATIONS:
+        return True
     configured = os.environ.get("JULES_REVIEW_TRUSTED_AUTHORS", "").strip()
     trusted = {owner.lower()}
     trusted.update(a.strip().lower() for a in configured.split(",") if a.strip())
@@ -699,7 +716,7 @@ def main() -> int:
             return 1
 
         verdict = parse_verdict(review_message)
-        author_trusted = is_trusted_author(pr_author, owner)
+        author_trusted = is_trusted_author(pr_author, owner, str(pr.get("author_association") or ""))
         # A verdict on part of a change is not a verdict on the change. Coverage is
         # satisfied either way it can honestly be satisfied: the excerpt in the prompt
         # was the entire diff, or Jules fetched the PR itself and reported a commit and
