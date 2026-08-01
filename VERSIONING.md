@@ -113,6 +113,41 @@ trade as the unbounded `mcp>=1.0.0` in 0.2.0: it works until someone else's rele
 When tasks return as an extension, this is worth revisiting, and the reason to revisit is
 recorded above.
 
+## The mcp 2.x migration, mapped
+
+Rigout pins `mcp>=1.0.0,<2` and speaks MCP protocol `2025-11-25` where 2.x speaks
+`2026-07-28`. Moving is a release of its own. What it involves is recorded here because
+the discovery is most of the work and is easy to redo badly.
+
+What does **not** change, checked against 2.0.0 rather than assumed:
+
+- `Tool(name=..., description=..., inputSchema=...)` constructs unchanged. 2.x renamed the
+  fields to `input_schema` and friends but keeps the camelCase spellings as aliases, so
+  every tool definition ports as written.
+- `mcp.server.stdio`, `mcp.server.streamable_http_manager`, `mcp.server.models` and
+  `mcp.types` all still import.
+- `Server`, `Server.run` and `create_initialization_options` all survive.
+
+What does change, and is the whole of the migration:
+
+- `@server.list_tools()` and `@server.call_tool()` are gone. Registration is now
+  `server.add_request_handler(method, params_type, handler)`, with
+  `"tools/list"` taking `PaginatedRequestParams` and `"tools/call"` taking
+  `CallToolRequestParams`.
+- The handlers therefore return results directly rather than the bare list and content
+  the decorators wrapped, which also removes the wrinkle where an error result has to be
+  raised as `RuntimeError` for the SDK to rebuild it.
+
+Two decisions to make before starting, neither obvious:
+
+- **Whether to support both majors or move.** The incompatibility is only the
+  registration, so a single `hasattr(Server, "list_tools")` branch would let the cap
+  widen to `<3` and not force anybody onto a major that is days old. The cost is a fork
+  in the code that has to be tested twice, on both lines.
+- **Whether it is time at all.** Nothing Rigout needs is exclusive to 2.x - tasks, which
+  looked like the reason to move, are gone from both. The protocol revision is the only
+  gain, and the caps mean nobody is broken meanwhile.
+
 ## Releasing
 
 ```bash
