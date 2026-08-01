@@ -948,3 +948,51 @@ class TestEndpointPortPersistence:
             reloaded = TunnelManager(config_file=config_path)
 
         assert reloaded.endpoints[0].port == DEFAULT_SSH_PORT
+
+
+@pytest.mark.unit
+class TestStrictHostKeyRefusalMessage:
+    """The first error anyone meets after turning strict host key checking on.
+
+    Paramiko's RejectPolicy raises "Server '[host]:port' not found in known_hosts",
+    which states the refusal and nothing about resolving it. Unlike a key mismatch this
+    is usually not an attack, just a host nobody has recorded yet, so the message has to
+    say how to record it.
+    """
+
+    @pytest.fixture
+    def manager(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+            json.dump({"endpoints": [], "security_config": {}}, handle)
+            handle.flush()
+            path = handle.name
+        with patch("rigout.ssh_manager.TunnelManager._start_background_tasks"):
+            yield TunnelManager(config_file=path)
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def test_an_unrecorded_host_is_told_how_to_record_it(self, manager):
+        message = manager._ssh_error_message(
+            "pod.example.com",
+            paramiko.SSHException("Server 'pod.example.com' not found in known_hosts"),
+        )
+
+        assert "no entry" in message
+        assert "ssh-keyscan" in message
+        assert "RIGOUT_STRICT_HOST_KEYS" in message
+        assert "pod.example.com" in message
+
+    def test_the_message_says_to_check_the_fingerprint_first(self, manager):
+        """ssh-keyscan trusts whatever answers, so recommending it without that
+        caveat would be teaching the habit the check exists to prevent."""
+        message = manager._ssh_error_message(
+            "pod.example.com", paramiko.SSHException("Server 'x' not found in known_hosts")
+        )
+
+        assert "fingerprint" in message
+
+    def test_other_ssh_errors_are_passed_through_unchanged(self, manager):
+        message = manager._ssh_error_message("host", paramiko.SSHException("Error reading SSH protocol banner"))
+
+        assert message == "SSH error: Error reading SSH protocol banner"
+        assert "ssh-keyscan" not in message

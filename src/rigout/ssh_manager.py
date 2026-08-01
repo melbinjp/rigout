@@ -545,6 +545,28 @@ class TunnelManager:
         else:
             ssh_client.set_missing_host_key_policy(WarningAutoAddPolicy(self._host_key_warned))
 
+    def _ssh_error_message(self, hostname: str, exc: paramiko.SSHException) -> str:
+        """Explain an SSH failure, naming the way out of the one users will hit first.
+
+        Paramiko's RejectPolicy raises a plain SSHException reading "Server '[host]:port'
+        not found in known_hosts", which states the refusal and nothing about resolving
+        it. It is the first thing anyone meets after turning strict checking on, and
+        unlike a key mismatch it is usually not an attack, just a host nobody has
+        recorded yet. Everything else is passed through unchanged.
+        """
+        text = str(exc)
+        if "not found in known_hosts" not in text:
+            return f"SSH error: {text}"
+
+        source = self.known_hosts_path or "your known_hosts file"
+        return (
+            f"Host key verification failed for {hostname}: strict host key checking is on and "
+            f"this host has no entry in {source}. Record its key first, having checked that the "
+            f"fingerprint is the one you expect: ssh-keyscan -p PORT {hostname} >> {source}. "
+            f"To connect without a recorded key instead, unset {STRICT_HOST_KEYS_ENV}, which "
+            "warns rather than refuses."
+        )
+
     def _host_key_mismatch_error(self, hostname: str, exc: paramiko.BadHostKeyException) -> str:
         """Explain a changed host key in terms the operator can act on."""
         source = self.known_hosts_path or "known_hosts"
@@ -750,7 +772,9 @@ class TunnelManager:
             return False
         except paramiko.SSHException as e:
             endpoint.status = "failed"
-            logger.error(f"SSH connection failed for {endpoint.hostname}: {e}")
+            # `manage_tunnels add` runs this test, so a strict-mode refusal here is the
+            # first thing an operator sees; the log line is where they will look.
+            logger.error(self._ssh_error_message(endpoint.hostname, e))
             return False
         except TimeoutError as e:
             endpoint.status = "failed"
@@ -972,10 +996,11 @@ class TunnelManager:
                 "timestamp": datetime.now().isoformat(),
             }
         except paramiko.SSHException as e:
+            message = self._ssh_error_message(endpoint.hostname, e)
             logger.error(f"SSH error for {endpoint.hostname}: {e}")
             return {
                 "success": False,
-                "error": f"SSH error: {e}",
+                "error": message,
                 "command": command,
                 "endpoint": endpoint.hostname,
                 "timestamp": datetime.now().isoformat(),

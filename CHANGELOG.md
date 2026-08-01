@@ -134,6 +134,15 @@ All notable changes to this project are documented here. Format follows
   Windows, where `st_mode` reports `0o666` whatever the ACLs say.
 
 ### Fixed
+- A strict-mode refusal now says how to resolve itself. Paramiko reports an
+  unrecorded host as `Server '[host]:port' not found in known_hosts`, which
+  states the refusal and nothing else; it is the first thing anyone meets after
+  turning strict host key checking on, and unlike a changed key it is usually
+  not an attack but a host nobody has recorded yet. The message now names the
+  known_hosts file in use, gives the `ssh-keyscan` line that records the key,
+  says to check the fingerprint before trusting it, and names the setting that
+  warns instead of refusing. A changed key already explained itself and is
+  unchanged. Every other SSH error is passed through as before.
 - Reading a binary file no longer breaks the MCP connection. Content was
   decoded with replacement characters and returned as text, and the control
   characters among it corrupted the event stream carrying the response: a bare
