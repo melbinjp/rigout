@@ -34,6 +34,14 @@ All notable changes to this project are documented here. Format follows
   unknown tools, connection-endpoint auth headers); and a wheel/sdist build.
 - `build_write_command` is exported from the package root. It builds the
   command that writes content to a path, and spells append as well as write.
+- `port` on `manage_tunnels add`, defaulting to 22. `TunnelEndpoint` has always
+  carried a port and the SSH connect path has always used it, but every
+  endpoint added through the tool was pinned to 22, so any host reached on
+  another port - a container with SSH forwarded, a jump host, anything behind a
+  NAT rule - could not be registered at all. A port outside 1-65535, or one
+  that is not a whole number, is refused by name rather than surfacing as
+  `Error executing tool`. `manage_tunnels list` shows a non-default port beside
+  the hostname and stays quiet about 22.
 - `rigout url`, which prints one URL and nothing else on stdout. The setup URL
   that `start` prints scrolls away in the foreground, and Ctrl+C in that
   terminal stops the server rather than copying anything; this reads the value

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from mcp.types import CallToolResult, TextContent
 
-from ..ssh_manager import get_tunnel_manager
+from ..ssh_manager import DEFAULT_SSH_PORT, get_tunnel_manager
 from ._platform import platform_family, platform_tokens
 from ._results import error_result
 
@@ -105,6 +105,19 @@ async def handle_manage_tunnels(arguments: dict) -> CallToolResult:
         private_key_path = str(arguments["private_key_path"])
         platform = arguments.get("platform", "unknown")
 
+        # The schema bounds this, but the schema only guards the MCP path and direct
+        # callers reach the same handler. TunnelEndpoint raises on a bad port, and an
+        # exception here would surface as "Error executing tool" with no clue why.
+        # `or DEFAULT_SSH_PORT` would be wrong here: port 0 is falsy, so an explicit 0
+        # would silently become 22 rather than being refused as the mistake it is.
+        raw_port = arguments.get("port")
+        try:
+            port = DEFAULT_SSH_PORT if raw_port is None else int(raw_port)
+        except (TypeError, ValueError):
+            return error_result(f"port must be a whole number, not {raw_port!r}")
+        if not 1 <= port <= 65535:
+            return error_result(f"port must be between 1 and 65535, not {port}")
+
         manager = get_tunnel_manager()
         existing = next((item for item in manager.endpoints if item.hostname == hostname), None)
         if existing is not None:
@@ -120,7 +133,7 @@ async def handle_manage_tunnels(arguments: dict) -> CallToolResult:
                 "The endpoint was not added; correct the path and try again."
             )
 
-        endpoint = manager.add_endpoint(hostname, username, expanded_key_path, platform)
+        endpoint = manager.add_endpoint(hostname, username, expanded_key_path, platform, port=port)
 
         # The old code claimed "Status: Testing connection..." and then never
         # tested anything, so a bad endpoint looked like a good one until it
@@ -135,6 +148,7 @@ async def handle_manage_tunnels(arguments: dict) -> CallToolResult:
         result_text = f"Added tunnel endpoint: {hostname}\n"
         result_text += f"Platform: {platform}\n"
         result_text += f"Username: {username}\n"
+        result_text += f"Port: {port}\n"
         result_text += f"Private key: {expanded_key_path}\n"
         if reachable:
             result_text += "Status: connection test PASSED"
@@ -175,7 +189,12 @@ async def handle_manage_tunnels(arguments: dict) -> CallToolResult:
             status_symbol = {"active": "[ACTIVE]", "failed": "[FAILED]", "unknown": "[UNKNOWN]"}.get(
                 endpoint.status, "[UNKNOWN]"
             )
-            result_text += f"{i}. {status_symbol} {endpoint.hostname}\n"
+            # The port is part of the address; listing endpoints without it cannot
+            # distinguish two entries that differ only by port.
+            host_label = (
+                endpoint.hostname if endpoint.port == DEFAULT_SSH_PORT else f"{endpoint.hostname}:{endpoint.port}"
+            )
+            result_text += f"{i}. {status_symbol} {host_label}\n"
             result_text += f"   Platform: {endpoint.platform}\n"
             result_text += f"   Status: {endpoint.status}\n"
             result_text += f"   Purpose: {endpoint.purpose}\n"

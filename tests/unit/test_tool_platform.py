@@ -33,12 +33,12 @@ LOCAL_KEY = "__local__"
 class FakeEndpoint:
     """A real object, not a MagicMock, so `platform` is a string a handler can test."""
 
-    def __init__(self, platform="Linux", private_key_path="/home/agent/id_ed25519", hostname="test-host"):
+    def __init__(self, platform="Linux", private_key_path="/home/agent/id_ed25519", hostname="test-host", port=22):
         self.platform = platform
         self.private_key_path = private_key_path
         self.hostname = hostname
         self.username = "agent"
-        self.port = 22
+        self.port = port
         self.status = "unknown"
         self.purpose = "primary"
         self.response_time = 0.1
@@ -412,9 +412,9 @@ class FakeTunnelManager:
     def save_config(self):
         self.saved += 1
 
-    def add_endpoint(self, hostname, username, private_key_path, platform="unknown"):
-        self.added.append((hostname, username, private_key_path, platform))
-        endpoint = FakeEndpoint(platform=platform, private_key_path=private_key_path, hostname=hostname)
+    def add_endpoint(self, hostname, username, private_key_path, platform="unknown", purpose="primary", port=22):
+        self.added.append((hostname, username, private_key_path, platform, port))
+        endpoint = FakeEndpoint(platform=platform, private_key_path=private_key_path, hostname=hostname, port=port)
         self.endpoints.append(endpoint)
         self.saved += 1
         return endpoint
@@ -473,6 +473,77 @@ class TestManageTunnelsAdd:
         assert result.isError is True
         assert "hostname" in text_of(result)
         assert manager.added == []
+
+    async def test_a_non_default_port_reaches_the_endpoint(self, tmp_path):
+        """SSH on another port is ordinary, and this tool could not express it.
+
+        TunnelEndpoint has always carried a port and the connect path has always used
+        it, but every endpoint added here was pinned to 22, so a container with SSH
+        forwarded, or a host behind a NAT rule, could not be registered at all.
+        """
+        manager = FakeTunnelManager(test_result=True)
+        with patch_manager("tunnel", manager):
+            result = await handle_manage_tunnels(
+                {
+                    "action": "add",
+                    "hostname": "pod.example.com",
+                    "username": "root",
+                    "private_key_path": str(self._key(tmp_path)),
+                    "port": 39554,
+                }
+            )
+
+        assert manager.added[0][-1] == 39554, "the port never reached add_endpoint"
+        assert manager.endpoints[-1].port == 39554
+        assert "Port: 39554" in text_of(result)
+
+    async def test_port_defaults_to_22_when_not_given(self, tmp_path):
+        manager = FakeTunnelManager(test_result=True)
+        with patch_manager("tunnel", manager):
+            await handle_manage_tunnels(
+                {
+                    "action": "add",
+                    "hostname": "box.example.com",
+                    "username": "agent",
+                    "private_key_path": str(self._key(tmp_path)),
+                }
+            )
+
+        assert manager.added[0][-1] == 22
+
+    @pytest.mark.parametrize("bad_port", [0, 65536, -1, "twenty-two"])
+    async def test_an_unusable_port_is_refused_with_a_reason(self, tmp_path, bad_port):
+        """TunnelEndpoint raises on a bad port, which would otherwise surface as a bare
+        "Error executing tool" with nothing naming the argument at fault."""
+        manager = FakeTunnelManager(test_result=True)
+        with patch_manager("tunnel", manager):
+            result = await handle_manage_tunnels(
+                {
+                    "action": "add",
+                    "hostname": "box.example.com",
+                    "username": "agent",
+                    "private_key_path": str(self._key(tmp_path)),
+                    "port": bad_port,
+                }
+            )
+
+        assert result.isError is True
+        assert "port" in text_of(result).lower()
+        assert manager.added == [], "a refused endpoint must not be registered"
+
+    async def test_listing_shows_a_non_default_port_and_hides_the_default(self):
+        manager = FakeTunnelManager(
+            endpoints=[
+                FakeEndpoint(hostname="plain.example.com"),
+                FakeEndpoint(hostname="odd.example.com", port=2222),
+            ]
+        )
+        with patch_manager("tunnel", manager):
+            listed = text_of(await handle_manage_tunnels({"action": "list"}))
+
+        assert "odd.example.com:2222" in listed
+        assert "plain.example.com\n" in listed
+        assert "plain.example.com:22" not in listed
 
     async def test_connection_is_actually_tested_and_reported(self, tmp_path):
         manager = FakeTunnelManager(test_result=True)

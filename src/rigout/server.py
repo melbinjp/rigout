@@ -191,6 +191,13 @@ async def handle_list_tools() -> list[Tool]:
                     "hostname": {"type": "string", "description": "Hostname for add/remove actions"},
                     "username": {"type": "string", "description": "Username for SSH connection"},
                     "private_key_path": {"type": "string", "description": "Path to SSH private key"},
+                    "port": {
+                        "type": "integer",
+                        "description": "SSH port for the add action (default 22)",
+                        "minimum": 1,
+                        "maximum": 65535,
+                        "default": 22,
+                    },
                     "platform": {
                         "type": "string",
                         "description": "Platform type",

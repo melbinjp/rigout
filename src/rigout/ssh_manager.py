@@ -241,6 +241,9 @@ class ConfigurationError(Exception):
     pass
 
 
+DEFAULT_SSH_PORT = 22
+
+
 @dataclass
 class TunnelEndpoint:
     """Represents a tunnel endpoint with connection details"""
@@ -248,7 +251,7 @@ class TunnelEndpoint:
     hostname: str
     username: str
     private_key_path: str
-    port: int = 22
+    port: int = DEFAULT_SSH_PORT
     platform: str = "unknown"
     status: str = "unknown"  # active, inactive, failed, testing
     last_tested: datetime | None = None
@@ -1205,15 +1208,28 @@ class TunnelManager:
         return True
 
     def add_endpoint(
-        self, hostname: str, username: str, private_key_path: str, platform: str = "unknown", purpose: str = "primary"
+        self,
+        hostname: str,
+        username: str,
+        private_key_path: str,
+        platform: str = "unknown",
+        purpose: str = "primary",
+        port: int = DEFAULT_SSH_PORT,
     ) -> TunnelEndpoint:
-        """Add a new tunnel endpoint"""
+        """Add a new tunnel endpoint.
+
+        `port` is accepted here because TunnelEndpoint has always carried one and the
+        SSH connect path has always used it, while every endpoint added through this
+        method was pinned to 22. A host reached on any other port - a container with SSH
+        forwarded, a jump host, anything behind a NAT rule - could not be registered.
+        """
         endpoint = TunnelEndpoint(
             hostname=hostname,
             username=username,
             private_key_path=private_key_path,
             platform=platform,
             purpose=purpose,
+            port=port,
             created=datetime.now(),
             status="unknown",
         )

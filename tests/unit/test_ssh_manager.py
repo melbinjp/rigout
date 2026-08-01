@@ -15,6 +15,7 @@ import paramiko
 import pytest
 
 from rigout.ssh_manager import (
+    DEFAULT_SSH_PORT,
     ConfigurationError,
     SecurityError,
     TunnelEndpoint,
@@ -914,3 +915,36 @@ class TestConfiguredRateLimit:
 
         assert manager._max_requests_per_minute == 60
         assert any("enable_rate_limiting" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.unit
+class TestEndpointPortPersistence:
+    """A port that is not saved and reloaded is a port that works until the first restart."""
+
+    @pytest.fixture
+    def config_path(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+            json.dump({"endpoints": [], "security_config": {}}, handle)
+            handle.flush()
+            yield handle.name
+        if os.path.exists(handle.name):
+            os.unlink(handle.name)
+
+    def test_a_non_default_port_survives_save_and_reload(self, config_path):
+        with patch("rigout.ssh_manager.TunnelManager._start_background_tasks"):
+            manager = TunnelManager(config_file=config_path)
+            manager.add_endpoint("pod.example.com", "root", "/tmp/key", "linux", port=39554)
+
+            reloaded = TunnelManager(config_file=config_path)
+
+        assert [endpoint.port for endpoint in reloaded.endpoints] == [39554]
+        assert reloaded.endpoints[0].hostname == "pod.example.com"
+
+    def test_an_endpoint_added_without_a_port_reloads_as_22(self, config_path):
+        with patch("rigout.ssh_manager.TunnelManager._start_background_tasks"):
+            manager = TunnelManager(config_file=config_path)
+            manager.add_endpoint("box.example.com", "agent", "/tmp/key", "linux")
+
+            reloaded = TunnelManager(config_file=config_path)
+
+        assert reloaded.endpoints[0].port == DEFAULT_SSH_PORT
