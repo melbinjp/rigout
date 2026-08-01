@@ -20,7 +20,14 @@ around and leaves out the rest. Nothing is implied by an omission.
 |-- .github/workflows/
 |   |-- ci.yml
 |   |-- scheduled-ci.yml
+|   |-- pr-review.yml
+|   |-- review-preview.yml
+|   |-- auto-merge.yml
+|   |-- agent-audit.yml
 |   `-- release.yml
+|-- scripts/
+|   |-- jules_review.py
+|   `-- check_release.py
 |-- README.md
 |-- AGENTS.md
 |-- URL_MCP_SERVER.md
@@ -29,6 +36,7 @@ around and leaves out the rest. Nothing is implied by an omission.
 |-- CONTRIBUTING.md
 |-- DEVELOPMENT_STANDARDS.md
 |-- SECURITY.md
+|-- VERSIONING.md
 |-- pyproject.toml
 |-- rigout.sh
 `-- rigout.ps1

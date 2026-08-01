@@ -34,6 +34,20 @@ All notable changes to this project are documented here. Format follows
   unknown tools, connection-endpoint auth headers); and a wheel/sdist build.
 - `build_write_command` is exported from the package root. It builds the
   command that writes content to a path, and spells append as well as write.
+- `VERSIONING.md`, stating what a version number promises, and
+  `scripts/check_release.py`, which checks it: the tag matches the packaged
+  version, the changelog has a dated non-empty section for it, the version
+  increases on the last release, and the increase is large enough for what that
+  section describes. The release workflow runs it before anything is built and
+  separately confirms the tagged commit is an ancestor of `main`, so a
+  mislabelled release, an undocumented one, or a tag on an unmerged commit
+  fails in seconds rather than reaching PyPI.
+- `.github/workflows/review-preview.yml`, which runs a candidate reviewer
+  against a real PR and approves nothing. `pr-review.yml` executes the reviewer
+  from the base commit on purpose, so a change to the reviewer is judged by the
+  version already on `main` and never exercised until after it merges; this is
+  how such a change can be observed first. Manually dispatched only, and the
+  job holds no approval permission.
 - `port` on `manage_tunnels add`, defaulting to 22. `TunnelEndpoint` has always
   carried a port and the SSH connect path has always used it, but every
   endpoint added through the tool was pinned to 22, so any host reached on
@@ -60,6 +74,15 @@ All notable changes to this project are documented here. Format follows
   Disable it with `--no-copy-url`.
 
 ### Changed
+- The Jules PR review now obtains the change from its own checkout instead of
+  reading a diff pasted into its prompt, and reports the commit and file count
+  it examined so that coverage is checked against what GitHub reports. On a
+  45-file PR the previous arrangement reviewed nine files, all of them
+  documentation, because `git diff` orders by path and the budget was spent
+  before `src/` was reached; the diff is now ordered by review priority as
+  well. An approving review is withheld when coverage cannot be confirmed.
+- `.github/jules-review-rules.md` gained rules describing what to check, where
+  it previously only listed what not to flag.
 - Terminal escape sequences are removed from tool output rather than returned.
   Ordinary tools colour their output when they think a terminal is watching, so
   `pytest`, `npm`, `cargo` and `git` all emit them; the caller wanted the words.

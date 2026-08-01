@@ -271,6 +271,10 @@ python -m twine check dist/rigout-*
 
 Rigout is written by AI coding agents working under human direction: the maintainer sets the product scope, safety boundaries, acceptance criteria, and release decisions, and agents write the implementation, tests, documentation, and release changes. Development standards for future contributors and agents are in [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md).
 
+## Versioning
+
+Rigout follows Semantic Versioning. Below 1.0.0 a breaking change costs a minor bump and everything else a patch, so a `0.3.x` line stays safe to sit on; from 1.0.0 onward, strict SemVer. What a version promises, and the checks that enforce it before anything publishes, are in [VERSIONING.md](VERSIONING.md).
+
 ## Project layout
 
 ```text
