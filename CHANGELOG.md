@@ -34,6 +34,13 @@ All notable changes to this project are documented here. Format follows
   unknown tools, connection-endpoint auth headers); and a wheel/sdist build.
 - `build_write_command` is exported from the package root. It builds the
   command that writes content to a path, and spells append as well as write.
+- `DEPLOYMENT.md`, covering what a permanent deployment needs, which was one
+  sentence of documentation before. A quick tunnel's hostname changes on every
+  restart and a public start mints a new bearer token unless one is supplied, so
+  an agent configured against the quick path stops working after a reboot. The
+  guide covers a hostname you own in front of a loopback-bound Rigout - named
+  Cloudflare Tunnel, reverse proxy, or private network - a token you choose, a
+  systemd unit, and what a standing public endpoint costs you.
 - `VERSIONING.md`, stating what a version number promises, and
   `scripts/check_release.py`, which checks it: the tag matches the packaged
   version, the changelog has a dated non-empty section for it, the version

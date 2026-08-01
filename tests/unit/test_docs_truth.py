@@ -1296,10 +1296,28 @@ def test_documented_tool_counts_match_the_advertised_list():
 ENV_ASSIGNMENT_RE = re.compile(r"^[A-Z_][A-Z0-9_]*=")
 
 
+# A changelog records what past versions did, so it names flags that have since been
+# renamed or removed on purpose. Every other document is telling a reader what to run
+# now, and is checked.
+UNCHECKED_DOCUMENTS = {"CHANGELOG.md"}
+
+
+def documented_files() -> list[Path]:
+    """Every Markdown document whose commands should still work.
+
+    Discovered rather than listed. A fixed list silently stops covering the next
+    document somebody adds, which is how DEPLOYMENT.md arrived full of unchecked
+    invocations and how URL_MCP_SERVER.md and TROUBLESHOOTING.md had gone unchecked
+    since they were written.
+    """
+    candidates = sorted(REPO_ROOT.glob("*.md")) + sorted((REPO_ROOT / "docs").glob("*.md"))
+    return [path for path in candidates if path.name not in UNCHECKED_DOCUMENTS]
+
+
 def documented_command_lines() -> list[tuple[Path, int, str]]:
     """Command lines shown in fenced blocks or backticks that invoke the launcher."""
     found: list[tuple[Path, int, str]] = []
-    for doc in (README, QUICK_REFERENCE, REQUEST_PATH, SECURITY):
+    for doc in documented_files():
         text = read(doc)
         in_fence = False
         for number, line in enumerate(text.splitlines(), start=1):
@@ -1357,8 +1375,13 @@ def test_documented_command_lines_parse():
         checked += 1
         try:
             mcp_url_launcher.parse_args(arguments)
-        except SystemExit:
-            failures.append(f"{relative(doc)}:{number} documents `{command_line}` but the launcher's parser rejects it")
+        except SystemExit as exit_request:
+            # `--help` and `--version` are accepted commands that argparse answers by
+            # printing and exiting 0. Only a nonzero exit is the parser refusing.
+            if exit_request.code not in (0, None):
+                failures.append(
+                    f"{relative(doc)}:{number} documents `{command_line}` but the launcher's parser rejects it"
+                )
         except Exception as error:  # noqa: BLE001 - reported, not swallowed
             failures.append(f"{relative(doc)}:{number} documents `{command_line}` but parsing raised {error!r}")
     assert checked, "no documented rigout command lines were found; the extraction or the docs changed"

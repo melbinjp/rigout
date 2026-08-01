@@ -36,6 +36,7 @@ around and leaves out the rest. Nothing is implied by an omission.
 |-- CONTRIBUTING.md
 |-- DEVELOPMENT_STANDARDS.md
 |-- SECURITY.md
+|-- DEPLOYMENT.md
 |-- VERSIONING.md
 |-- pyproject.toml
 |-- rigout.sh

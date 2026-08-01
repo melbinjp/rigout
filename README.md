@@ -209,7 +209,7 @@ Do not expose Rigout publicly with `--no-auth` unless the network is private and
 
 ## Public URL reliability
 
-Cloudflare quick tunnels are useful for one-command setup and testing, but their public URLs are ephemeral. For long-running or production use, put Rigout behind a stable tunnel or gateway such as a named Cloudflare Tunnel, Tailscale, a reverse proxy, or a dedicated VM with explicit network controls.
+Cloudflare quick tunnels are useful for one-command setup and testing, but their public URLs are ephemeral, and Rigout generates a new bearer token on every public start unless you supply one - so an agent configured against a quick tunnel stops working when the machine restarts. [DEPLOYMENT.md](DEPLOYMENT.md) covers the permanent arrangement end to end: a hostname you own in front of a loopback-bound Rigout, a token you choose, and a systemd unit that brings it back after a reboot.
 
 Restarting a quick tunnel changes its URL and invalidates the old connection. Use `rigout status` to inspect the current managed URL; do not build durable automation around a `trycloudflare.com` address.
 
