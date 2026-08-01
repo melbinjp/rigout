@@ -156,6 +156,54 @@ detaching would make it think Rigout had exited. Put the token in an
 `EnvironmentFile=/etc/rigout.env` with mode 600 rather than in the unit if anyone else
 can read `/etc/systemd`.
 
+## 4b. In a container, "permanent" means something different
+
+The section above assumes a machine that reboots and comes back as itself. A container -
+a RunPod pod, a Docker container, a Kubernetes pod - does not. It comes back as a fresh
+copy of its image, and everything written since it started is gone: Rigout, its state
+directory, the bearer token in `connection.json`, and any `~/.cloudflared` credentials.
+A permanent hostname pointing at a machine that forgets its own token every restart is
+not a permanent deployment.
+
+Check before assuming. Anything on `overlay` is discarded when the container is
+recreated:
+
+```bash
+df --output=target,fstype /root /tmp /workspace
+```
+
+If every line says `overlay`, no persistent storage is attached, and nothing you install
+survives. Attach a volume first - the provider mounts it somewhere like `/workspace` or
+`/runpod-volume` - and then keep all three durable things on it:
+
+```bash
+rigout start --tunnel none --host 127.0.0.1 --port 8765 \
+  --public-url https://rigout.example.com \
+  --auth-token "$RIGOUT_AUTH_TOKEN" \
+  --no-agent-setup-url \
+  --state-dir /workspace/rigout-state
+```
+
+- **State** goes on the volume with `--state-dir`, so `connection.json` and the runtime
+  files outlive the container.
+- **The token** comes from the environment, set in the image or the pod template, not
+  generated. This is the same rule as everywhere else and it matters more here, because
+  the container has no memory of the last one.
+- **Tunnel credentials**, if you use a named tunnel, belong on the volume too. Point
+  `credentials-file:` at the volume path rather than `~/.cloudflared`.
+
+Start it from whatever the image already runs. `systemctl` may exist in the image while
+PID 1 is a shell script, in which case systemd is not running and the unit above will
+never fire; check with `cat /proc/1/comm`. Add the `rigout start` line to the image's
+entrypoint or the provider's start command instead, without `--detach`, so the container
+lives as long as Rigout does.
+
+Reinstall on each start unless the package itself is on the volume:
+
+```bash
+pip install "rigout==0.3.0" && rigout start ...
+```
+
 ## 5. Point the agent at it
 
 ```bash
