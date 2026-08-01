@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import subprocess
 import tarfile
 from argparse import Namespace
 from pathlib import Path
@@ -258,6 +259,23 @@ class FakeCloudflaredProcess:
         self._exited = True
 
 
+def cloudflared_only(fake_process, real_popen=subprocess.Popen):
+    """Fake the cloudflared launch and let every other subprocess through.
+
+    Patching subprocess.Popen wholesale also captures subprocess.run, which is built on
+    `with Popen(...) as process:`. Nothing in these three tests reaches subprocess.run
+    today, but the blanket patch is the same shape that broke the launcher's interrupt
+    test on macOS, where process_identity shells out to `ps`.
+    """
+
+    def popen(command, *args, **kwargs):
+        if command and "cloudflared" in str(command[0]):
+            return fake_process
+        return real_popen(command, *args, **kwargs)
+
+    return popen
+
+
 @pytest.mark.unit
 def test_start_cloudflare_tunnel_extracts_url_from_process_output():
     fake_process = FakeCloudflaredProcess(
@@ -266,7 +284,7 @@ def test_start_cloudflare_tunnel_extracts_url_from_process_output():
 
     with (
         patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
-        patch("rigout.mcp_url_launcher.subprocess.Popen", return_value=fake_process) as popen,
+        patch("rigout.mcp_url_launcher.subprocess.Popen", side_effect=cloudflared_only(fake_process)) as popen,
     ):
         process, url = start_cloudflare_tunnel(8765, timeout=5)
 
@@ -282,7 +300,7 @@ def test_start_cloudflare_tunnel_raises_when_process_exits_without_url():
 
     with (
         patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
-        patch("rigout.mcp_url_launcher.subprocess.Popen", return_value=fake_process),
+        patch("rigout.mcp_url_launcher.subprocess.Popen", side_effect=cloudflared_only(fake_process)),
     ):
         with pytest.raises(RuntimeError, match="exited before publishing a tunnel URL"):
             start_cloudflare_tunnel(8765, timeout=5)
@@ -294,7 +312,7 @@ def test_start_cloudflare_tunnel_terminates_process_and_raises_on_timeout():
 
     with (
         patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
-        patch("rigout.mcp_url_launcher.subprocess.Popen", return_value=fake_process),
+        patch("rigout.mcp_url_launcher.subprocess.Popen", side_effect=cloudflared_only(fake_process)),
     ):
         with pytest.raises(RuntimeError, match="Timed out waiting for cloudflared"):
             start_cloudflare_tunnel(8765, timeout=0.3)

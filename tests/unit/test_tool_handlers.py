@@ -733,9 +733,7 @@ class TestFileOperationsParity:
         validation on its own merits: writes must not need a security bypass.
         """
         for operation in ("write", "append"):
-            await handle_file_operations(
-                {"operation": operation, "path": "/tmp/notes.md", "content": content}
-            )
+            await handle_file_operations({"operation": operation, "path": "/tmp/notes.md", "content": content})
             command = remote_manager.execute_command.await_args.args[1]
 
             is_safe, err = security_validator.validate_command(command)

@@ -184,6 +184,22 @@ class TestInstallSoftwarePlatformBranch:
 # FIX 2: environment_setup on a local Windows endpoint
 # --------------------------------------------------------------------------
 
+# A local endpoint is this machine, so its platform is this machine's: the local-Windows
+# branch can only be reached on a Windows host. The tests below hand the handler a
+# workspace path taken from the runner's own filesystem, which makes the runner decide
+# what is being tested. On Windows tmp_path has a drive and passes through; on Linux it
+# starts with /tmp and is mapped onto the temp directory; on macOS it is
+# /private/var/folders/... which the handler correctly refuses as an unmappable POSIX
+# absolute path, so no command is built at all. The handler then emits backslash paths
+# that no POSIX host can stat, so every assertion here can only hold on Windows.
+#
+# The two tests in this class without this mark do not touch the host filesystem and are
+# deliberately left running everywhere.
+windows_host_only = pytest.mark.skipif(
+    os.name != "nt",
+    reason="the local-Windows shell branch exists only on a Windows host; see the note above",
+)
+
 
 @pytest.mark.unit
 @pytest.mark.asyncio
@@ -192,6 +208,7 @@ class TestEnvironmentSetupWindowsLocal:
     def _windows_manager():
         return RecordingManager(FakeEndpoint(platform="Windows", private_key_path=LOCAL_KEY))
 
+    @windows_host_only
     async def test_no_if_guard_swallows_the_setup_chain(self, tmp_path):
         workspace = tmp_path / "ws"
         workspace.mkdir()  # the case that used to make cmd.exe skip everything
@@ -208,6 +225,7 @@ class TestEnvironmentSetupWindowsLocal:
         assert "python -m venv venv" in command
         assert 'venv\\Scripts\\python.exe -m pip install "numpy"' in command
 
+    @windows_host_only
     async def test_default_workspace_is_a_usable_windows_path(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
         manager = self._windows_manager()
@@ -219,6 +237,7 @@ class TestEnvironmentSetupWindowsLocal:
         assert str(tmp_path / "ai_workspace") in manager.only_command
         assert (tmp_path / "ai_workspace").is_dir(), "the workspace was never created"
 
+    @windows_host_only
     async def test_workspace_directory_is_created_before_use(self, tmp_path):
         workspace = tmp_path / "fresh" / "nested"
         manager = self._windows_manager()
@@ -238,6 +257,7 @@ class TestEnvironmentSetupWindowsLocal:
         assert "POSIX absolute path" in text_of(result)
         assert manager.commands == [], "a doomed command was sent anyway"
 
+    @windows_host_only
     async def test_docker_dockerfile_is_written_not_shell_quoted(self, tmp_path):
         workspace = tmp_path / "ws"
         manager = self._windows_manager()
@@ -257,6 +277,7 @@ class TestEnvironmentSetupWindowsLocal:
         assert dockerfile.read_text(encoding="utf-8") == "FROM python:3.12-slim\nRUN pip install numpy\n"
         assert "Dockerfile written" in text_of(result)
 
+    @windows_host_only
     async def test_unquotable_requirement_cannot_break_out_of_the_command(self, tmp_path):
         manager = self._windows_manager()
         with patch_manager("environment", manager):
@@ -272,6 +293,7 @@ class TestEnvironmentSetupWindowsLocal:
         assert "cannot be quoted for cmd.exe" in text_of(result)
         assert manager.commands == []
 
+    @windows_host_only
     async def test_pip_specifiers_are_still_accepted(self, tmp_path):
         manager = self._windows_manager()
         with patch_manager("environment", manager):
@@ -304,9 +326,7 @@ class TestEnvironmentSetupPosixLocal:
         workspace = tmp_path / "ws"
         manager = RecordingManager(FakeEndpoint(platform="Darwin", private_key_path=LOCAL_KEY))
         with patch_manager("environment", manager):
-            result = await handle_environment_setup(
-                {"environment_type": "python", "workspace_path": str(workspace)}
-            )
+            result = await handle_environment_setup({"environment_type": "python", "workspace_path": str(workspace)})
 
         command = manager.only_command
         assert result.isError is False

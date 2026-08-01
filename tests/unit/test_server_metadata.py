@@ -54,8 +54,7 @@ def _dispatched_tool_names() -> set[str]:
     dispatcher = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
-        and node.name == "_handle_call_tool_result"
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name == "_handle_call_tool_result"
     )
 
     names: set[str] = set()
@@ -86,12 +85,10 @@ async def test_advertised_tools_and_dispatch_chain_agree():
     assert dispatched, "no dispatch branches found; _handle_call_tool_result may have been restructured"
 
     assert advertised - dispatched == set(), (
-        "advertised but never dispatched, so calling these returns 'Unknown tool': "
-        f"{sorted(advertised - dispatched)}"
+        f"advertised but never dispatched, so calling these returns 'Unknown tool': {sorted(advertised - dispatched)}"
     )
     assert dispatched - advertised == set(), (
-        "dispatched but not advertised, so no client can discover these: "
-        f"{sorted(dispatched - advertised)}"
+        f"dispatched but not advertised, so no client can discover these: {sorted(dispatched - advertised)}"
     )
 
 

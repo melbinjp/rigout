@@ -64,7 +64,9 @@ async def handle_docker_operations(arguments: dict) -> CallToolResult:
         # result instead of being a silent surprise when the container is gone.
         if options.get("remove", True):
             docker_cmd += " --rm"
-            notes.append("Auto-remove: --rm applied, the container is deleted on exit (options.remove=false to keep it)")
+            notes.append(
+                "Auto-remove: --rm applied, the container is deleted on exit (options.remove=false to keep it)"
+            )
         else:
             notes.append("Auto-remove: disabled, the container persists after exit")
 

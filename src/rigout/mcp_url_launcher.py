@@ -836,8 +836,7 @@ def start_detached(args: argparse.Namespace, paths: RuntimePaths) -> int:
 def already_running_message(pid: object) -> str:
     """Say what is already running and what the operator can do about it."""
     return (
-        f"Rigout is already running with PID {pid}. "
-        "Run `rigout status` to see it, or `rigout stop` to stop it first."
+        f"Rigout is already running with PID {pid}. Run `rigout status` to see it, or `rigout stop` to stop it first."
     )
 
 

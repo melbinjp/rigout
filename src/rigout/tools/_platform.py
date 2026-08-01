@@ -20,9 +20,7 @@ _MACOS_TOKENS = frozenset({"darwin", "mac", "macos", "macosx", "osx", "apple"})
 _WINDOWS_TOKENS = frozenset(
     {"windows", "win", "win32", "win64", "winnt", "cygwin", "msys", "mingw", "mingw32", "mingw64"}
 )
-_LINUX_TOKENS = frozenset(
-    {"linux", "ubuntu", "debian", "centos", "rhel", "fedora", "arch", "alpine", "suse", "gnu"}
-)
+_LINUX_TOKENS = frozenset({"linux", "ubuntu", "debian", "centos", "rhel", "fedora", "arch", "alpine", "suse", "gnu"})
 
 WINDOWS = "windows"
 MACOS = "macos"

@@ -782,7 +782,12 @@ def interrupt_now():
 
 
 class SilentCloudflared:
-    """A cloudflared that never publishes a URL and never exits, like a stalled tunnel."""
+    """A cloudflared that never publishes a URL and never exits, like a stalled tunnel.
+
+    Complete enough to stand in for a real Popen, including the context manager protocol.
+    A double that implements only the parts the author's own platform happens to call
+    passes there and fails everywhere else.
+    """
 
     def __init__(self, *_args, **_kwargs):
         self.stdout = iter(())
@@ -799,6 +804,32 @@ class SilentCloudflared:
 
     def kill(self):
         self.terminated = True
+
+    def communicate(self, *_args, **_kwargs):
+        return "", ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exception):
+        return False
+
+
+def cloudflared_only(fake_process, real_popen=subprocess.Popen):
+    """Fake the cloudflared launch and let every other subprocess through.
+
+    Patching subprocess.Popen wholesale also captures subprocess.run, which is built on
+    `with Popen(...) as process:`. process_identity uses subprocess.run for `ps` wherever
+    /proc is absent, which is every macOS run, so a blanket patch hands the `ps` lookup a
+    cloudflared double and the failure surfaces nowhere near the test's subject.
+    """
+
+    def popen(command, *args, **kwargs):
+        if command and "cloudflared" in str(command[0]):
+            return fake_process
+        return real_popen(command, *args, **kwargs)
+
+    return popen
 
 
 @pytest.mark.unit
@@ -865,7 +896,7 @@ def test_a_real_interrupt_ends_a_stalled_tunnel_wait(tmp_path, capsys):
 
     with (
         patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
-        patch("rigout.mcp_url_launcher.subprocess.Popen", SilentCloudflared),
+        patch("rigout.mcp_url_launcher.subprocess.Popen", side_effect=cloudflared_only(SilentCloudflared())),
         patch("rigout.mcp_url_launcher.start_server") as start_server_call,
     ):
         threading.Timer(0.5, lambda: signal.raise_signal(signal.SIGINT)).start()
