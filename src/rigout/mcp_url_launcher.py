@@ -1165,6 +1165,11 @@ def handle_url(args: argparse.Namespace, paths: RuntimePaths) -> int:
 
     if args.output == "json":
         print_json({"connection_file": str(connection_file), **{f"{k}_url": v for k, v in urls.items()}})
+        # The same warning the text path gives. It was missing here, so the machine
+        # -readable form handed over a credential-bearing URL and said nothing about it;
+        # stderr keeps stdout a single parseable object either way.
+        if urls["setup"]:
+            print("The setup_url is credential-equivalent; it can fetch the bearer token.", file=sys.stderr)
         return 0 if urls[args.which] else 1
 
     chosen = urls[args.which]

@@ -1588,10 +1588,14 @@ def test_url_json_output_is_one_parseable_object(tmp_path, capsys):
 
     exit_code = main(["url", "--state-dir", str(tmp_path), "--output", "json"])
 
-    output = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
     assert exit_code == 0
     assert output["setup_url"] == SETUP_URL
     assert output["mcp_url"] == "https://example.trycloudflare.com/mcp"
+    # The machine-readable form hands over a credential too, so it carries the same
+    # warning the text form does; stdout stays a single parseable object.
+    assert "credential-equivalent" in captured.err
 
 
 @pytest.mark.unit

@@ -109,7 +109,9 @@ def released_tags() -> list[tuple[int, int, int]]:
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return []
-    versions = [parse_version(line.strip().lstrip("v")) for line in output.splitlines() if line.strip()]
+    # removeprefix, not lstrip: lstrip takes a character set, so it would turn a
+    # malformed "vv1.0.0" into a valid-looking 1.0.0 instead of rejecting it.
+    versions = [parse_version(line.strip().removeprefix("v")) for line in output.splitlines() if line.strip()]
     return sorted(v for v in versions if v is not None)
 
 
