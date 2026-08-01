@@ -8,11 +8,13 @@ Three structural guarantees, not just prompt instructions:
   2. This script never calls the GitHub commit-status or branch-protection
      APIs, so it has no way to force a merge closed.
   3. An approving review is only submitted when the verdict line parsed out
-     of Jules' own message is "approve" or "comment" (no BLOCKING findings).
-     Anything else - "block", a missing/malformed verdict line, a failed or
-     timed-out session - fails closed: the comment is posted, but no review
-     is submitted, so required-review branch protection stays unsatisfied
-     and a human has to look at it.
+     of Jules' own message is "approve" or "comment" (no BLOCKING findings)
+     AND the whole diff fitted in the prompt. Anything else - "block", a
+     missing/malformed verdict line, a failed or timed-out session, or a diff
+     too large to show in full - fails closed: the comment is posted, but no
+     review is submitted, so required-review branch protection stays
+     unsatisfied and a human has to look at it. A verdict on part of a change
+     is not a verdict on the change.
 
 This exists to solve a specific problem for solo-maintainer repos: GitHub's
 "require approval of the most recent reviewable push" branch protection
@@ -199,6 +201,58 @@ def load_rules_file(owner: str, repo: str, path: str, base_sha: str, token: str)
     return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
 
 
+FILE_HEADER_PATTERN = re.compile(r"^diff --git a/(\S+)", re.MULTILINE)
+
+# What a reviewer must see first when not everything fits. `git diff` emits files in
+# path order, which put `.github/`, `CHANGELOG.md`, `README.md` and `docs/` ahead of
+# `src/` on every alphabetically unlucky PR. On one 45-file change that meant the
+# entire budget was spent on documentation and workflow YAML, and not one line of
+# `src/` reached the model - while the review still returned a verdict that satisfied
+# the required-review rule. Shipped code is reviewed first, then the tests that are
+# supposed to hold it up, then prose.
+REVIEW_PRIORITY = (
+    ("src/", 0),
+    ("scripts/", 1),
+    ("pyproject.toml", 2),
+    (".github/", 3),
+    ("tests/", 4),
+)
+DEFAULT_REVIEW_PRIORITY = 5
+
+
+def review_priority(path: str) -> int:
+    """Return the review-order rank of one changed path; lower is reviewed sooner."""
+    for prefix, rank in REVIEW_PRIORITY:
+        if path.startswith(prefix):
+            return rank
+    return DEFAULT_REVIEW_PRIORITY
+
+
+def split_diff_by_file(diff: str) -> list[tuple[str, str]]:
+    """Split a unified diff into (path, section) pairs, preserving each section whole."""
+    matches = list(FILE_HEADER_PATTERN.finditer(diff))
+    if not matches:
+        return []
+    sections = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(diff)
+        sections.append((match.group(1), diff[match.start() : end]))
+    return sections
+
+
+def order_diff_for_review(diff: str) -> str:
+    """Reorder a diff so the most review-critical files come first.
+
+    Stable within each rank, so files that were adjacent for a reason stay adjacent.
+    A diff this cannot parse is returned untouched rather than mangled.
+    """
+    sections = split_diff_by_file(diff)
+    if not sections:
+        return diff
+    ordered = sorted(range(len(sections)), key=lambda i: (review_priority(sections[i][0]), i))
+    return "".join(sections[i][1] for i in ordered)
+
+
 def truncate_diff(diff: str, max_chars: int) -> tuple[str, str | None]:
     if len(diff) <= max_chars:
         return diff, None
@@ -207,9 +261,12 @@ def truncate_diff(diff: str, max_chars: int) -> tuple[str, str | None]:
     if cut <= 0:
         cut = max_chars
     text = diff[:cut]
+    seen = {path for path, _ in split_diff_by_file(text)}
+    unseen = [path for path, _ in split_diff_by_file(diff) if path not in seen]
+    unseen_note = f" Files not shown at all: {', '.join(unseen)}." if unseen else ""
     note = (
         f"The diff was truncated: original {len(diff)} chars, kept the first {len(text)}. "
-        "Some changes are not visible above; say so in your review."
+        f"Some changes are not visible above; say so in your review.{unseen_note}"
     )
     return text, note
 
@@ -458,7 +515,7 @@ def main() -> int:
     try:
         diff = fetch_diff(owner, repo, pr_number, token)
         max_chars = int(os.environ.get("JULES_REVIEW_MAX_DIFF_CHARS", "80000"))
-        diff_text, truncated_note = truncate_diff(diff, max_chars)
+        diff_text, truncated_note = truncate_diff(order_diff_for_review(diff), max_chars)
 
         rules_path = os.environ.get("JULES_REVIEW_RULES_FILE", ".github/jules-review-rules.md")
         rules_from_file = load_rules_file(owner, repo, rules_path, base_sha, token)
@@ -503,10 +560,20 @@ def main() -> int:
 
         verdict = parse_verdict(review_message)
         author_trusted = is_trusted_author(pr_author, owner)
-        will_approve = verdict in APPROVING_VERDICTS and author_trusted
+        # A verdict on part of a change is not a verdict on the change. When the diff
+        # did not fit, the model reviewed some files and never saw others, so its
+        # approval cannot stand in for the required review; that is the same
+        # fail-closed rule already applied to a missing verdict or a dead session.
+        reviewed_whole_diff = truncated_note is None
+        will_approve = verdict in APPROVING_VERDICTS and author_trusted and reviewed_whole_diff
 
         if will_approve:
             approval_note = "_No blocking issues were found, so this PR was auto-approved._"
+        elif not reviewed_whole_diff:
+            approval_note = (
+                "_This did not auto-approve: the diff was too large to review in full, so part "
+                "of this change was never seen. Split the PR, or review and approve it yourself._"
+            )
         elif verdict not in APPROVING_VERDICTS:
             approval_note = "_This did not auto-approve: a human still needs to review and approve this PR._"
         else:
@@ -533,7 +600,8 @@ def main() -> int:
     # with a generic failure message.
     if not will_approve:
         print(
-            f"Not approved (verdict: {verdict!r}, author_trusted: {author_trusted}). A human review is still required."
+            f"Not approved (verdict: {verdict!r}, author_trusted: {author_trusted}, "
+            f"reviewed_whole_diff: {reviewed_whole_diff}). A human review is still required."
         )
         return 0
     try:

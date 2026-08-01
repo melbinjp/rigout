@@ -360,3 +360,97 @@ class TestMainFlows:
         assert len(patch_calls) == 1
         assert "VERDICT: approve" in patch_calls[0].kwargs["json"]["body"]
         assert "failed" not in patch_calls[0].kwargs["json"]["body"].lower()
+
+
+def _diff_for(*paths, body_lines=3):
+    """Build a unified diff touching each path, in git's own path order."""
+    parts = []
+    for path in paths:
+        body = "\n".join(f"+line {n} of {path}" for n in range(body_lines))
+        parts.append(f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,3 @@\n{body}\n")
+    return "".join(parts)
+
+
+@pytest.mark.unit
+class TestReviewOrdering:
+    """`git diff` emits files in path order, which is not review order.
+
+    On a real 45-file PR, `.github/`, `CHANGELOG.md`, `README.md` and `docs/` sorted
+    ahead of `src/` and consumed the entire prompt budget: the review saw nine files,
+    all of them documentation and workflow YAML, and not one line of shipped code -
+    then returned a verdict that satisfied the required-review rule.
+    """
+
+    def test_source_is_ordered_ahead_of_documentation(self):
+        diff = _diff_for("CHANGELOG.md", "README.md", "src/rigout/server.py")
+
+        ordered = jules_review.order_diff_for_review(diff)
+
+        assert ordered.index("src/rigout/server.py") < ordered.index("CHANGELOG.md")
+
+    def test_source_is_ordered_ahead_of_tests(self):
+        """Both matter, but code that ships is reviewed before the tests holding it up."""
+        diff = _diff_for("tests/unit/test_server.py", "src/rigout/server.py")
+
+        ordered = jules_review.order_diff_for_review(diff)
+
+        assert ordered.index("src/rigout/server.py") < ordered.index("tests/unit/test_server.py")
+
+    def test_every_changed_file_survives_reordering(self):
+        paths = ("CHANGELOG.md", "src/rigout/a.py", "tests/unit/test_a.py", ".github/workflows/ci.yml")
+        diff = _diff_for(*paths)
+
+        ordered = jules_review.order_diff_for_review(diff)
+
+        for path in paths:
+            assert f"diff --git a/{path}" in ordered
+        assert len(ordered) == len(diff), "reordering must not add or drop content"
+
+    def test_a_diff_with_no_file_headers_is_returned_untouched(self):
+        assert jules_review.order_diff_for_review("not a diff") == "not a diff"
+
+    def test_source_survives_a_budget_that_documentation_would_have_eaten(self):
+        """The end-to-end property: the code is what reaches the model."""
+        diff = _diff_for("CHANGELOG.md", "README.md", body_lines=400) + _diff_for("src/rigout/server.py")
+
+        kept, note = jules_review.truncate_diff(jules_review.order_diff_for_review(diff), 2000)
+
+        assert "src/rigout/server.py" in kept
+        assert note is not None
+
+    def test_truncation_names_the_files_that_were_never_shown(self):
+        diff = _diff_for("src/rigout/server.py", body_lines=400) + _diff_for("CHANGELOG.md")
+
+        _, note = jules_review.truncate_diff(jules_review.order_diff_for_review(diff), 2000)
+
+        assert "CHANGELOG.md" in note
+
+
+@pytest.mark.unit
+class TestTruncationFailsClosed:
+    """A verdict on part of a change is not a verdict on the change."""
+
+    def test_a_complete_diff_reports_no_truncation(self):
+        kept, note = jules_review.truncate_diff(_diff_for("src/a.py"), 100000)
+
+        assert note is None
+        assert "src/a.py" in kept
+
+    @pytest.mark.parametrize(
+        ("verdict", "trusted", "whole", "expected"),
+        [
+            ("approve", True, True, True),
+            ("comment", True, True, True),
+            ("approve", True, False, False),  # the gap this closes
+            ("comment", True, False, False),
+            ("block", True, True, False),
+            ("approve", False, True, False),
+            (None, True, True, False),
+        ],
+    )
+    def test_approval_requires_a_clean_verdict_a_trusted_author_and_a_whole_diff(
+        self, verdict, trusted, whole, expected
+    ):
+        will_approve = verdict in jules_review.APPROVING_VERDICTS and trusted and whole
+
+        assert will_approve is expected
