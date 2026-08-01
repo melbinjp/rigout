@@ -101,6 +101,45 @@ maintainer would not add protection either - it would add a second copy of the s
 since the owner cannot approve their own pull request. Either leave it inert or turn it
 off; do not satisfy it by adding a file.
 
+## When there is more than one maintainer
+
+Everything above describes a gate with one person behind it, and a gate built only for
+that has to be taken apart when a second person arrives. It should not have to be, so
+the parts that would need unpicking are worth naming now.
+
+Two places assume the maintainer is the repository owner:
+
+- `auto-merge.yml` arms auto-merge only for pull requests whose author is
+  `github.repository_owner`. A second maintainer's pull request would never have it
+  armed, and nobody would know why.
+- `is_trusted_author` in `scripts/jules_review.py` trusts the owner by default. It can be
+  extended through `JULES_REVIEW_TRUSTED_AUTHORS`, but that is a list somebody has to
+  remember to update when access changes.
+
+Both should key off write access rather than a name. GitHub already computes that per
+pull request as `author_association`, which is `OWNER`, `MEMBER` or `COLLABORATOR` for
+someone with write access and `CONTRIBUTOR` or `NONE` for someone without. Keying off it
+means adding a maintainer is done entirely by granting repository access, with no
+workflow to edit and no list to drift out of date, and it changes nothing today because
+there is nobody else with access.
+
+What genuinely changes when the second maintainer arrives is that the review requirement
+stops being theatre. One person cannot review their own work; two can review each
+other's, so the rule that is currently satisfied by a language model can be satisfied by
+a person who did not write the change. At that point:
+
+- **Remove the bypass allowance.** It exists because there is no honest way for one
+  person to satisfy a review requirement. There is one now, and leaving the bypass in
+  place would keep an unnecessary hole open.
+- **Demote the reviewer from gate to advisor.** Its comment stays useful; its approval
+  no longer needs to be what merges things. Dropping it from the approving path is a
+  matter of not letting it submit a review, not of removing it.
+- **`CODEOWNERS` becomes worth having.** The reason not to add one today is that it would
+  name the only person who cannot approve the pull request. With two maintainers it
+  routes review to whoever owns the area, which is what it is for.
+
+None of that is a redesign, which is the point of writing it down before it is needed.
+
 ## The reviewer's own bootstrap
 
 `pr-review.yml` running the reviewer from the base commit is correct and should stay.
