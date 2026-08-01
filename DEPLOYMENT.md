@@ -53,6 +53,19 @@ ingress:
   - service: http_status:404
 ```
 
+Check the rules before starting anything. This needs no account and no tunnel, so it is
+worth doing while the file is still easy to change:
+
+```bash
+cloudflared tunnel --config ~/.cloudflared/config.yml ingress validate
+cloudflared tunnel --config ~/.cloudflared/config.yml ingress rule https://rigout.example.com/mcp
+```
+
+The first prints `OK`. The second should name your hostname and
+`service: http://127.0.0.1:8765`; if it matches `http_status:404` instead, the hostname
+in the file does not match the one you asked about. Note that `--config` goes after
+`tunnel` and before `ingress` - putting it at the end is rejected.
+
 ```bash
 cloudflared service install    # runs it at boot
 ```
@@ -189,13 +202,24 @@ the entire point of the arrangement.
 The Rigout half was run on a Linux host against a 0.3.0 build: `--public-url` advertised
 in `connection.json` instead of the loopback address, `--auth-token` used verbatim, a
 `--public-url` start still requiring bearer auth, the socket staying on `127.0.0.1`, and
-the URL and token both identical after a stop and start. Then the whole chain through an
-nginx reverse proxy: `/health`, a `401` on an unauthenticated POST, and a full MCP
-session including a tool call, with buffering on and off. The systemd unit above was
-checked with `systemd-analyze verify`.
+the URL and token both identical after a stop and start.
 
-Not run here: `cloudflared tunnel create` and DNS routing, which need a Cloudflare
-account and a domain, and starting the unit under a live systemd, which a container does
-not have. Those are ordinary usage of those tools rather than anything specific to
-Rigout - what differs between a named tunnel and the nginx above is DNS and TLS, and
-neither of those is what could break MCP.
+Then the whole chain, twice. Through an nginx reverse proxy on plain HTTP: `/health`, a
+`401` on an unauthenticated POST, and a full MCP session including a tool call, with
+buffering on and off. Then again with nginx terminating TLS for `rigout.example.com` on
+a certificate for that name, with the hostname resolving to the machine: `/health` over
+HTTPS returning the `https://` URL an agent should use, a `401` on an unauthenticated
+HTTPS POST, and a full MCP session over HTTPS - initialize, fifteen tools, a command
+executed. That is the arrangement a purchased domain produces; only the certificate's
+signature and where the name is resolved differ.
+
+The ingress file above was checked with `cloudflared` itself: `ingress validate` returns
+`OK`, a request for the hostname matches the rule pointing at loopback Rigout, and any
+other hostname falls through to the 404 catch-all. The systemd unit was checked with
+`systemd-analyze verify`.
+
+Not run here, and not runnable without an account and a domain: `cloudflared tunnel
+create`, `tunnel route dns`, and Cloudflare's edge itself. Nor starting the unit under a
+live systemd, which a container does not have. What those add over what was tested is
+DNS resolution and a publicly trusted certificate, neither of which is something Rigout
+participates in.
