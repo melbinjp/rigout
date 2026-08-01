@@ -41,7 +41,7 @@ claim afterwards, not for saying.
 
 5. Rigout's own dispatch is a fifteen-branch if/elif chain, no registry table. An unknown
    name falls through to `Unknown tool`, flagged as an error.
-   Code: `_handle_call_tool_result` in `server.py`, at `text=f"Unknown tool: {name}"`
+   Code: `_dispatch_tool` in `server.py`, at `text=f"Unknown tool: {name}"`
 
 6. The handler picks an endpoint. `auto_failover` reuses the active SSH endpoint if it
    answers, otherwise takes the fastest that does, and falls back to a synthetic local
@@ -286,12 +286,12 @@ the checker verifies the file exists and nothing more. They move with the depend
 ### Rigout stage
 
 `handle_call_tool` in `server.py` is the registered function. It delegates to
-`_handle_call_tool_result` in `server.py`, which is a literal if/elif chain over the tool
+`_dispatch_tool` in `server.py`, which is a literal if/elif chain over the tool
 name, one branch per handler, imported from `rigout.tools`. There is no dispatch table and no
 dynamic lookup. The tool list in `handle_list_tools` and this chain are two independently
 maintained lists of the same 15 names.
 
-An unknown name falls to the `else` in `_handle_call_tool_result` in `server.py`, at
+An unknown name falls to the `else` in `_dispatch_tool` in `server.py`, at
 `text=f"Unknown tool: {name}"`, and returns `isError=True`. Verified end to end: the client
 receives
 `{"content": [{"type": "text", "text": "Unknown tool: no_such_tool"}], "isError": true}`.
@@ -591,7 +591,7 @@ unmarked is still true.
 2. **The auth layer is conditional, not a middleware.** `create_app` in `mcp_http_server.py`
    swaps in an unprotected app when there is no token. Reading it top to bottom, it is easy
    to see `BearerAuthASGIApp` and assume the endpoint is always protected.
-3. **Dispatch is a 15-branch if/elif chain.** `_handle_call_tool_result` in `server.py`. The
+3. **Dispatch is a 15-branch if/elif chain.** `_dispatch_tool` in `server.py`. The
    tool list in `handle_list_tools` and the chain are separate hand-maintained copies of the
    same names, so adding a tool to one and forgetting the other produces `Unknown tool` at
    runtime with no test or type error.

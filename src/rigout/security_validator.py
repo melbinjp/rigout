@@ -97,6 +97,39 @@ class SecurityValidator:
         r"netcat\s+.*\s+\d+.*<",
     ]
 
+    # What each pattern means, in the words a caller can act on. Without this the
+    # refusal reads `Command contains dangerous pattern: \$\([^)]*\)`, which asks the
+    # reader to parse a regex to find out what Rigout objected to, while every
+    # _semantic_danger refusal already says something like "raw disk copy". The
+    # substitution entries carry a way forward as well, because they are the two that
+    # ordinary work runs into; without one, the only route the message offers is
+    # bypass_security, which switches off every check including the ones that matter.
+    DANGEROUS_PATTERN_REASONS = {
+        r"mkfs\.": "filesystem creation",
+        r"fdisk\s+": "disk partitioning",
+        r"parted\s+": "disk partitioning",
+        r"format\s+": "disk formatting",
+        r"del\s+/[sq]\s+": "recursive or quiet Windows delete",
+        r"rmdir\s+/[sq]\s+": "recursive or quiet Windows directory delete",
+        r"[<>]\s*/dev/(sd[a-z]|hd[a-z]|nvme\w*|mmcblk\w*|mem\b|kmem|port)": (
+            "redirection to or from a raw disk device or kernel memory"
+        ),
+        r"curl\s+.*\|\s*(ba)?sh\b": "a downloaded script piped straight into a shell",
+        r"wget\s+.*\|\s*(ba)?sh\b": "a downloaded script piped straight into a shell",
+        r"eval\s+\$\(": "eval of a command substitution",
+        r"`[^`]*`": (
+            "command substitution in backticks, whose contents Rigout cannot inspect. "
+            "Run the inner command first and pass its output, or write it to a file and "
+            "read that"
+        ),
+        r"\$\([^)]*\)": (
+            "command substitution, whose contents Rigout cannot inspect. Run the inner "
+            "command first and pass its output, or write it to a file and read that"
+        ),
+        r"nc\s+.*\s+\d+.*<": "netcat sending a file to a network address",
+        r"netcat\s+.*\s+\d+.*<": "netcat sending a file to a network address",
+    }
+
     # Allowed command prefixes for system operations
     ALLOWED_COMMANDS = [
         "ls",
@@ -433,7 +466,8 @@ class SecurityValidator:
                 scan_text = unquoted_command
             if re.search(pattern, scan_text, re.IGNORECASE):
                 self.blocked_commands.append(command)
-                return False, f"{self.DANGEROUS_PREFIX}{pattern}"
+                reason = self.DANGEROUS_PATTERN_REASONS.get(pattern, pattern)
+                return False, f"{self.DANGEROUS_PREFIX}{reason}"
 
         # _semantic_danger returns an already-formatted message; do not re-prefix it.
         semantic_danger = self._semantic_danger(tokens)

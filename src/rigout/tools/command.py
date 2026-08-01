@@ -7,6 +7,21 @@ from ..ssh_manager import (
 from ._platform import MACOS, WINDOWS, platform_family
 from ._results import error_result, failure_detail
 
+# Every other tool bounds what it returns; this one did not, and a live server handed
+# back five million characters from a single call. Output that large is a cost and a
+# context problem for the caller long before it is a transport one, and the tail of a
+# build log is rarely the part anyone wanted. Generous enough for real build and test
+# output, and truncation is always stated.
+MAX_COMMAND_OUTPUT_CHARS = 200_000
+
+
+def bounded_command_output(text: str) -> str:
+    """Return command output capped to a stated size."""
+    if len(text) <= MAX_COMMAND_OUTPUT_CHARS:
+        return text
+    dropped = len(text) - MAX_COMMAND_OUTPUT_CHARS
+    return f"{text[:MAX_COMMAND_OUTPUT_CHARS]}\n\n[output truncated: {dropped} more characters]"
+
 
 async def handle_execute_command(arguments: dict) -> CallToolResult:
     command = arguments["command"]
@@ -37,9 +52,9 @@ async def handle_execute_command(arguments: dict) -> CallToolResult:
         result_text = f"Command executed successfully on {result['endpoint']}\n\n"
         result_text += f"Command: {result['command']}\n"
         result_text += f"Exit Code: {result['exit_code']}\n\n"
-        result_text += f"Output:\n{result['stdout']}"
+        result_text += f"Output:\n{bounded_command_output(result['stdout'])}"
         if result["stderr"]:
-            result_text += f"\n\nErrors:\n{result['stderr']}"
+            result_text += f"\n\nErrors:\n{bounded_command_output(result['stderr'])}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
         result_text = f"Command failed on {result['endpoint']}\n\n"
@@ -50,7 +65,7 @@ async def handle_execute_command(arguments: dict) -> CallToolResult:
         # how far the work got: `build && test` that fails in test discards the whole
         # build log otherwise. Reported after the error so the failure stays first.
         if result.get("stdout"):
-            result_text += f"\n\nOutput:\n{result['stdout']}"
+            result_text += f"\n\nOutput:\n{bounded_command_output(result['stdout'])}"
         return error_result(result_text)
 
 
@@ -109,7 +124,7 @@ async def handle_execute_in_terminal(arguments: dict) -> CallToolResult:
     if result["success"]:
         result_text = f"Command executed in session {session_id}\n\n"
         result_text += f"Command: {result['command']}\n\n"
-        result_text += f"Output:\n{result['output']}"
+        result_text += f"Output:\n{bounded_command_output(result['output'])}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
         return error_result(
@@ -189,7 +204,7 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
         result_text += f"Packages: {', '.join(packages)}\n"
         result_text += f"Package Manager: {package_manager}\n"
         result_text += f"Endpoint: {result['endpoint']}\n\n"
-        result_text += f"Output:\n{result['stdout']}"
+        result_text += f"Output:\n{bounded_command_output(result['stdout'])}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
         result_text = "Software installation failed\n\n"
@@ -198,5 +213,5 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
         # The package manager's own output names the conflict or the missing
         # repository; without it the caller only learns that installing failed.
         if result.get("stdout"):
-            result_text += f"\n\nOutput:\n{result['stdout']}"
+            result_text += f"\n\nOutput:\n{bounded_command_output(result['stdout'])}"
         return error_result(result_text)

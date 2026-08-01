@@ -52,6 +52,16 @@ All notable changes to this project are documented here. Format follows
   Disable it with `--no-copy-url`.
 
 ### Changed
+- `execute_command`, `execute_in_terminal` and `install_software` bound their
+  output to 200,000 characters and state the truncation, where they previously
+  returned it whole; a live server returned five million characters from one
+  call. Every other tool already bounded what it returned. If you relied on an
+  unbounded response, redirect the command's output to a file and read it in
+  parts instead.
+- `file_operations` read refuses a binary file rather than returning its bytes
+  decoded as text. Breaking for a caller that read binary content and decoded
+  it back, which could not have worked: the bytes were already lossy, and past
+  roughly 500 KB the response never arrived at all.
 - The agent setup URL is printed alone at the left margin, under a line naming
   it as the one to hand to an agent, while the informational MCP and health
   URLs stay labelled. Three URLs previously appeared in the same shape with no
@@ -111,6 +121,18 @@ All notable changes to this project are documented here. Format follows
   Windows, where `st_mode` reports `0o666` whatever the ACLs say.
 
 ### Fixed
+- Reading a binary file no longer breaks the MCP connection. Content was
+  decoded with replacement characters and returned as text, and the control
+  characters among it corrupted the event stream carrying the response: a bare
+  carriage return ends a Server-Sent Event, so the JSON message arrived
+  truncated mid-string and the client waited for a reply that could never come.
+  Found against a live server, where it reproduced at every size from 500 KB
+  up, with no error and no timeout - the session simply stopped. Three
+  independent changes close it: every tool result now has carriage returns
+  normalized and other control characters replaced, applied once at dispatch so
+  no handler has to remember; `file_operations` read detects a binary file and
+  says which tools do handle bytes instead of returning them; and no single
+  result may exceed 2,000,000 characters.
 - A failing command no longer discards the output it produced.
   `execute_command`, `install_software`, `docker_operations` and
   `environment_setup` reported only the error, so `make && ./run-tests` that

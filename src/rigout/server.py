@@ -33,6 +33,7 @@ from .tools import (
     handle_manage_tunnels,
     handle_system_monitoring,
 )
+from .tools._results import transport_safe_result
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +338,11 @@ async def handle_list_tools() -> list[Tool]:
 
 async def _handle_call_tool_result(name: str, arguments: dict) -> CallToolResult:
     """Build a CallToolResult for direct tests and wrapper transports."""
+    return transport_safe_result(await _dispatch_tool(name, arguments))
+
+
+async def _dispatch_tool(name: str, arguments: dict) -> CallToolResult:
+    """Route one tool call to its handler, converting any escape into a result."""
     try:
         if name == "connect_hardware":
             return await handle_connect_hardware(arguments)

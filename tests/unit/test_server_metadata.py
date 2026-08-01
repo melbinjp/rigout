@@ -44,7 +44,7 @@ async def test_stdio_initialization_advertises_package_version():
 
 
 def _dispatched_tool_names() -> set[str]:
-    """Tool names the dispatch chain in `_handle_call_tool_result` actually handles.
+    """Tool names the dispatch chain in `_dispatch_tool` actually handles.
 
     Read from the source with `ast` rather than by executing handlers, so this stays
     accurate when the chain moves and never runs a real tool to find out.
@@ -54,7 +54,7 @@ def _dispatched_tool_names() -> set[str]:
     dispatcher = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name == "_handle_call_tool_result"
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name == "_dispatch_tool"
     )
 
     names: set[str] = set()
@@ -82,7 +82,7 @@ async def test_advertised_tools_and_dispatch_chain_agree():
     dispatched = _dispatched_tool_names()
 
     assert advertised, "handle_list_tools returned no tools; the parse below cannot be trusted"
-    assert dispatched, "no dispatch branches found; _handle_call_tool_result may have been restructured"
+    assert dispatched, "no dispatch branches found; _dispatch_tool may have been restructured"
 
     assert advertised - dispatched == set(), (
         f"advertised but never dispatched, so calling these returns 'Unknown tool': {sorted(advertised - dispatched)}"

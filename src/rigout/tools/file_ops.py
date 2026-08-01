@@ -25,18 +25,57 @@ def scrub(text: str) -> str:
     return security_validator.sanitize_command_output(text)
 
 
+# How much of a file is examined to decide whether it is text. A NUL byte in the first
+# few KB is the classic test and is what `grep`, `git` and `file` all effectively use;
+# no real text file contains one.
+BINARY_SNIFF_BYTES = 8192
+
+
+def looks_binary(sample: bytes) -> bool:
+    """Return whether `sample` is bytes rather than text."""
+    return b"\x00" in sample[:BINARY_SNIFF_BYTES]
+
+
+def binary_refusal(path: str, size: int | None) -> str:
+    """Explain that a file is not text, and name the tools that do handle bytes.
+
+    Returning the bytes instead is worse than useless. Decoded with replacement
+    characters they tell the caller nothing, they cost whatever an agent pays for the
+    context they fill, and the control characters among them corrupt the event stream
+    carrying the response, which hung a live session until the client gave up.
+    """
+    measured = f" ({size} bytes)" if size is not None else ""
+    return (
+        f"'{path}'{measured} is a binary file, and file_operations read returns text.\n\n"
+        "Reading it as text would return nothing usable. To work with it instead:\n"
+        "- bulk_file_transfer moves the file without decoding it\n"
+        "- execute_command with `file`, `xxd | head`, or `sha256sum` inspects it in place\n"
+        "- execute_command with `base64` returns it as text if it must travel in a response"
+    )
+
+
 def _read_bounded(path: Path) -> str:
     """Read at most MAX_READ_BYTES, stating plainly when the file was truncated."""
     with path.open("rb") as handle:
         raw = handle.read(MAX_READ_BYTES + 1)
+    if looks_binary(raw):
+        size = path.stat().st_size if path.exists() else None
+        return binary_refusal(str(path), size)
     text = raw[:MAX_READ_BYTES].decode("utf-8", errors="replace")
     if len(raw) > MAX_READ_BYTES:
         text += f"\n\n[truncated: only the first {MAX_READ_BYTES} bytes are shown]"
     return text
 
 
-def _truncate_remote(text: str) -> str:
-    """Apply the same statement of truncation to output of a bounded remote read."""
+def _truncate_remote(text: str, path: str | None = None) -> str:
+    """Apply the same statement of truncation to output of a bounded remote read.
+
+    A remote read arrives already decoded, so the binary test is for a NUL character
+    rather than a NUL byte; it is the same test and it has to happen here too, because
+    a remote binary file breaks the response exactly as a local one does.
+    """
+    if path is not None and "\x00" in text[:BINARY_SNIFF_BYTES]:
+        return binary_refusal(path, None)
     if len(text) > MAX_READ_BYTES:
         return text[:MAX_READ_BYTES] + f"\n\n[truncated: only the first {MAX_READ_BYTES} bytes are shown]"
     return text
@@ -88,7 +127,8 @@ async def handle_file_operations(arguments: dict) -> CallToolResult:
         result_text += f"Path: {path}\n"
         result_text += f"Endpoint: {result['endpoint']}\n"
         if result["stdout"]:
-            result_text += f"\nOutput:\n{_truncate_remote(result['stdout'])}"
+            payload = _truncate_remote(result["stdout"], path if operation == "read" else None)
+            result_text += f"\nOutput:\n{payload}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
         result_text = f"File operation '{operation}' failed\n\n"
