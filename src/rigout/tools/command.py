@@ -4,6 +4,7 @@ from ..ssh_manager import (
     get_tunnel_manager,
     shell_join,
 )
+from ._platform import MACOS, WINDOWS, platform_family
 from ._results import error_result, failure_detail
 
 
@@ -131,13 +132,12 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
         return error_result("No available hardware endpoints")
 
     if package_manager == "auto":
-        endpoint_platform = endpoint.platform.lower()
-        if "win" in endpoint_platform:
+        family = platform_family(endpoint.platform)
+        endpoint_platform = str(endpoint.platform or "").lower()
+        if family == WINDOWS:
             package_manager = "choco"
-        elif "darwin" in endpoint_platform or "mac" in endpoint_platform:
+        elif family == MACOS:
             package_manager = "brew"
-        elif "ubuntu" in endpoint_platform or "debian" in endpoint_platform or "linux" in endpoint_platform:
-            package_manager = "apt"
         elif "centos" in endpoint_platform or "rhel" in endpoint_platform:
             package_manager = "yum"
         else:

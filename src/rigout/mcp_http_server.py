@@ -209,6 +209,10 @@ def build_connection_data(
         "security": {
             "ai_agent_mode": True,
             "bypass_security_available": True,
+            # Deprecated, retained through 0.3.x so a client that reads this key gets None
+            # instead of a KeyError. Rigout no longer writes an audit-log file; read activity
+            # through the tool named in activity_access. Scheduled for removal in 0.4.0.
+            "audit_log": None,
             "activity_access": {
                 "tool": "get_server_activity",
                 "format": "json",

@@ -6,11 +6,14 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from mcp.types import CallToolResult
+from mcp.types import CallToolResult, ImageContent, ResourceLink, TextContent
 
+from rigout import server as rigout_server
+from rigout.security_validator import security_validator
 from rigout.ssh_manager import TunnelManager
 from rigout.terminal_session import LocalTerminalSession
 from rigout.tools import (
+    file_ops,
     handle_bulk_file_transfer,
     handle_close_terminal_session,
     handle_connect_hardware,
@@ -558,3 +561,236 @@ class TestTerminalSessionSecurity:
         assert limited.isError is True
         assert "Rate limit exceeded" in limited.content[0].text
         assert session.executed == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestCallToolErrorChannel:
+    """The MCP error round trip must not discard content blocks silently."""
+
+    async def _raise_from(self, content):
+        result = CallToolResult(content=content, isError=True)
+        with patch("rigout.server._handle_call_tool_result", AsyncMock(return_value=result)):
+            with pytest.raises(RuntimeError) as excinfo:
+                await rigout_server.handle_call_tool("file_operations", {})
+        return str(excinfo.value)
+
+    async def test_text_only_error_message_is_unchanged(self):
+        """The common case must keep the exact message it has today."""
+        message = await self._raise_from([TextContent(type="text", text="File operation failed")])
+        assert message == "File operation failed"
+
+    async def test_empty_error_content_falls_back_to_tool_name(self):
+        message = await self._raise_from([])
+        assert message == "Tool 'file_operations' failed"
+
+    async def test_non_text_error_content_is_not_dropped_silently(self):
+        """An image or resource on an error path must survive into the message.
+
+        The SDK can only signal isError by raising, and renders the exception as a
+        single string, so these cannot survive as blocks. They must not vanish.
+        """
+        message = await self._raise_from(
+            [
+                TextContent(type="text", text="Capture failed"),
+                ImageContent(type="image", data="aGk=", mimeType="image/png"),
+                ResourceLink(
+                    type="resource_link",
+                    uri="file:///var/log/rigout.log",
+                    name="rigout.log",
+                ),
+            ]
+        )
+
+        assert "Capture failed" in message
+        assert "image" in message
+        assert "file:///var/log/rigout.log" in message
+
+    async def test_error_content_without_any_text_block_is_still_reported(self):
+        """A purely non-text error must not collapse to a bare fallback."""
+        message = await self._raise_from([ImageContent(type="image", data="aGk=", mimeType="image/png")])
+
+        assert message != "Tool 'file_operations' failed"
+        assert "image" in message
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestFileOperationsParity:
+    """The local and SSH branches of file_ops must not disagree about safety."""
+
+    SECRET = "export API_KEY=sk-live-ABCDEFG\npassword=hunter2\ntoken=ghp_realtokenvalue\n"
+
+    @pytest.fixture
+    def local_manager(self):
+        endpoint = MagicMock()
+        endpoint.private_key_path = "__local__"
+        manager = MagicMock()
+        manager.auto_failover = AsyncMock(return_value=endpoint)
+        with patch("rigout.tools.file_ops.get_tunnel_manager", return_value=manager):
+            yield manager
+
+    @pytest.fixture
+    def remote_manager(self):
+        endpoint = MagicMock()
+        endpoint.private_key_path = "/home/agent/.ssh/id_ed25519"
+        manager = MagicMock()
+        manager.auto_failover = AsyncMock(return_value=endpoint)
+        manager.execute_command = AsyncMock(return_value={"success": True, "endpoint": "test-host", "stdout": ""})
+        with patch("rigout.tools.file_ops.get_tunnel_manager", return_value=manager):
+            yield manager
+
+    @pytest.fixture
+    def secret_file(self, tmp_path):
+        target = tmp_path / "secretfile.env"
+        target.write_text(self.SECRET, encoding="utf-8")
+        return target
+
+    async def test_local_read_redacts_credentials(self, local_manager, secret_file):
+        """A secret refused through execute_command must not be handed over here."""
+        result = await handle_file_operations({"operation": "read", "path": str(secret_file)})
+
+        text = result.content[0].text
+        assert "sk-live-ABCDEFG" not in text
+        assert "hunter2" not in text
+        assert "ghp_realtokenvalue" not in text
+        assert "api_key=***" in text
+        assert "password=***" in text
+
+    async def test_local_bulk_download_redacts_credentials(self, local_manager, secret_file, tmp_path):
+        """The same leak was reachable through the transfer tool."""
+        result = await handle_bulk_file_transfer(
+            {"operation": "download", "source": str(secret_file), "destination": str(tmp_path / "out")}
+        )
+
+        text = result.content[0].text
+        assert "sk-live-ABCDEFG" not in text
+        assert "hunter2" not in text
+        assert "api_key=***" in text
+
+    async def test_local_read_is_bounded_and_says_so(self, local_manager, tmp_path):
+        """An unbounded read exhausts memory and floods the model's context."""
+        big = tmp_path / "big.txt"
+        big.write_bytes(b"A" * (file_ops.MAX_READ_BYTES + 5000))
+
+        result = await handle_file_operations({"operation": "read", "path": str(big)})
+
+        text = result.content[0].text
+        assert len(text) < file_ops.MAX_READ_BYTES + 500
+        assert "truncated" in text
+
+    async def test_local_delete_refuses_a_directory_without_recursive(self, local_manager, tmp_path):
+        """Passing a directory by mistake must not silently destroy the tree."""
+        target = tmp_path / "logdir"
+        (target / "nested").mkdir(parents=True)
+        (target / "nested" / "keep.txt").write_text("important", encoding="utf-8")
+
+        result = await handle_file_operations({"operation": "delete", "path": str(target)})
+
+        assert result.isError is True
+        assert "recursive=true" in result.content[0].text
+        assert (target / "nested" / "keep.txt").exists()
+
+    async def test_local_delete_removes_a_directory_when_asked(self, local_manager, tmp_path):
+        target = tmp_path / "logdir"
+        target.mkdir()
+        (target / "a.txt").write_text("x", encoding="utf-8")
+
+        result = await handle_file_operations({"operation": "delete", "path": str(target), "recursive": True})
+
+        assert result.isError is False
+        assert not target.exists()
+
+    async def test_remote_delete_is_recursive_only_when_asked(self, remote_manager):
+        """The SSH branch must follow the same rule as the local branch."""
+        await handle_file_operations({"operation": "delete", "path": "/tmp/logdir"})
+        plain = remote_manager.execute_command.await_args.args[1]
+
+        await handle_file_operations({"operation": "delete", "path": "/tmp/logdir", "recursive": True})
+        recursive = remote_manager.execute_command.await_args.args[1]
+
+        assert plain.startswith("rm -f ")
+        assert recursive.startswith("rm -rf ")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Use the `rm` builtin carefully.\n",
+            "VER=$(git rev-parse HEAD)\n",
+            "cd /tmp && rm stale.log\n",
+            "it's got an apostrophe\n",
+            "'; rm -rf / #\n",
+            "-leading-dash\n",
+            "100% coverage\n",
+            "",
+        ],
+    )
+    async def test_remote_write_and_append_accept_ordinary_file_content(self, remote_manager, content):
+        """Ordinary file content must be writable and must stay inert.
+
+        Content reaches the shell single-quoted, so it can never be read as syntax
+        no matter what it holds. Every command built here therefore has to pass
+        validation on its own merits: writes must not need a security bypass.
+        """
+        for operation in ("write", "append"):
+            await handle_file_operations(
+                {"operation": operation, "path": "/tmp/notes.md", "content": content}
+            )
+            command = remote_manager.execute_command.await_args.args[1]
+
+            is_safe, err = security_validator.validate_command(command)
+            assert is_safe is True, f"{operation} of {content!r} was refused: {err}"
+            assert not remote_manager.execute_command.await_args.kwargs.get("bypass_security", False)
+
+    async def test_remote_upload_accepts_ordinary_content_without_a_bypass(self, remote_manager):
+        await handle_bulk_file_transfer({"operation": "upload", "source": "x=$(id)\n", "destination": "/tmp/x.sh"})
+
+        call = remote_manager.execute_command.await_args
+        assert not call.kwargs.get("bypass_security", False)
+        assert security_validator.validate_command(call.args[1])[0] is True
+
+    @pytest.mark.parametrize("operation", ["write", "append"])
+    @pytest.mark.parametrize("device", ["/dev/sda", "/dev/nvme0n1", "/dev/mem"])
+    async def test_remote_write_to_a_raw_device_is_still_refused(self, remote_manager, operation, device):
+        """Not bypassing validation is what keeps this protection reachable.
+
+        A write is a real command once the content is quoted, so redirecting one at
+        a raw disk stays blocked. Passing bypass_security would have discarded this.
+
+        Append is covered because it is a separate code path, not because it is
+        fragile: two independent rules refuse it. `_semantic_danger` lists `>>` in
+        its redirect tokens by design, and the `[<>]` DANGEROUS_PATTERNS entry also
+        matches the first chevron of `>>`. Disabling either one alone leaves this
+        test green, which is the point of asserting the property rather than the
+        mechanism -- the test survives a rewrite of either rule.
+        """
+        await handle_file_operations({"operation": operation, "path": device, "content": "x"})
+
+        command = remote_manager.execute_command.await_args.args[1]
+        is_safe, err = security_validator.validate_command(command)
+        assert is_safe is False, f"{operation} to {device} must be refused: {command!r}"
+        assert "dangerous pattern" in err.lower()
+
+    async def test_remote_operations_never_bypass_validation(self, remote_manager):
+        """No file operation disables the validator, including the content ones."""
+        for arguments in (
+            {"operation": "read", "path": "/tmp/a"},
+            {"operation": "write", "path": "/tmp/a", "content": "x"},
+            {"operation": "append", "path": "/tmp/a", "content": "x"},
+            {"operation": "delete", "path": "/tmp/a"},
+            {"operation": "copy", "path": "/tmp/a", "destination": "/tmp/b"},
+            {"operation": "move", "path": "/tmp/a", "destination": "/tmp/b"},
+            {"operation": "chmod", "path": "/tmp/a", "permissions": "755"},
+        ):
+            await handle_file_operations(arguments)
+            assert not remote_manager.execute_command.await_args.kwargs.get("bypass_security", False)
+
+    async def test_remote_read_is_bounded_at_the_source(self, remote_manager):
+        """Bounding only the local branch would recreate the asymmetry being fixed."""
+        expected = f"head -c {file_ops.MAX_READ_BYTES + 1} "
+
+        await handle_file_operations({"operation": "read", "path": "/tmp/big.log"})
+        assert remote_manager.execute_command.await_args.args[1].startswith(expected)
+
+        await handle_bulk_file_transfer({"operation": "download", "source": "/tmp/big.log", "destination": "/tmp/x"})
+        assert remote_manager.execute_command.await_args.args[1].startswith(expected)

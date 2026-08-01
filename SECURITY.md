@@ -30,6 +30,16 @@ Connection file written before its permissions were restricted. Affects 0.2.0 an
 
 If another account could read the directory that held your connection file, treat the bearer token in it as exposed and rotate it: stop the server, delete the connection file, and start again to generate a new token.
 
+Local file reads and downloads returned unscrubbed content. Affects 0.2.0 and earlier, fixed in 0.3.0.
+
+A `file_operations` read, and a `bulk_file_transfer` download, against the local endpoint returned the file's contents to the caller exactly as they sat on disk. The same two operations against an SSH endpoint were built as shell commands and run through `execute_command`, which redacts common credential patterns from what it returns, so the same file was scrubbed on one path and handed over verbatim on the other. Content returned this way reaches the calling agent and travels onward to whatever model serves it.
+
+Local mode is enabled by default and answers whenever no SSH endpoint is configured or reachable. Rigout tries the active SSH endpoint first, then the best available one, and falls back to the local device, so for anyone who never registered an SSH endpoint the local path served every call.
+
+0.3.0 applies the same redaction to content returned by local operations, so both paths now return the same text for the same file.
+
+If an agent read a credentials file, a private key, or a `.env` through local mode on an affected version, treat those secrets as disclosed to your model provider and rotate them. Work that used SSH endpoints exclusively was not affected.
+
 ## Recommended Deployment
 
 - Run Rigout in a VM, container, or dedicated machine when giving an agent broad control.

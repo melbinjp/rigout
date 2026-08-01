@@ -32,12 +32,46 @@ All notable changes to this project are documented here. Format follows
 - Production validation gained three categories: the required lint, format,
   and type-check gates; live runtime contracts (server version, `isError` on
   unknown tools, connection-endpoint auth headers); and a wheel/sdist build.
+- `build_write_command` is exported from the package root. It builds the
+  command that writes content to a path, and spells append as well as write.
 
 ### Changed
 - `connection.json` and `/health` now report the running package version, and
   `connection.json` advertises the `server_activity` capability.
 - GitHub Actions bumped: `checkout` v4 to v7, `setup-python` v5 to v6,
   `upload-artifact` v4 to v7, `download-artifact` v4 to v8 (#17).
+- Recursive force deletes are now refused by target rather than by pattern.
+  The old check matched any absolute path, so `rm -rf /tmp/build` was refused
+  while a quoted or long-flag spelling such as `'rm' -Rf /usr` went through.
+  A recursive forced delete is now refused when its target is the filesystem
+  root or one of the top-level system directories, and permitted below them.
+  Both halves are behaviour changes: `/usr` and its siblings are protected
+  against spellings that previously evaded the check, and ordinary work such
+  as `rm -rf /tmp/build` or `rm -rf /home/you/project` is no longer blocked.
+  If you relied on the old check to refuse deletes anywhere under an absolute
+  path, it no longer will.
+- `file_operations` reads at most 1 MiB and states in its output when a file
+  was truncated, rather than returning it whole. A remote read is bounded at
+  the source with `head -c`, so the transfer is capped rather than only the
+  reported output. The tool gained a `recursive` argument, and `delete` now
+  refuses a directory unless it is set, where a local delete previously
+  removed the tree outright and the remote path errored. That last one is
+  breaking for any agent that relied on `delete` recursing on a local path.
+- `dd` is judged by its operands rather than by its flags. Any `dd` naming both
+  an input and an output was refused, so `dd if=/dev/urandom of=/tmp/testfile`
+  was blocked. It is refused now when either operand names a raw device, which
+  keeps both directions covered: writing over a disk, and copying a disk or
+  kernel memory out to a readable file.
+- A chained `rm` is judged the same way the unchained command would be.
+  `cd /tmp && rm stale.log` and `make clean; rm -f core.dump` were refused for
+  following an operator at all, while the identical commands on their own were
+  permitted. A chain that reaches a protected directory, such as
+  `ls; rm -rf /`, is still refused.
+
+### Deprecated
+- `heredoc_redirect` is an alias for `build_write_command` and no longer
+  involves a heredoc. It stays exported because 0.2.0 exported it, so removing
+  it would break anyone already importing it. Removal is planned for 0.4.0.
 
 ### Removed
 - `security.audit_log` is gone from `connection.json`, and the
@@ -45,6 +79,15 @@ All notable changes to this project are documented here. Format follows
   client reading that field breaks on upgrade. Read activity through
   `security.activity_access` instead, which names the `get_server_activity`
   tool and its 200-line ceiling.
+- `SecurityValidator.validate_file_path` and `SecurityValidator.validate_ssh_key`
+  are gone. `SecurityValidator` is exported from the package, so this is a
+  public API removal and an external caller of either method breaks on
+  upgrade. Nothing in Rigout called them. Both were worse than no check: the
+  path check was routed around in one step, because `execute_command` hands
+  over the same files with `cat`, while it refused any relative path
+  containing `..` and any write under `/root`, which breaks container
+  workflows where root is the login user. The key check rejected every key on
+  Windows, where `st_mode` reports `0o666` whatever the ACLs say.
 
 ### Fixed
 - Setup-token handling: tokens expire after 15 minutes by default, are
@@ -62,8 +105,12 @@ All notable changes to this project are documented here. Format follows
   server logs one concise summary instead of a large Pydantic union dump.
 - Shell validation now treats quoted text as data rather than syntax, so a
   quoted control operator no longer reads as one. Destructive-command
-  protection is retained and extended to raw device redirection, an
-  executable `rm -rf /`, and commands nested inside `bash -c`.
+  protection is retained and extended to raw device redirection, commands
+  nested inside `bash -c`, and destructive executables whose names were hidden
+  by quoting: `mkfs`, `fdisk`, `parted`, `format`, `dd` with both `if=` and
+  `of=`, Windows `del`/`rmdir` with `/s` or `/q`, and `curl` or `wget` piped
+  into a shell. Recursive deletes are covered by the protected-root rule
+  described under Changed.
 - Package, HTTP, and stdio server version reporting now use the same package
   metadata source; the stdio server previously advertised a hardcoded
   `1.0.0`.
@@ -116,6 +163,54 @@ All notable changes to this project are documented here. Format follows
   home-relative rather than absolute, so a remote agent no longer learns the
   operator's account name from the path. New in 0.3.0: the tool ships for the
   first time in this release.
+- A remote `write` or `append` is validated in full and no longer has the
+  file's contents inspected as though they were shell syntax. Writing a file
+  that merely mentions a dangerous command is no longer refused, while writing
+  to a raw device still is. Nothing is waived to achieve it: the content
+  travels as quoted data, which the quoted-text rule above already treats as
+  inert, so the write is never exempted from validation the way it once was.
+- A remote `write` or `append` no longer adds a byte the caller did not ask
+  for. Every remote write gained exactly one trailing newline, so content that
+  had none grew by a byte and empty content produced a one-byte file, while
+  the local branch of the same tool wrote the bytes exactly. The same call
+  produced different files depending on which endpoint answered, and both
+  reported success. Anyone who wrote a checksum, a PEM block, base64 or a JSON
+  document to a remote host on 0.2.0 or earlier has a file that differs by one
+  byte from what they asked for.
+- The error text of a failed local `file_operations` or `bulk_file_transfer`
+  is scrubbed for credentials, alongside the content those paths return. Error
+  text is worth scrubbing in its own right, because a decoding failure quotes
+  the bytes that caused it, so a file's contents can leave through the error
+  channel as readily as through the result.
+- macOS is no longer treated as Windows in local mode. The local endpoint
+  records what `platform.system()` reports, which is `darwin`, and the tools
+  asked whether the platform contained `win` - true of `darwin`. A Mac was
+  therefore sent PowerShell commands, `if not exist` against `/bin/sh`, and
+  Chocolatey rather than Homebrew. Platform detection now matches whole tokens,
+  and the Windows predicate refuses any macOS token outright, so a future
+  caller that checks only for Windows still cannot fire on a Mac.
+- `rigout stop` can always exit a state it could not previously leave. A stale
+  reservation combined with a reused PID left `status` reporting running,
+  `stop` refusing to act on a PID it could not verify, and `start` refusing to
+  launch, with no command able to clear it - the state directory had to be
+  deleted by hand. `stop --force` clears state that cannot be verified as
+  Rigout's. It signals no process it cannot confirm, so if a stray server is
+  genuinely running, it survives and is still yours to stop.
+- A command rejected inside `bash -c` reports `Nested shell command rejected:`
+  followed by the reason, instead of wrapping the reason in the outer
+  dangerous-pattern prefix a second time.
+- An MCP error result describes non-text content blocks instead of dropping
+  them. The SDK renders an error as a single string, so an image or embedded
+  resource cannot survive as a block; it is now named in the message rather
+  than disappearing without trace.
+- `security_config.max_requests_per_minute` is read and enforced. The key was
+  validated and reported but never applied, so every install ran at the
+  built-in 60 per endpoint whatever the configuration said. Anyone who set it
+  now gets the value they chose, which is a tightening for those who set it
+  lower and a loosening for those who set it higher; the effective limit is
+  logged when it differs from the default. Setting
+  `security_config.enable_rate_limiting` to false is still not honoured, and
+  now says so on startup rather than being ignored silently.
 
 ### Security
 - `rigout start` bound to a non-loopback host served every tool without
@@ -156,6 +251,18 @@ All notable changes to this project are documented here. Format follows
   files use, which creates the file owner-only and moves it into place, so the
   token is never present at the destination under loose permissions. This
   affects 0.2.0 and earlier.
+- A local `file_operations` read and a local `bulk_file_transfer` download
+  returned file contents without scrubbing credentials from them, so reading a
+  file of secrets handed them to the calling agent and onward to whatever model
+  serves it. The same read against an SSH endpoint was scrubbed, because that
+  path goes through `execute_command`; only the local branch was exposed. Local
+  mode is on unless `RIGOUT_LOCAL_MODE` is disabled, and it answers whenever no
+  SSH endpoint is configured or reachable, so anyone running Rigout against
+  their own machine was on the unscrubbed path for every read. Using SSH
+  endpoints exclusively was not affected. Both local paths now scrub. This
+  affects 0.2.0 and earlier. If an agent read a credentials file, a private key
+  or a `.env` through local mode, treat those secrets as disclosed to your
+  model provider and rotate them.
 
 ## [0.2.0] - 2026-07-09
 

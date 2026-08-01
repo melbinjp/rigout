@@ -33,7 +33,10 @@ rigout status
 rigout logs --tail 100
 rigout logs --follow
 rigout stop
+rigout stop --force
 ```
+
+`stop --force` clears recorded state that cannot be verified as Rigout's. It signals no process.
 
 Machine-readable commands:
 
@@ -45,6 +48,14 @@ rigout stop --output json
 ```
 
 `--output json` startup requires `--detach`. `logs --follow` is text-only.
+
+Exit codes: 0 succeeded, or `status` found Rigout running. 1 nothing to report or the command failed, including `status` when Rigout is not running. 2 usage error. `stop` exits 0 when nothing was running.
+
+## Connect your agent
+
+Read `connection.json` from the state directory; `rigout status` prints its path. Its `mcp` object holds `transport` (`streamable-http`), `url`, `health_url`, and `headers`. Register `url` with your MCP client as a streamable HTTP server and send every header in `headers`. Client-side field names come from your client's documentation, not from Rigout.
+
+`headers` is empty on a plain local server. With a token it is `{"Authorization": "Bearer <token>"}`, and the connection file is the only place that token is written.
 
 ## Source checkout
 
@@ -67,6 +78,7 @@ rigout-stdio
 - `connection.json`: generated MCP client configuration; contains the bearer token.
 - `activity.log`: managed startup/runtime output.
 - `runtime.json` and `rigout.pid`: credential-free lifecycle metadata.
+- `rigout.lock`: contentless lock that serializes concurrent lifecycle commands; recreated on demand.
 - `pyproject.toml`: package metadata and build configuration.
 - `src/rigout/`: package source.
 - `tests/`: pytest coverage.

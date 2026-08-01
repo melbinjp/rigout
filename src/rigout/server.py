@@ -1,12 +1,14 @@
 import asyncio
 import logging
 import sys
+from collections.abc import Sequence
 
 from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import (
     CallToolResult,
+    ContentBlock,
     TextContent,
     Tool,
 )
@@ -234,6 +236,11 @@ async def handle_list_tools() -> list[Tool]:
                     "destination": {"type": "string", "description": "Destination path for copy/move operations"},
                     "permissions": {"type": "string", "description": "Permissions for chmod operation (e.g., '755')"},
                     "owner": {"type": "string", "description": "Owner for chown operation (e.g., 'user:group')"},
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "Required to delete a directory and everything inside it",
+                        "default": False,
+                    },
                 },
                 "required": ["operation", "path"],
             },
@@ -373,13 +380,34 @@ async def _handle_call_tool_result(name: str, arguments: dict) -> CallToolResult
         )
 
 
+def _error_message(name: str, content: Sequence[ContentBlock]) -> str:
+    """Flatten error content into the single string the MCP error channel allows.
+
+    An error cannot travel out of here as a result: the SDK's call_tool handler
+    hardcodes ``isError=False`` on its success path and only sets ``isError=True``
+    by catching an exception, which it renders as one TextContent. Non-text blocks
+    therefore cannot survive as blocks. Describe them instead of filtering them out,
+    so an image or embedded resource on an error path is visible in the message
+    rather than disappearing without a trace.
+    """
+    parts: list[str] = []
+    for item in content:
+        text = getattr(item, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+        kind = getattr(item, "type", None) or type(item).__name__
+        uri = getattr(item, "uri", None) or getattr(getattr(item, "resource", None), "uri", None)
+        parts.append(f"[{kind} content: {uri}]" if uri else f"[{kind} content]")
+    return "\n".join(parts) or f"Tool '{name}' failed"
+
+
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle tool calls from MCP clients."""
     result = await _handle_call_tool_result(name, arguments)
     if result.isError:
-        message = "\n".join(item.text for item in result.content if isinstance(item, TextContent))
-        raise RuntimeError(message or f"Tool '{name}' failed")
+        raise RuntimeError(_error_message(name, result.content))
     return result.content  # type: ignore
 
 

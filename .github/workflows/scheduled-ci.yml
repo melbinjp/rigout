@@ -1,0 +1,365 @@
+name: Scheduled CI
+
+# Why this workflow exists.
+#
+# ci.yml only runs on push and pull_request. Dependencies are resolved fresh at
+# install time, so CI would have caught the mcp 2.0.0 breakage - but nothing was
+# pushed after mcp 2.0.0 was published, so no run happened and nobody was told. A
+# dependency published after the last commit can break `pip install rigout` for
+# every new user, silently and indefinitely.
+#
+# This is a SEPARATE workflow rather than a `schedule:` trigger added to ci.yml so
+# that the push/PR behaviour of ci.yml is provably unchanged, and so that the jobs
+# added here (fresh install, failure reporting) can never appear as new required
+# status checks on a pull request.
+#
+# Note: GitHub only runs `schedule:` triggers on the repository's DEFAULT branch.
+# This file does nothing until it is merged to main.
+
+on:
+  schedule:
+    # 06:17 UTC every Monday.
+    #
+    # Weekly, because it is matched to dependabot's weekly cadence: dependabot
+    # proposes in-range bumps as PRs that run full CI, so the unique job of this
+    # run is to catch what dependabot cannot - breakage from *transitive*
+    # dependencies (httpx, anyio, h11, pydantic and friends arrive via mcp and
+    # starlette and are managed by nobody) and from runner image changes. Daily
+    # would cut worst-case exposure from 7 days to 1, but this matrix is ~21 jobs
+    # across three operating systems, and paying that every day to shorten a
+    # window that dependabot already covers for direct dependencies is not a
+    # trade worth making.
+    #
+    # Off the hour on purpose: GitHub delays or silently drops scheduled runs
+    # that pile up on the hour. Monday morning UTC so a failure is waiting at the
+    # start of the week rather than ageing over a weekend.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-ci
+  cancel-in-progress: false
+
+jobs:
+  # The exact same jobs the push/PR runs execute, via ci.yml's workflow_call.
+  # Reusing it means this can never drift from what CI actually checks.
+  full-ci:
+    name: Full CI
+    uses: ./.github/workflows/ci.yml
+
+  # ci.yml installs `-e ".[dev]"`. That is not what a user gets. This builds the
+  # wheel and installs it alone, so only the runtime dependency set is resolved -
+  # which is the thing that actually breaks when a dependency ships a new major.
+  fresh-install:
+    name: Fresh Install (${{ matrix.os }} - Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+        # Oldest and newest supported: the two ends where resolution breaks first.
+        python-version: ["3.10", "3.14"]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build Wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A stale dist/ from an earlier build would be installed silently, so the
+          # run would test a wheel that is not the one this commit produces.
+          rm -rf dist
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          expected="$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          echo "EXPECTED_VERSION=$expected" >> "$GITHUB_ENV"
+          count="$(ls dist/*.whl | wc -l)"
+          if [ "$count" -ne 1 ]; then
+            echo "expected exactly one wheel in dist/, found $count:" >&2
+            ls -l dist >&2
+            exit 1
+          fi
+          wheel="$(ls dist/*.whl)"
+          case "$(basename "$wheel")" in
+            rigout-"$expected"-*) echo "built $wheel (version $expected)" ;;
+            *) echo "wheel $wheel does not match pyproject version $expected" >&2; exit 1 ;;
+          esac
+
+      - name: Install The Wheel Into A Clean Environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv fresh-env
+          # Absolute, so later steps can cd elsewhere and still invoke these.
+          if [ -d fresh-env/Scripts ]; then
+            venv_bin="$(pwd)/fresh-env/Scripts"
+          else
+            venv_bin="$(pwd)/fresh-env/bin"
+          fi
+          echo "VENV_BIN=$venv_bin" >> "$GITHUB_ENV"
+          echo "VENV_PYTHON=$venv_bin/python" >> "$GITHUB_ENV"
+          "$venv_bin/python" -m pip install --upgrade pip
+          # No --no-deps and no dev extra: this must resolve runtime deps from
+          # PyPI exactly as `pip install rigout` will for a user.
+          "$venv_bin/python" -m pip install dist/*.whl
+          installed="$("$venv_bin/python" -c "import importlib.metadata as m;print(m.version('rigout'))")"
+          if [ "$installed" != "$EXPECTED_VERSION" ]; then
+            echo "installed rigout $installed but pyproject declares $EXPECTED_VERSION" >&2
+            exit 1
+          fi
+          echo "installed rigout $installed"
+
+      - name: Show Resolved Dependency Versions
+        shell: bash
+        run: |
+          "$VENV_PYTHON" -m pip freeze
+
+      - name: Import Every Shipped Module
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Run from a directory with no src/ on the path, so this genuinely
+          # exercises the installed package rather than the checkout.
+          cd "$RUNNER_TEMP"
+          # The package is walked rather than listed. A hardcoded list rots in
+          # both directions: it misses every module added later, and it breaks
+          # the run when one is removed.
+          "$VENV_PYTHON" - <<'PY'
+          import importlib
+          import pkgutil
+          import sys
+
+          import rigout
+
+          failed = []
+          found = 0
+          for module in pkgutil.walk_packages(rigout.__path__, "rigout."):
+              found += 1
+              try:
+                  importlib.import_module(module.name)
+              except Exception as exc:  # noqa: BLE001 - any failure is a failure
+                  failed.append((module.name, exc))
+
+          print(f"rigout {rigout.__version__}: walked {found} modules")
+          for name, exc in failed:
+              print(f"FAILED {name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+          if failed:
+              sys.exit(1)
+          if not found:
+              print("walked zero modules - the package looks empty", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Run The Console Scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+
+          # Checks the entry points a user actually gets, not `python -m rigout...`.
+          # Module execution succeeds even if [project.scripts] is misspelled, points
+          # at a function that does not exist, or is dropped entirely.
+          #
+          # The names are read from the INSTALLED distribution metadata, so this
+          # cannot rot as scripts are added or removed, and `ep.load()` resolves the
+          # module and the attribute without calling them.
+          #
+          # Deliberately NOT `--help` on every script: rigout-stdio maps to
+          # server.py:stdio_main, which has no argument parser. It would ignore
+          # --help, start a real stdio MCP server and block until the job timed out.
+          "$VENV_PYTHON" - <<'PY'
+          import importlib.metadata as metadata
+          import sys
+
+          entry_points = [
+              ep
+              for ep in metadata.distribution("rigout").entry_points
+              if ep.group == "console_scripts"
+          ]
+          if not entry_points:
+              print("the installed rigout exposes no console_scripts", file=sys.stderr)
+              sys.exit(1)
+
+          failed = []
+          for ep in entry_points:
+              try:
+                  target = ep.load()
+              except Exception as exc:  # noqa: BLE001 - any failure is a failure
+                  failed.append(f"{ep.name} = {ep.value} -> {type(exc).__name__}: {exc}")
+                  continue
+              if not callable(target):
+                  failed.append(f"{ep.name} = {ep.value} -> resolved to a non-callable {target!r}")
+                  continue
+              print(f"entry point OK: {ep.name} = {ep.value}")
+
+          for line in failed:
+              print(f"BROKEN entry point: {line}", file=sys.stderr)
+          sys.exit(1 if failed else 0)
+          PY
+
+          # And prove pip actually put an executable on disk for each of them.
+          scripts="$("$VENV_PYTHON" -c "
+          import importlib.metadata as m
+          print(' '.join(e.name for e in m.distribution('rigout').entry_points if e.group == 'console_scripts'))
+          ")"
+          for script in $scripts; do
+            if [ -x "$VENV_BIN/$script" ]; then
+              executable="$VENV_BIN/$script"
+            elif [ -x "$VENV_BIN/$script.exe" ]; then
+              executable="$VENV_BIN/$script.exe"   # Windows
+            else
+              echo "console script '$script' was not installed into $VENV_BIN" >&2
+              ls -l "$VENV_BIN" >&2
+              exit 1
+            fi
+            echo "installed executable OK: $executable"
+          done
+
+          # rigout is the one script with a real parser, so it gets genuinely run.
+          # stdin is closed and the call is bounded so this can never hang the job.
+          if [ -x "$VENV_BIN/rigout" ] || [ -x "$VENV_BIN/rigout.exe" ]; then
+            "$VENV_BIN/rigout" --help < /dev/null > /dev/null
+            echo "executed: rigout --help"
+          fi
+
+  # The failure mode of the capping policy in pyproject.toml is the opposite of
+  # the one it prevents: a cap can silently freeze a dependency forever if nothing
+  # ever proposes raising it. Dependabot normally does, but its pip strategy is
+  # chosen automatically and `widen` cannot be requested explicitly for pip, so
+  # this does not rely on it. Reports only - it must never fail the run, because a
+  # new major being available is news, not breakage.
+  held-back-majors:
+    name: Report Dependencies Held Back By Caps
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Compare Caps Against Latest On PyPI
+        continue-on-error: true
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, tomllib, urllib.request
+          from urllib.error import URLError
+
+          with open("pyproject.toml", "rb") as handle:
+              deps = tomllib.load(handle)["project"]["dependencies"]
+
+          print("## Dependencies held back by a version cap\n")
+          rows = []
+          for spec in deps:
+              name = spec.split(">")[0].split("<")[0].split("=")[0].strip()
+              cap = spec.split("<")[1].strip() if "<" in spec else None
+              try:
+                  with urllib.request.urlopen(
+                      f"https://pypi.org/pypi/{name}/json", timeout=30
+                  ) as response:
+                      latest = json.load(response)["info"]["version"]
+              except (URLError, KeyError, ValueError) as exc:
+                  rows.append(f"| {name} | ? | {cap or '-'} | lookup failed: {exc} |")
+                  continue
+              if cap and int(latest.split(".")[0]) >= int(cap.split(".")[0]):
+                  rows.append(f"| {name} | {latest} | <{cap} | **held back - test and raise the cap** |")
+              else:
+                  rows.append(f"| {name} | {latest} | {'<' + cap if cap else 'uncapped'} | ok |")
+
+          print("| package | latest on PyPI | cap | status |")
+          print("| --- | --- | --- | --- |")
+          for row in rows:
+              print(row)
+          PY
+
+  # A red run nobody looks at is not a safety net. Scheduled-run failures do not
+  # appear on anyone's PR, so this turns one into a tracked, notifying issue.
+  report-failure:
+    name: Report Failure
+    needs: [full-ci, fresh-install]
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open Or Update The Failure Issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Idempotent: the label may already exist from a previous failure.
+          gh label create scheduled-ci-failure \
+            --repo "$REPO" \
+            --color B60205 \
+            --description "A scheduled CI run failed without any code change" \
+            2>/dev/null || true
+
+          body="$(cat <<EOF
+          The scheduled CI run failed. No code changed, so this is almost certainly
+          a newly published dependency (direct or transitive) breaking the build.
+
+          Failed run: $RUN_URL
+
+          Check the resolved versions in the \`Show Resolved Dependency Versions\`
+          step of the Fresh Install jobs against the bounds in \`pyproject.toml\`.
+
+          This issue is updated rather than duplicated on each subsequent failure,
+          and closed automatically when a scheduled run next passes.
+          EOF
+          )"
+
+          existing="$(gh issue list --repo "$REPO" \
+            --label scheduled-ci-failure --state open \
+            --json number --jq '.[0].number // empty')"
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            echo "Commented on existing issue #$existing"
+          else
+            gh issue create --repo "$REPO" \
+              --title "Scheduled CI is failing" \
+              --label scheduled-ci-failure \
+              --body "$body"
+          fi
+
+  # Close the failure issue once a scheduled run is green again, so an open issue
+  # always means "currently broken" and the signal stays worth trusting.
+  clear-failure:
+    name: Clear Failure Report
+    needs: [full-ci, fresh-install]
+    if: ${{ always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Close Any Open Failure Issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --repo "$REPO" \
+            --label scheduled-ci-failure --state open \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$REPO" \
+              --comment "A scheduled CI run passed again: $RUN_URL"
+            echo "Closed issue #$existing"
+          else
+            echo "No open failure issue to close."
+          fi

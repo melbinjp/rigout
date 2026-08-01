@@ -1,7 +1,60 @@
+import contextlib
+import logging
+from pathlib import Path
+
 from mcp.types import CallToolResult, TextContent
 
 from ..ssh_manager import get_tunnel_manager
+from ._platform import platform_family, platform_tokens
 from ._results import error_result
+
+logger = logging.getLogger(__name__)
+
+
+def platform_matches(preferred: object, candidate_platform: object) -> bool:
+    """Decide whether an endpoint satisfies a preferred_platform request.
+
+    `windows`, `linux` and `macos` are matched by family, so an endpoint
+    labelled "Ubuntu 22.04" satisfies a request for linux and a Mac ("darwin")
+    never satisfies a request for windows. Anything else, such as "docker",
+    falls back to a token match on the label.
+    """
+    wanted = str(preferred).strip().lower()
+    if wanted in {"windows", "linux", "macos", "darwin", "mac"}:
+        return platform_family(candidate_platform) == platform_family(wanted)
+    return wanted in platform_tokens(candidate_platform)
+
+
+def close_endpoint_resources(manager: object, hostname: str) -> tuple[int, int]:
+    """Close every live SSH client and terminal session bound to a hostname.
+
+    Dropping an endpoint from the configuration is not enough: pooled SSH
+    clients stay open and authenticated, so `execute_in_terminal` on an
+    existing session still reaches a host the user has just removed.
+
+    This walks the manager's connection pool directly because TunnelManager
+    exposes no per-endpoint close; the natural home for it is a
+    `close_endpoint_connections` method on TunnelManager in ssh_manager.py.
+    """
+    closed_clients = 0
+    pool = getattr(manager, "_connection_pool", None)
+    if isinstance(pool, dict):
+        for pool_key in [key for key in list(pool) if str(key).rsplit(":", 1)[0] == hostname]:
+            for ssh_client in pool.pop(pool_key, []) or []:
+                with contextlib.suppress(Exception):
+                    ssh_client.close()
+                closed_clients += 1
+
+    closed_sessions = 0
+    sessions = getattr(manager, "terminal_sessions", None)
+    if isinstance(sessions, dict):
+        for session_id, session in list(sessions.items()):
+            endpoint = getattr(session, "endpoint", None)
+            if endpoint is not None and getattr(endpoint, "hostname", None) == hostname:
+                with contextlib.suppress(Exception):
+                    manager.close_terminal_session(session_id)  # type: ignore[attr-defined]
+                closed_sessions += 1
+    return closed_clients, closed_sessions
 
 
 async def handle_connect_hardware(arguments: dict) -> CallToolResult:
@@ -11,9 +64,7 @@ async def handle_connect_hardware(arguments: dict) -> CallToolResult:
     endpoint = None
     if preferred_platform and preferred_platform != "any":
         for candidate in manager.endpoints:
-            if preferred_platform.lower() in (candidate.platform or "").lower() and await manager.test_endpoint(
-                candidate
-            ):
+            if platform_matches(preferred_platform, candidate.platform) and await manager.test_endpoint(candidate):
                 endpoint = candidate
                 manager.active_endpoint = candidate
                 break
@@ -43,37 +94,77 @@ async def handle_manage_tunnels(arguments: dict) -> CallToolResult:
     action = arguments["action"]
 
     if action == "add":
-        hostname = arguments["hostname"]
-        username = arguments["username"]
-        private_key_path = arguments["private_key_path"]
+        # Every one of these used to be arguments["..."], so a missing argument
+        # surfaced as "Error executing tool 'manage_tunnels': 'hostname'".
+        missing = [name for name in ("hostname", "username", "private_key_path") if not arguments.get(name)]
+        if missing:
+            return error_result(f"The add action requires: {', '.join(missing)}")
+
+        hostname = str(arguments["hostname"])
+        username = str(arguments["username"])
+        private_key_path = str(arguments["private_key_path"])
         platform = arguments.get("platform", "unknown")
 
-        endpoint = get_tunnel_manager().add_endpoint(hostname, username, private_key_path, platform)
+        manager = get_tunnel_manager()
+        existing = next((item for item in manager.endpoints if item.hostname == hostname), None)
+        if existing is not None:
+            return error_result(
+                f"A tunnel endpoint for {hostname} is already configured (user {existing.username}). "
+                "Remove it first if you want to replace it."
+            )
+
+        expanded_key_path = str(Path(private_key_path).expanduser())
+        if not Path(expanded_key_path).is_file():
+            return error_result(
+                f"Private key not found: {private_key_path}. "
+                "The endpoint was not added; correct the path and try again."
+            )
+
+        endpoint = manager.add_endpoint(hostname, username, expanded_key_path, platform)
+
+        # The old code claimed "Status: Testing connection..." and then never
+        # tested anything, so a bad endpoint looked like a good one until it
+        # failed somewhere far away from here.
+        try:
+            reachable = await manager.test_endpoint(endpoint)
+        except Exception as exc:
+            logger.warning("Connection test failed for %s: %s", hostname, exc)
+            reachable = False
+        manager.save_config()
 
         result_text = f"Added tunnel endpoint: {hostname}\n"
         result_text += f"Platform: {platform}\n"
         result_text += f"Username: {username}\n"
-        result_text += "Status: Testing connection..."
-        return CallToolResult(content=[TextContent(type="text", text=result_text)])
+        result_text += f"Private key: {expanded_key_path}\n"
+        if reachable:
+            result_text += "Status: connection test PASSED"
+            return CallToolResult(content=[TextContent(type="text", text=result_text)])
+        result_text += (
+            "Status: connection test FAILED. The endpoint stays configured so you can retry, "
+            "but it is not usable yet - check the host, the username and the key."
+        )
+        return error_result(result_text)
 
     elif action == "remove":
-        hostname = arguments.get("hostname")
-        if not hostname:
+        target_hostname = str(arguments.get("hostname") or "")
+        if not target_hostname:
             return error_result("The remove action requires a hostname argument")
 
         manager = get_tunnel_manager()
-        remaining = [endpoint for endpoint in manager.endpoints if endpoint.hostname != hostname]
+        remaining = [endpoint for endpoint in manager.endpoints if endpoint.hostname != target_hostname]
         removed_count = len(manager.endpoints) - len(remaining)
         if not removed_count:
-            return error_result(f"No tunnel endpoint found with hostname: {hostname}")
+            return error_result(f"No tunnel endpoint found with hostname: {target_hostname}")
 
         manager.endpoints = remaining
-        if manager.active_endpoint and manager.active_endpoint.hostname == hostname:
+        if manager.active_endpoint and manager.active_endpoint.hostname == target_hostname:
             manager.active_endpoint = None
+        closed_clients, closed_sessions = close_endpoint_resources(manager, target_hostname)
         manager.save_config()
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Removed {removed_count} tunnel endpoint(s) for {hostname}")]
-        )
+        result_text = f"Removed {removed_count} tunnel endpoint(s) for {target_hostname}\n"
+        result_text += f"Closed pooled SSH connections: {closed_clients}\n"
+        result_text += f"Closed terminal sessions: {closed_sessions}"
+        return CallToolResult(content=[TextContent(type="text", text=result_text)])
 
     elif action == "list":
         if not get_tunnel_manager().endpoints:

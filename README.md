@@ -46,6 +46,31 @@ http://127.0.0.1:8765/mcp
 
 The launcher writes its connection and activity files under a per-user state directory. Give an agent the `mcp.url` and `mcp.headers` values only through an authorized channel. Public/tunnel mode automatically generates a bearer token unless `--no-auth` is explicitly used.
 
+If a step does not work, [TROUBLESHOOTING.md](TROUBLESHOOTING.md) covers the common failures: the port already in use, `rigout` not on your PATH, unauthorized responses, and managed state in an unexpected location.
+
+## Connect your agent
+
+Rigout writes what a client needs into `connection.json` in the state directory. `rigout status` prints that path, and `rigout start --detach --output json` reports it as `connection_file`.
+
+The `mcp` object in that file describes the connection:
+
+```json
+{
+  "mcp": {
+    "transport": "streamable-http",
+    "url": "http://127.0.0.1:8765/mcp",
+    "health_url": "http://127.0.0.1:8765/health",
+    "headers": {}
+  }
+}
+```
+
+Register `url` with your MCP client as a streamable HTTP server, and send every header in `headers` on each request. The field names on the client side belong to that client rather than to Rigout, so check its documentation for where server definitions live.
+
+`headers` is empty for a plain local server, which has no bearer auth. Once Rigout generates a token, or you pass `--auth-token`, it becomes `{"Authorization": "Bearer <token>"}`. The connection file is the only place that token is written, so treat the file as a credential.
+
+On a tunnel the printed agent setup URL is quicker: hand it to the agent and it retrieves this same configuration itself.
+
 ## Background lifecycle and JSON output
 
 The installed package includes lifecycle commands; the source-only shell wrappers are not required:
@@ -77,7 +102,19 @@ The default state directory is:
 - macOS: `~/Library/Application Support/rigout`
 - Linux: `$XDG_STATE_HOME/rigout`, or `~/.local/state/rigout`
 
-Override it with `--state-dir PATH` or `RIGOUT_STATE_DIR`. Managed state includes `connection.json`, `activity.log`, `runtime.json`, and `rigout.pid`. On POSIX, Rigout creates its own state directory owner-only and writes runtime files owner-only; a directory it did not create is left as it found it, with a warning on stderr if it is group- or world-reachable. Keep the directory private on every platform because the connection file contains the bearer token.
+Override it with `--state-dir PATH` or `RIGOUT_STATE_DIR`. Managed state includes `connection.json`, `activity.log`, `runtime.json`, `rigout.pid`, and `rigout.lock`. The lock file holds no content: it exists so that two lifecycle commands running at once cannot both conclude that Rigout is stopped and write conflicting records. Rigout recreates it whenever it needs it, so it is safe to delete while no Rigout command is running. On POSIX, Rigout creates its own state directory owner-only and writes runtime files owner-only; a directory it did not create is left as it found it, with a warning on stderr if it is group- or world-reachable. Keep the directory private on every platform because the connection file contains the bearer token.
+
+If `stop` refuses because the recorded PID cannot be verified as a managed Rigout launcher, `rigout stop --force` clears the recorded state. It signals nothing: Rigout will not send a signal to a process it cannot prove is its own, so a stray server still has to be stopped by you.
+
+Exit codes, for scripting:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | The command succeeded. For `status`, Rigout is running. |
+| 1 | Nothing to report, or the command failed: `status` when Rigout is not running, `logs` when no activity log exists, `stop` when it refuses an unverified PID or the process does not stop. |
+| 2 | Usage error: `--output json` without `--detach`, `logs --follow` combined with `--output json`, or an internal-only option passed directly. |
+
+`stop` exits 0 when nothing was running, because the requested outcome already holds. `status` exits 1 in that same situation, because it is a query rather than a request to change anything.
 
 ## Source checkout
 
@@ -88,17 +125,25 @@ python -m pip install -e .
 rigout --tunnel cloudflare
 ```
 
-The repository also ships `rigout.sh` and `rigout.ps1`, which start the launcher in the foreground without installing the package:
+The repository also ships `rigout.sh` and `rigout.ps1`, a convenience shim for running from a source checkout without installing the package:
 
 ```bash
 ./rigout.sh
+./rigout.sh --background
+./rigout.sh status
+./rigout.sh stop
 ```
 
 ```powershell
 .\rigout.ps1
+.\rigout.ps1 -Background
+.\rigout.ps1 status
+.\rigout.ps1 stop
 ```
 
-Their `--background`, `status`, and `stop` modes still look for a connection file inside the checkout directory, which the launcher no longer writes there. Use `rigout start --detach`, `rigout status`, and `rigout stop` for background runs.
+Both are deprecated as of 0.3.0 and say so when they run, on a stream other than stdout, so anything reading their output is unaffected. They hold no lifecycle state of their own: each action translates to the same lifecycle command the installed CLI runs, invoked as `python -m rigout.mcp_url_launcher` from the checkout so that no installation is needed. A server started by `./rigout.sh --background` is therefore visible to `rigout status` and can be stopped with `rigout stop`, and the reverse holds too. One difference to know: the wrappers keep their historical default of a Cloudflare tunnel, where `rigout start` defaults to no tunnel.
+
+The installed CLI is the supported path and accepts many options the wrappers do not. If an older checkout left `ai_agent_connection.json` or `.rigout.pid` behind, `status` reports them as stale and points at the live state, and `stop` clears them.
 
 ## MCP tools
 

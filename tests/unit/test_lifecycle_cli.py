@@ -2,17 +2,26 @@ import json
 import os
 import signal
 import stat
+import subprocess
+import sys
+import threading
+import time
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from rigout import lifecycle
+from rigout._version import __version__
 from rigout.lifecycle import (
     RuntimePaths,
     default_state_dir,
+    process_identity,
     process_is_running,
+    ps_identity,
+    read_pid,
     read_tail,
     redact_home_path,
     redact_sensitive_text,
@@ -24,13 +33,18 @@ from rigout.lifecycle import (
     write_pid,
 )
 from rigout.mcp_url_launcher import (
+    STARTUP_INTERRUPTED,
+    StartupInterruptedError,
     build_managed_child_command,
+    download_file,
     main,
     parse_args,
     prepare_start_args,
     run_foreground,
+    runtime_metadata,
     start_detached,
     start_server,
+    wait_for_health,
 )
 
 
@@ -174,15 +188,22 @@ def test_foreground_start_refuses_existing_instance_without_touching_state(tmp_p
 
 @pytest.mark.unit
 def test_detached_child_does_not_refuse_parent_reserved_pid(tmp_path, monkeypatch):
-    """The parent reserves lifecycle state before its managed child starts."""
+    """The parent reserves lifecycle state before its managed child starts.
+
+    The reservation reads as running, so the child has to tell its own parent's
+    reservation apart from another instance's: it does that by the instance id its parent
+    put in the record and passed down in the environment.
+    """
     args = parse_args(["start", "--managed-child", "--state-dir", str(tmp_path)])
     paths = RuntimePaths.resolve(args.state_dir)
     prepare_start_args(args, paths)
     monkeypatch.setenv("RIGOUT_DETACHED_CHILD", "1")
+    monkeypatch.setenv("RIGOUT_INSTANCE_ID", "the-parent-reservation")
     already_reserved = {
         "status": "running",
         "running": True,
         "pid": 12345,
+        "instance_id": "the-parent-reservation",
         "connection_file": str(paths.connection_file),
         "activity_log": str(paths.log_file),
     }
@@ -200,11 +221,56 @@ def test_detached_child_does_not_refuse_parent_reserved_pid(tmp_path, monkeypatc
 class FakeDetachedProcess:
     """Minimal running Popen result for deterministic startup tests."""
 
+    # Deliberately not this process's PID: a Windows venv launcher can return a
+    # redirector PID while the managed Python child records a different OS PID.
     pid = 43210
     returncode = None
 
     def poll(self):
         return None
+
+
+class FakeManagedChild(FakeDetachedProcess):
+    """A launched child that publishes its own running record, as run_foreground does.
+
+    The parent polls `poll()` once per pass, so publishing on the first call reproduces
+    the real handover deterministically: the parent's reservation is on disk first, then
+    the child replaces it with its own verified PID and identity.
+    """
+
+    def __init__(self, paths, instance_id, extra=None):
+        self.paths = paths
+        self.instance_id = instance_id
+        self.extra = extra or {}
+        self.published = False
+
+    def poll(self):
+        if not self.published:
+            self.published = True
+            write_json_secure(
+                self.paths.runtime_file,
+                {
+                    "status": "running",
+                    "managed": True,
+                    "pid": os.getpid(),
+                    "process_identity": process_identity(os.getpid()),
+                    "instance_id": self.instance_id,
+                    **self.extra,
+                },
+            )
+            write_pid(self.paths, os.getpid())
+        return None
+
+
+@pytest.fixture
+def live_foreign_process():
+    """A real, unrelated OS process, for tests about PIDs Rigout does not own."""
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        yield process
+    finally:
+        process.kill()
+        process.wait(timeout=10)
 
 
 @pytest.mark.unit
@@ -242,28 +308,11 @@ def test_detached_json_handoff_is_credential_free(tmp_path, capsys):
         ),
         encoding="utf-8",
     )
-    stopped = {
-        "status": "stopped",
-        "pid": None,
-        "running": False,
-        "state_dir": str(paths.root),
-        "connection_file": str(paths.connection_file),
-        "activity_log": str(paths.log_file),
-    }
-    running = {
-        **stopped,
-        "status": "running",
-        # Windows venv launchers can return a redirector PID while the managed
-        # Python child records a different OS PID.
-        "pid": 98765,
-        "running": True,
-        "instance_id": "test-instance",
-    }
+    child = FakeManagedChild(paths, "test-instance", {"connection_file": str(paths.connection_file)})
 
     with (
-        patch("rigout.mcp_url_launcher.launch_detached", return_value=FakeDetachedProcess()) as launch,
+        patch("rigout.mcp_url_launcher.launch_detached", return_value=child) as launch,
         patch("rigout.mcp_url_launcher.secrets.token_urlsafe", return_value="test-instance"),
-        patch("rigout.mcp_url_launcher.runtime_status", side_effect=[stopped, running]),
     ):
         exit_code = start_detached(args, paths)
 
@@ -273,7 +322,8 @@ def test_detached_json_handoff_is_credential_free(tmp_path, capsys):
     assert output["mcp_url"] == "https://agent.example/mcp"
     assert "setup-secret" not in output_text
     assert "bearer-secret" not in output_text
-    assert output["pid"] == 98765
+    # The PID reported is the one the child recorded, not the launcher handle's.
+    assert output["pid"] == os.getpid() != FakeDetachedProcess.pid
     command = launch.call_args.args[0]
     env = launch.call_args.args[2]
     assert "setup-secret" not in command
@@ -281,6 +331,101 @@ def test_detached_json_handoff_is_credential_free(tmp_path, capsys):
     assert env["RIGOUT_SETUP_TOKEN"] == "setup-secret"
     assert env["RIGOUT_AUTH_TOKEN"] == "bearer-secret"
     assert env["RIGOUT_INSTANCE_ID"] == "test-instance"
+
+
+def wedged_reservation(paths, args, foreign_pid):
+    """Write the state start_detached leaves if its parent dies before the child reports.
+
+    This is the record start_detached builds at the top of its reservation, and the PID
+    file it writes one step later, so the fixture cannot drift away from the source.
+    """
+    write_json_secure(
+        paths.runtime_file,
+        runtime_metadata(args, paths, status="starting", pid=0, instance_id="abandoned-instance"),
+    )
+    write_pid(paths, foreign_pid)
+
+
+@pytest.mark.unit
+def test_status_does_not_trust_a_live_process_at_an_unverified_reserved_pid(tmp_path, live_foreign_process):
+    """A pending reservation plus a recycled PID must not read as a running Rigout.
+
+    Trusting any live process at a reserved PID wedges the whole CLI: status reports
+    starting, stop refuses to touch the PID, and start refuses to launch, with no
+    supported command left that can clear it.
+    """
+    args = parse_args(["start", "--detach", "--state-dir", str(tmp_path)])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    paths.prepare()
+    wedged_reservation(paths, args, live_foreign_process.pid)
+
+    status = runtime_status(paths)
+
+    assert process_is_running(live_foreign_process.pid) is True
+    assert status["running"] is False
+    assert status["status"] == "stopped"
+    assert status["stale_state"] is True
+
+
+@pytest.mark.unit
+def test_detached_start_is_not_blocked_by_an_abandoned_reservation(tmp_path, live_foreign_process, capsys):
+    """start must be able to recover the state directory an abandoned reservation left."""
+    args = parse_args(["start", "--detach", "--state-dir", str(tmp_path)])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    paths.prepare()
+    wedged_reservation(paths, args, live_foreign_process.pid)
+    child = FakeManagedChild(paths, "fresh-instance")
+
+    with (
+        patch("rigout.mcp_url_launcher.launch_detached", return_value=child) as launch,
+        patch("rigout.mcp_url_launcher.secrets.token_urlsafe", return_value="fresh-instance"),
+    ):
+        exit_code = start_detached(args, paths)
+
+    assert "already running" not in capsys.readouterr().err
+    assert exit_code == 0
+    launch.assert_called_once()
+
+
+@pytest.mark.unit
+def test_the_detached_reservation_is_verifiable_while_the_child_starts(tmp_path, live_foreign_process):
+    """Removing the "trust any live PID" path must not remove the protection it provided.
+
+    Between the launch and the child's first report, the reservation still has to read as
+    running so a second start is refused. The launched child's own creation fingerprint
+    now carries that, so the same window is protected and every claim in it is checkable.
+    """
+    args = parse_args(["start", "--detach", "--state-dir", str(tmp_path)])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    paths.prepare()
+    child = FakeManagedChild(paths, "fresh-instance")
+    child.pid = live_foreign_process.pid  # a real live process stands in for the child
+    reported = child.poll
+    seen = {}
+
+    def snapshot_then_report():
+        if not child.published:
+            seen["runtime"] = json.loads(paths.runtime_file.read_text(encoding="utf-8"))
+            seen["pid_file"] = read_pid(paths)
+            seen["status"] = runtime_status(paths)
+        return reported()
+
+    child.poll = snapshot_then_report
+
+    with (
+        patch("rigout.mcp_url_launcher.launch_detached", return_value=child),
+        patch("rigout.mcp_url_launcher.secrets.token_urlsafe", return_value="fresh-instance"),
+    ):
+        exit_code = start_detached(args, paths)
+
+    assert exit_code == 0
+    assert seen["pid_file"] == live_foreign_process.pid
+    assert seen["runtime"]["process_identity"] == process_identity(live_foreign_process.pid)
+    assert seen["runtime"]["process_identity"] is not None
+    assert seen["status"]["running"] is True
 
 
 class FakeChildProcess:
@@ -602,9 +747,693 @@ def test_redact_home_path_hides_the_account_name_without_touching_other_paths():
         assert redact_home_path(f"{os.sep}srv{os.sep}rigout") == f"{os.sep}srv{os.sep}rigout"
 
 
+@pytest.fixture(autouse=True)
+def clear_interrupt_state():
+    """No test may leak an interrupt, or a launcher's signal handler, into the next one.
+
+    run_foreground installs SIGINT and SIGTERM handlers and never restores them, so
+    without this a later test inherits a handler closed over a finished run.
+    """
+    handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
+    STARTUP_INTERRUPTED.clear()
+    yield
+    STARTUP_INTERRUPTED.clear()
+    for number, handler in handlers.items():
+        signal.signal(number, handler)
+
+
+class ExitingChildProcess(FakeChildProcess):
+    """A child that runs for a couple of polls and then exits, so the serve loop ends."""
+
+    def __init__(self, pid=31415, polls_before_exit=1):
+        super().__init__(pid)
+        self.polls = 0
+        self.polls_before_exit = polls_before_exit
+
+    def poll(self):
+        self.polls += 1
+        return 0 if self.polls > self.polls_before_exit else None
+
+
+def interrupt_now():
+    """Deliver a SIGINT to whatever handler the launcher has installed."""
+    handler = signal.getsignal(signal.SIGINT)
+    handler(signal.SIGINT, None)
+
+
+class SilentCloudflared:
+    """A cloudflared that never publishes a URL and never exits, like a stalled tunnel."""
+
+    def __init__(self, *_args, **_kwargs):
+        self.stdout = iter(())
+        self.terminated = False
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.terminated = True
+
+
+@pytest.mark.unit
+def test_health_wait_ends_promptly_when_the_startup_is_interrupted():
+    """The health wait is 30 seconds, and Ctrl+C used to leave the user inside all of it.
+
+    The old handler stopped two processes that do not exist during startup and returned,
+    so every wait ran to its full timeout while the user had been told it was stopping.
+    """
+    threading.Timer(0.3, STARTUP_INTERRUPTED.set).start()
+    started = time.monotonic()
+
+    # Port 1 is closed, so every attempt fails and the loop runs its full timeout.
+    healthy = wait_for_health("http://127.0.0.1:1/health", timeout=30)
+
+    elapsed = time.monotonic() - started
+    assert healthy is False
+    assert elapsed < 5, f"the interrupt was not noticed for {elapsed:.1f}s"
+
+
+@pytest.mark.unit
+def test_cloudflared_download_stops_when_the_startup_is_interrupted(tmp_path):
+    """The download is ~35 MB and is the longest wait a first run can hit."""
+
+    class EndlessResponse:
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, _size):
+            self.reads += 1
+            if self.reads == 2:
+                STARTUP_INTERRUPTED.set()
+            return b"x" * 1024
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    response = EndlessResponse()
+    with patch("rigout.mcp_url_launcher.urllib.request.urlopen", return_value=response):
+        with pytest.raises(StartupInterruptedError):
+            download_file("https://example.invalid/cloudflared", tmp_path / "download")
+
+    assert response.reads < 10, "the download kept going after the interrupt"
+
+
+@pytest.mark.unit
+def test_a_real_interrupt_ends_a_stalled_tunnel_wait(tmp_path, capsys):
+    """Ctrl+C during the tunnel wait: a real signal, the real handler, the real loop.
+
+    This is the worst first-run experience in the CLI, because the user is both stuck and
+    told the opposite: the handler announced a shutdown and stopped two processes that do
+    not exist during the tunnel wait, then returned, and the 45 second wait carried on.
+
+    The signal is raised rather than the handler called, so the whole chain is under test:
+    CPython delivers it to the main thread exactly as a console Ctrl+C does.
+    """
+    args = parse_args(["start", "--state-dir", str(tmp_path), "--tunnel", "cloudflare", "--port", "19804"])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    started = time.monotonic()
+
+    with (
+        patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
+        patch("rigout.mcp_url_launcher.subprocess.Popen", SilentCloudflared),
+        patch("rigout.mcp_url_launcher.start_server") as start_server_call,
+    ):
+        threading.Timer(0.5, lambda: signal.raise_signal(signal.SIGINT)).start()
+        exit_code = run_foreground(args, paths, managed=True)
+
+    elapsed = time.monotonic() - started
+    output = capsys.readouterr()
+    combined = output.out + output.err
+    assert exit_code == 130
+    assert elapsed < 15, f"the tunnel wait ran on for {elapsed:.1f}s after the interrupt"
+    start_server_call.assert_not_called()
+    # No server or tunnel exists yet, so naming one is telling the user the opposite.
+    assert "Interrupting startup..." in combined
+    assert "Stopping MCP server..." not in combined
+    assert "Startup interrupted. Nothing is running." in combined
+
+
+@pytest.mark.unit
+def test_an_interrupted_startup_is_recorded_as_stopped_not_failed(tmp_path, capsys):
+    """An operator-requested stop is not a failure, and must not read as one afterwards."""
+    args = parse_args(["start", "--state-dir", str(tmp_path), "--port", "19802"])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+
+    def interrupt_instead_of_starting(*_args, **_kwargs):
+        interrupt_now()
+        return ExitingChildProcess()
+
+    with patch("rigout.mcp_url_launcher.start_server", side_effect=interrupt_instead_of_starting):
+        exit_code = run_foreground(args, paths, managed=True)
+
+    runtime = json.loads(paths.runtime_file.read_text(encoding="utf-8"))
+    assert exit_code == 130
+    assert runtime["status"] == "stopped"
+    assert "last_error" not in runtime
+    assert runtime_status(paths)["running"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("argv", [["--version"], ["-V"], ["status", "--version"], ["stop", "-V"]])
+def test_version_is_reachable_from_every_command(argv, capsys):
+    """A first run reaches for --version before anything else, and it did not exist."""
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(argv)
+
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out.strip() == f"rigout {__version__}"
+
+
+@pytest.mark.unit
+def test_unknown_command_names_the_commands_that_exist(capsys):
+    """A typo used to be reported against start's usage, which never lists the commands."""
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["stpo"])
+
+    error = capsys.readouterr().err
+    assert exit_info.value.code == 2
+    assert "unknown command 'stpo'" in error
+    for command in ("start", "status", "logs", "stop"):
+        assert command in error
+
+
+@pytest.mark.unit
+def test_help_states_defaults_and_documents_every_visible_option(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["start", "--help"])
+
+    # Collapsed, because argparse wraps to the terminal width and a fixed substring
+    # would otherwise pass or fail depending on how wide the running console is.
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "(default:" in help_text
+    # These three carried no help text at all, so --help listed them without saying
+    # what they do.
+    for option in ("--json-response", "--stateless", "--output"):
+        assert option in help_text
+    assert "server-sent event stream" in help_text
+    assert "without a persistent session" in help_text
+
+
+@pytest.mark.unit
+def test_a_blocked_state_directory_is_a_message_not_a_traceback(tmp_path, capsys):
+    """paths.prepare() sits outside every try, so this reached the user as a traceback."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file, not a directory", encoding="utf-8")
+
+    exit_code = main(["start", "--detach", "--state-dir", str(blocker / "state")])
+
+    error = capsys.readouterr().err
+    assert exit_code == 1
+    assert "cannot use the runtime state directory" in error
+    assert "--state-dir" in error
+    assert "Traceback" not in error
+
+
+@pytest.mark.unit
+def test_logs_without_a_log_file_says_so_like_follow_already_did(tmp_path, capsys):
+    """The default path printed zero bytes and exited 1; --follow printed a message."""
+    exit_code = main(["logs", "--state-dir", str(tmp_path)])
+
+    output = capsys.readouterr()
+    assert exit_code == 1
+    assert output.out == ""
+    assert f"No activity log exists at {RuntimePaths.resolve(tmp_path).log_file}" in output.err
+
+
+@pytest.mark.unit
+def test_status_json_keys_do_not_change_between_states(tmp_path, capsys):
+    """`json.load(...)["mcp_url"]` must not raise before the first start."""
+    stopped_code = main(["status", "--state-dir", str(tmp_path), "--output", "json"])
+    stopped = json.loads(capsys.readouterr().out)
+
+    paths = RuntimePaths.resolve(tmp_path)
+    write_json_secure(
+        paths.runtime_file,
+        {
+            "status": "running",
+            "managed": True,
+            "pid": os.getpid(),
+            "process_identity": process_identity(os.getpid()),
+            "mcp_url": "http://127.0.0.1:8765/mcp",
+            "health_url": "http://127.0.0.1:8765/health",
+            "host": "127.0.0.1",
+            "port": 8765,
+        },
+    )
+    write_pid(paths, os.getpid())
+    running_code = main(["status", "--state-dir", str(tmp_path), "--output", "json"])
+    running = json.loads(capsys.readouterr().out)
+
+    assert stopped_code == 1
+    assert running_code == 0
+    assert stopped["mcp_url"] is None
+    assert running["mcp_url"] == "http://127.0.0.1:8765/mcp"
+    assert set(stopped) <= set(running), f"keys vanish when stopped: {set(running) - set(stopped)}"
+    for key in lifecycle.OPTIONAL_STATUS_KEYS:
+        assert key in stopped, f"{key} is missing before the first start"
+
+
+@pytest.mark.unit
+def test_logs_follow_json_refusal_is_itself_json(tmp_path, capsys):
+    """The caller asked for JSON, so the refusal has to be parseable by that caller."""
+    exit_code = main(["logs", "--state-dir", str(tmp_path), "--output", "json", "--follow"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 2
+    # The reason is preserved, not reduced to a bare refusal.
+    assert "follow output is a text stream" in json.loads(output)["error"]
+
+
+@pytest.mark.unit
+def test_json_start_refusal_is_itself_json(tmp_path, capsys):
+    exit_code = main(["start", "--state-dir", str(tmp_path), "--output", "json"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 2
+    assert "requires --detach" in json.loads(output)["error"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        (["--host", "127.0.0.1"], "Auth: none, and none needed"),
+        (["--host", "0.0.0.0"], "Auth: bearer token required"),
+        (["--host", "0.0.0.0", "--no-auth"], "Auth: NONE, and this server is reachable beyond this machine."),
+    ],
+)
+def test_the_running_banner_always_states_the_auth_posture(tmp_path, capsys, extra, expected):
+    """The unauthenticated public case used to be marked by the Auth line being absent.
+
+    Absence is the one posture a reader cannot notice, and it is the dangerous one: the
+    --no-auth warning has scrolled away behind tunnel output by the time this prints.
+    """
+    args = parse_args(["start", "--state-dir", str(tmp_path), "--port", "19803", *extra])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+
+    with (
+        patch("rigout.mcp_url_launcher.start_server", return_value=ExitingChildProcess()),
+        patch("rigout.mcp_url_launcher.wait_for_health", return_value=True),
+        patch("rigout.mcp_url_launcher.write_connection_file"),
+    ):
+        run_foreground(args, paths, managed=True)
+
+    output = capsys.readouterr().out
+    assert expected in output
+    assert "Auth:" in output
+
+
+@pytest.mark.unit
+def test_already_running_tells_the_user_what_to_do_next(tmp_path, live_foreign_process, capsys):
+    args = parse_args(["start", "--detach", "--state-dir", str(tmp_path)])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    paths.prepare()
+    winning_record(paths, live_foreign_process.pid)
+
+    exit_code = start_detached(args, paths)
+
+    error = capsys.readouterr().err
+    assert exit_code == 1
+    assert "already running" in error
+    assert "rigout status" in error
+    assert "rigout stop" in error
+
+
 @pytest.mark.unit
 def test_process_check_rejects_nonexistent_pid():
     assert process_is_running(999_999_999) is False
+
+
+@pytest.mark.unit
+def test_managed_child_is_rejected_without_the_marker_its_parent_sets(tmp_path, capsys):
+    """The suppressed internal flag skips the single-instance check, so a user must not
+    be able to reach it: one typed flag would otherwise put two launchers on one state
+    directory."""
+    # Patched so that a regression here fails the test instead of launching a real server.
+    with patch("rigout.mcp_url_launcher.run_foreground", return_value=0) as foreground:
+        exit_code = main(["start", "--managed-child", "--state-dir", str(tmp_path)])
+
+    assert exit_code == 2
+    assert "not a supported option" in capsys.readouterr().err
+    foreground.assert_not_called()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.unit
+def test_managed_child_is_accepted_from_the_parent_that_sets_the_marker(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGOUT_DETACHED_CHILD", "1")
+
+    with patch("rigout.mcp_url_launcher.run_foreground", return_value=0) as foreground:
+        exit_code = main(["start", "--managed-child", "--state-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    foreground.assert_called_once()
+
+
+@pytest.mark.unit
+def test_follow_reseeks_after_a_restart_truncates_the_log(tmp_path, capsys, monkeypatch):
+    """A follower holding an offset past a truncated log shows nothing, forever.
+
+    `start` truncates the activity log, so `logs --follow` left running across a restart
+    silently stops reporting while it looks like it is still working.
+    """
+    paths = RuntimePaths.resolve(tmp_path)
+    paths.prepare()
+    paths.log_file.write_text("stale instance line\n" * 4, encoding="utf-8")
+    monkeypatch.setattr("rigout.mcp_url_launcher.FOLLOW_LIVENESS_SECONDS", 0)
+    monkeypatch.setattr("rigout.mcp_url_launcher.time.sleep", lambda _seconds: None)
+    calls = {"count": 0}
+
+    def restart_then_stop(_paths):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # A concurrent `rigout start` truncates the log and writes the new instance.
+            paths.log_file.write_text("new instance line\n", encoding="utf-8")
+            return {"running": True, "status": "running"}
+        return {"running": False, "status": "stopped"}
+
+    with patch("rigout.mcp_url_launcher.runtime_status", side_effect=restart_then_stop):
+        exit_code = main(["logs", "--state-dir", str(tmp_path), "--tail", "0", "--follow"])
+
+    assert exit_code == 0
+    assert "new instance line" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_logs_redacts_credentials_the_way_the_activity_tool_does(tmp_path, capsys):
+    """`rigout logs` and get_server_activity read one file; the operator view must not be
+    the less redacted of the two."""
+    paths = RuntimePaths.resolve(tmp_path)
+    paths.prepare()
+    paths.log_file.write_text(
+        "GET /connection.json?setup_token=setup-secret\n"
+        'reply "Authorization: Bearer bearer-secret"\n'
+        "resolved auth_token=third-secret\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["logs", "--state-dir", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "setup-secret" not in output
+    assert "bearer-secret" not in output
+    assert "third-secret" not in output
+
+
+@pytest.mark.unit
+def test_logs_json_redacts_credentials(tmp_path, capsys):
+    paths = RuntimePaths.resolve(tmp_path)
+    paths.prepare()
+    paths.log_file.write_text("GET /connection.json?setup_token=setup-secret\n", encoding="utf-8")
+
+    exit_code = main(["logs", "--state-dir", str(tmp_path), "--output", "json"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "setup-secret" not in output
+    assert json.loads(output)["lines"][0] == "GET /connection.json?setup_token=***"
+
+
+@pytest.mark.unit
+def test_ps_identity_is_cached_within_the_granularity_it_already_has(tmp_path):
+    """`ps` costs a fork and an exec, and status is polled several times a second.
+
+    The cache is bounded by the resolution `ps -o lstart=` already reports, one second,
+    so it cannot make the PID-reuse guard any less precise than its own source.
+    """
+    lifecycle._PS_IDENTITY_CACHE.clear()
+    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="Sat Aug  1 00:00:00 2026\n", stderr="")
+
+    with patch("rigout.lifecycle.subprocess.run", return_value=completed) as run:
+        first = ps_identity(4242)
+        second = ps_identity(4242)
+        other = ps_identity(4243)
+
+    assert first == second == "ps-lstart:Sat Aug  1 00:00:00 2026"
+    assert other == first
+    assert run.call_count == 2  # one per PID, not one per question
+
+    with (
+        patch("rigout.lifecycle.subprocess.run", return_value=completed) as run,
+        patch("rigout.lifecycle.time.monotonic", return_value=time_after_cache_expiry()),
+    ):
+        ps_identity(4242)
+
+    assert run.call_count == 1
+    lifecycle._PS_IDENTITY_CACHE.clear()
+
+
+def time_after_cache_expiry():
+    import time as _time
+
+    return _time.monotonic() + lifecycle.PS_IDENTITY_CACHE_SECONDS + 1
+
+
+@pytest.mark.unit
+def test_detached_startup_polling_does_not_verify_the_process_every_tick(tmp_path):
+    """Verification costs a `ps` on systems without /proc, and startup polls five times a
+    second for up to ninety seconds."""
+    args = parse_args(["start", "--detach", "--state-dir", str(tmp_path)])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    paths.prepare()
+
+    class SlowChild(FakeManagedChild):
+        def __init__(self, *call_args):
+            super().__init__(*call_args)
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            if self.polls < 12:
+                return None  # still starting
+            return super().poll()
+
+    child = SlowChild(paths, "slow-instance")
+    child.pid = os.getpid()
+
+    with (
+        patch("rigout.mcp_url_launcher.launch_detached", return_value=child),
+        patch("rigout.mcp_url_launcher.secrets.token_urlsafe", return_value="slow-instance"),
+        patch("rigout.mcp_url_launcher.time.sleep"),
+        # Patched inside lifecycle, which is where runtime_status reaches it: the launcher
+        # holds its own reference, so patching that name would miss every polled lookup.
+        patch("rigout.lifecycle.process_identity", side_effect=process_identity) as identity,
+    ):
+        exit_code = start_detached(args, paths)
+
+    assert exit_code == 0
+    assert child.polls >= 12
+    # Verification belongs on the terminal answer, not on every one of those polls.
+    assert identity.call_count <= 2
+
+
+LOCK_WORKER = """
+import json, os, sys, time
+sys.path.insert(0, {source!r})
+from rigout.lifecycle import RuntimePaths, state_lock
+
+paths = RuntimePaths.resolve(sys.argv[1])
+counter = paths.root / "counter.json"
+increments = int(sys.argv[2])
+held = True
+for _ in range(increments):
+    with state_lock(paths) as locked:
+        held = held and locked
+        # Read-modify-write with a real gap: without exclusion the writers that read the
+        # same value both write value+1 and one increment is lost.
+        value = json.loads(counter.read_text(encoding="utf-8"))["value"]
+        time.sleep(0.001)
+        counter.write_text(json.dumps({{"value": value + 1}}), encoding="utf-8")
+print("locked" if held else "unlocked")
+"""
+
+
+@pytest.mark.unit
+def test_state_lock_serializes_writers_in_separate_os_processes(tmp_path):
+    """The lock has to hold across processes, which is the only place it is ever used.
+
+    Real `rigout` commands are separate OS processes, so an in-process check would prove
+    nothing. Concurrent read-modify-write of one counter loses increments unless the lock
+    actually excludes; the assertion is on the total, not on timing.
+    """
+    workers, increments = 4, 25
+    paths = RuntimePaths.resolve(tmp_path)
+    paths.prepare()
+    (paths.root / "counter.json").write_text(json.dumps({"value": 0}), encoding="utf-8")
+    source = str(Path(lifecycle.__file__).resolve().parent.parent)
+    script = tmp_path / "lock_worker.py"
+    script.write_text(LOCK_WORKER.format(source=source), encoding="utf-8")
+
+    def run_worker(_index):
+        return subprocess.run(
+            [sys.executable, str(script), str(tmp_path), str(increments)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(run_worker, range(workers)))
+
+    for result in results:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "locked", result.stdout
+    assert json.loads((paths.root / "counter.json").read_text(encoding="utf-8"))["value"] == workers * increments
+
+
+def winning_record(paths, pid):
+    """A live, verified record owned by another instance, on a real running process."""
+    winner = {
+        "status": "running",
+        "managed": True,
+        "pid": pid,
+        "process_identity": process_identity(pid),
+        "instance_id": "the-winner",
+        "mcp_url": "http://127.0.0.1:8765/mcp",
+    }
+    write_json_secure(paths.runtime_file, winner)
+    write_pid(paths, pid)
+    return winner
+
+
+@pytest.mark.unit
+def test_a_managed_child_refuses_a_directory_another_instance_already_runs(tmp_path, live_foreign_process, capsys):
+    """A child whose parent lost the race must not take over the winner's directory.
+
+    The single-instance check used to be skipped for managed children entirely, so a
+    child of a losing parent walked in and started rewriting the winner's state.
+    """
+    args = parse_args(["start", "--managed-child", "--state-dir", str(tmp_path)])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    paths.prepare()
+    winner = winning_record(paths, live_foreign_process.pid)
+
+    with (
+        patch.dict(os.environ, {"RIGOUT_DETACHED_CHILD": "1", "RIGOUT_INSTANCE_ID": "the-loser"}),
+        patch("rigout.mcp_url_launcher.start_server") as start,
+    ):
+        exit_code = run_foreground(args, paths, managed=True)
+
+    assert exit_code == 1
+    assert "already running" in capsys.readouterr().err
+    start.assert_not_called()
+    assert json.loads(paths.runtime_file.read_text(encoding="utf-8")) == winner
+
+
+@pytest.mark.unit
+def test_a_shutdown_does_not_overwrite_a_record_another_instance_now_owns(tmp_path, live_foreign_process):
+    """The shutdown path must write only its own instance's outcome.
+
+    A launcher that fails after another instance has taken the directory would otherwise
+    write "stopped" over a live record, which makes status report a running server as
+    stopped and makes stop refuse it: a server nobody can reach through the CLI.
+    """
+    args = parse_args(["start", "--managed-child", "--state-dir", str(tmp_path)])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    paths.prepare()
+    taken_over = {}
+
+    def lose_the_directory(*_args, **_kwargs):
+        taken_over["winner"] = winning_record(paths, live_foreign_process.pid)
+        raise OSError("address already in use")
+
+    with (
+        patch.dict(os.environ, {"RIGOUT_DETACHED_CHILD": "1", "RIGOUT_INSTANCE_ID": "the-loser"}),
+        patch("rigout.mcp_url_launcher.start_server", side_effect=lose_the_directory),
+    ):
+        exit_code = run_foreground(args, paths, managed=True)
+
+    status = runtime_status(paths)
+    assert exit_code == 1
+    assert json.loads(paths.runtime_file.read_text(encoding="utf-8")) == taken_over["winner"]
+    assert status["running"] is True
+    assert status["status"] == "running"
+
+
+@pytest.mark.unit
+def test_child_pids_are_not_recorded_against_another_instances_record(tmp_path, live_foreign_process):
+    """stop reaps whatever child PIDs the record names, so a stray instance writing its
+    own children there points a later stop at processes that instance never started."""
+    args = parse_args(["start", "--managed-child", "--state-dir", str(tmp_path), "--tunnel", "cloudflare"])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    paths.prepare()
+    taken_over = {}
+
+    def lose_the_directory(*_args, **_kwargs):
+        taken_over["winner"] = winning_record(paths, live_foreign_process.pid)
+        return FakeChildProcess(27182), "https://example.trycloudflare.com"
+
+    with (
+        patch.dict(os.environ, {"RIGOUT_DETACHED_CHILD": "1", "RIGOUT_INSTANCE_ID": "the-loser"}),
+        patch("rigout.mcp_url_launcher.start_cloudflare_tunnel", side_effect=lose_the_directory),
+        patch("rigout.mcp_url_launcher.start_server", return_value=FakeChildProcess(31415)),
+        patch("rigout.mcp_url_launcher.wait_for_health", return_value=False),
+    ):
+        run_foreground(args, paths, managed=True)
+
+    runtime = json.loads(paths.runtime_file.read_text(encoding="utf-8"))
+    assert runtime == taken_over["winner"]
+    assert "server_pid" not in runtime
+    assert "tunnel_pid" not in runtime
+
+
+@pytest.mark.unit
+def test_stop_force_clears_an_unverifiable_reservation_without_signalling_it(tmp_path, live_foreign_process, capsys):
+    """The way out of a state the CLI cannot verify must not be to kill an unknown PID."""
+    args = parse_args(["start", "--detach", "--state-dir", str(tmp_path)])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    paths.prepare()
+    wedged_reservation(paths, args, live_foreign_process.pid)
+
+    refused = main(["stop", "--state-dir", str(tmp_path)])
+    refusal = capsys.readouterr().err
+    forced = main(["stop", "--state-dir", str(tmp_path), "--force"])
+    forced_output = capsys.readouterr().out
+
+    assert refused == 1
+    assert "rigout stop --force" in refusal
+    assert forced == 0
+    assert "was not signalled" in forced_output
+    assert paths.pid_file.exists() is False
+    assert live_foreign_process.poll() is None  # never signalled
+    assert runtime_status(paths)["running"] is False
+
+
+@pytest.mark.unit
+def test_status_explains_a_live_recorded_pid_that_is_not_rigout(tmp_path, live_foreign_process, capsys):
+    """A live PID printed under a stopped status reads as a contradiction on its own."""
+    args = parse_args(["start", "--detach", "--state-dir", str(tmp_path)])
+    paths = RuntimePaths.resolve(args.state_dir)
+    prepare_start_args(args, paths)
+    paths.prepare()
+    wedged_reservation(paths, args, live_foreign_process.pid)
+
+    exit_code = main(["status", "--state-dir", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "Rigout status: stopped" in output
+    assert "has reused it" in output
+    assert "rigout stop --force" in output
 
 
 @pytest.mark.unit

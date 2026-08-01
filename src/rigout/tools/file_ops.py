@@ -1,12 +1,45 @@
 import posixpath
 import shutil
-import uuid
 from pathlib import Path
 
 from mcp.types import CallToolResult, TextContent
 
-from ..ssh_manager import get_tunnel_manager, heredoc_redirect, shell_join, shell_quote
+from ..security_validator import security_validator
+from ..ssh_manager import build_write_command, get_tunnel_manager, shell_join, shell_quote
 from ._results import error_result, failure_detail
+
+# A file read lands in an agent's context, so it has to be bounded. This is generous
+# for source and configuration files while making it impossible to exhaust memory on
+# a multi-gigabyte file or bury the model in one call.
+MAX_READ_BYTES = 1_048_576
+
+
+def scrub(text: str) -> str:
+    """Redact credentials from text a local operation is about to return.
+
+    The SSH path inherits this from `execute_command`, which sanitizes stdout and
+    stderr. The local path has no such chokepoint, so every local branch that
+    returns content has to call this itself. Without it the same secret is refused
+    through `execute_command` and handed over through `file_operations`.
+    """
+    return security_validator.sanitize_command_output(text)
+
+
+def _read_bounded(path: Path) -> str:
+    """Read at most MAX_READ_BYTES, stating plainly when the file was truncated."""
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_READ_BYTES + 1)
+    text = raw[:MAX_READ_BYTES].decode("utf-8", errors="replace")
+    if len(raw) > MAX_READ_BYTES:
+        text += f"\n\n[truncated: only the first {MAX_READ_BYTES} bytes are shown]"
+    return text
+
+
+def _truncate_remote(text: str) -> str:
+    """Apply the same statement of truncation to output of a bounded remote read."""
+    if len(text) > MAX_READ_BYTES:
+        return text[:MAX_READ_BYTES] + f"\n\n[truncated: only the first {MAX_READ_BYTES} bytes are shown]"
+    return text
 
 
 async def handle_file_operations(arguments: dict) -> CallToolResult:
@@ -21,16 +54,18 @@ async def handle_file_operations(arguments: dict) -> CallToolResult:
         return await _handle_local_file_operation(operation, arguments)
 
     if operation == "read":
-        command = f"cat {shell_quote(path)}"
+        command = f"head -c {MAX_READ_BYTES + 1} {shell_quote(path)}"
     elif operation == "write":
         content = arguments.get("content", "")
-        command = heredoc_redirect(content, path)
+        command = build_write_command(content, path)
     elif operation == "append":
         content = arguments.get("content", "")
-        delimiter = f"EOF_{uuid.uuid4().hex}"
-        command = f"cat >> {shell_quote(path)} <<'{delimiter}'\n{content}\n{delimiter}"
+        command = build_write_command(content, path, append=True)
     elif operation == "delete":
-        command = f"rm -f {shell_quote(path)}"
+        # Recursive deletion is opt-in, so that a directory passed by mistake is
+        # refused rather than removed. The local branch enforces the same rule.
+        flag = "-rf" if arguments.get("recursive", False) else "-f"
+        command = f"rm {flag} {shell_quote(path)}"
     elif operation == "copy":
         destination = arguments.get("destination", "")
         command = f"cp {shell_quote(path)} {shell_quote(destination)}"
@@ -53,7 +88,7 @@ async def handle_file_operations(arguments: dict) -> CallToolResult:
         result_text += f"Path: {path}\n"
         result_text += f"Endpoint: {result['endpoint']}\n"
         if result["stdout"]:
-            result_text += f"\nOutput:\n{result['stdout']}"
+            result_text += f"\nOutput:\n{_truncate_remote(result['stdout'])}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
         result_text = f"File operation '{operation}' failed\n\n"
@@ -76,9 +111,9 @@ async def handle_bulk_file_transfer(arguments: dict) -> CallToolResult:
 
     if operation == "upload":
         parent_dir = posixpath.dirname(destination) or "."
-        command = f"mkdir -p {shell_quote(parent_dir)} && {heredoc_redirect(source, destination)}"
+        command = f"mkdir -p {shell_quote(parent_dir)} && {build_write_command(source, destination)}"
     elif operation == "download":
-        command = f"cat {shell_quote(source)}"
+        command = f"head -c {MAX_READ_BYTES + 1} {shell_quote(source)}"
     elif operation == "sync":
         files = arguments.get("files", [])
         if files:
@@ -96,7 +131,7 @@ async def handle_bulk_file_transfer(arguments: dict) -> CallToolResult:
         result_text += f"Source: {source}\n"
         result_text += f"Destination: {destination}\n"
         if result["stdout"]:
-            result_text += f"\nOutput:\n{result['stdout']}"
+            result_text += f"\nOutput:\n{_truncate_remote(result['stdout'])}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
         return error_result(
@@ -108,7 +143,7 @@ async def _handle_local_file_operation(operation: str, arguments: dict) -> CallT
     path = Path(arguments["path"]).expanduser()
     try:
         if operation == "read":
-            output = path.read_text(encoding="utf-8", errors="replace")
+            output = _read_bounded(path)
         elif operation == "write":
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(arguments.get("content", ""), encoding="utf-8")
@@ -120,6 +155,10 @@ async def _handle_local_file_operation(operation: str, arguments: dict) -> CallT
             output = ""
         elif operation == "delete":
             if path.is_dir():
+                if not arguments.get("recursive", False):
+                    return error_result(
+                        f"'{path}' is a directory. Pass recursive=true to delete a directory and its contents."
+                    )
                 shutil.rmtree(path)
             else:
                 path.unlink(missing_ok=True)
@@ -147,10 +186,10 @@ async def _handle_local_file_operation(operation: str, arguments: dict) -> CallT
 
         result_text = f"Local file operation '{operation}' completed successfully\n\nPath: {path}"
         if output:
-            result_text += f"\n\nOutput:\n{output}"
+            result_text += f"\n\nOutput:\n{scrub(output)}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     except Exception as exc:
-        return error_result(f"Local file operation '{operation}' failed: {exc}")
+        return error_result(scrub(f"Local file operation '{operation}' failed: {exc}"))
 
 
 async def _handle_local_bulk_file_transfer(operation: str, arguments: dict) -> CallToolResult:
@@ -161,8 +200,8 @@ async def _handle_local_bulk_file_transfer(operation: str, arguments: dict) -> C
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(source, encoding="utf-8")
         elif operation == "download":
-            content = Path(source).expanduser().read_text(encoding="utf-8", errors="replace")
-            return CallToolResult(content=[TextContent(type="text", text=content)])
+            content = _read_bounded(Path(source).expanduser())
+            return CallToolResult(content=[TextContent(type="text", text=scrub(content))])
         elif operation == "sync":
             files = arguments.get("files", [])
             destination.mkdir(parents=True, exist_ok=True)
@@ -192,4 +231,4 @@ async def _handle_local_bulk_file_transfer(operation: str, arguments: dict) -> C
             ]
         )
     except Exception as exc:
-        return error_result(f"Local file transfer '{operation}' failed: {exc}")
+        return error_result(scrub(f"Local file transfer '{operation}' failed: {exc}"))
