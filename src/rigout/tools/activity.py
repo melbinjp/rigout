@@ -1,15 +1,26 @@
 """Read-only MCP access to Rigout's managed lifecycle activity."""
 
 import json
+from pathlib import Path
 
 from mcp.types import CallToolResult, TextContent
 
-from ..lifecycle import RuntimePaths, read_tail, redact_sensitive_text, runtime_status
+from ..lifecycle import RuntimePaths, read_tail, redact_home_path, redact_sensitive_text, runtime_status
 from ..security_validator import security_validator
 from ._results import error_result
 
 DEFAULT_ACTIVITY_LINES = 50
 MAX_ACTIVITY_LINES = 200
+
+
+def sanitized_path(path: Path) -> str:
+    """Return a runtime path with the operator's account name and credentials removed.
+
+    A local operator can still resolve a `~`-relative path, while a remote agent no longer
+    learns the home directory, which carries the operating system user name.
+    """
+    sanitized = redact_sensitive_text(redact_home_path(str(path)))
+    return security_validator.sanitize_command_output(sanitized)
 
 
 async def handle_get_server_activity(arguments: dict) -> CallToolResult:
@@ -33,8 +44,8 @@ async def handle_get_server_activity(arguments: dict) -> CallToolResult:
         "status": str(status.get("status", "stopped")),
         "running": bool(status.get("running", False)),
         "pid": pid if isinstance(pid, int) else None,
-        "state_dir": str(paths.root),
-        "activity_log": str(paths.log_file),
+        "state_dir": sanitized_path(paths.root),
+        "activity_log": sanitized_path(paths.log_file),
         "lines": safe_lines,
     }
     return CallToolResult(

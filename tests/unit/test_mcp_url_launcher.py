@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import subprocess
 import tarfile
 from argparse import Namespace
 from pathlib import Path
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from rigout import lifecycle
 from rigout.mcp_http_server import connection_setup_url, tokens_match, write_connection_file
 from rigout.mcp_url_launcher import (
     cloudflared_asset,
@@ -61,6 +63,38 @@ def test_write_connection_file_includes_agent_setup_url(tmp_path):
     assert data["mcp"]["headers"]["Authorization"] == "Bearer secret-token"
     if os.name == "posix":
         # File contains a bearer token, so it must be owner-only
+        assert (connection_file.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.unit
+def test_write_connection_file_restricts_mode_before_the_file_is_visible(tmp_path):
+    """The bearer token must never sit at the final path with umask permissions."""
+    connection_file = tmp_path / "connection.json"
+    restrictions: list[str] = []
+    real_secure_descriptor = lifecycle.secure_descriptor
+
+    def record_secure_descriptor(descriptor):
+        restrictions.append("visible" if connection_file.exists() else "hidden")
+        real_secure_descriptor(descriptor)
+
+    with patch("rigout.lifecycle.secure_descriptor", side_effect=record_secure_descriptor):
+        write_connection_file(
+            connection_file,
+            "https://agent.example/mcp",
+            "127.0.0.1",
+            8765,
+            "/mcp",
+            auth_token="secret-token",
+        )
+
+    # The mode is restricted on the descriptor while the destination does not yet exist,
+    # so the token is never readable at the final path. secure_descriptor applies 0o600:
+    # see test_secure_descriptor_applies_owner_only_mode.
+    assert restrictions == ["hidden"]
+    assert list(tmp_path.iterdir()) == [connection_file]
+    data = json.loads(connection_file.read_text(encoding="utf-8"))
+    assert data["mcp"]["headers"]["Authorization"] == "Bearer secret-token"
+    if os.name == "posix":
         assert (connection_file.stat().st_mode & 0o777) == 0o600
 
 
@@ -225,6 +259,23 @@ class FakeCloudflaredProcess:
         self._exited = True
 
 
+def cloudflared_only(fake_process, real_popen=subprocess.Popen):
+    """Fake the cloudflared launch and let every other subprocess through.
+
+    Patching subprocess.Popen wholesale also captures subprocess.run, which is built on
+    `with Popen(...) as process:`. Nothing in these three tests reaches subprocess.run
+    today, but the blanket patch is the same shape that broke the launcher's interrupt
+    test on macOS, where process_identity shells out to `ps`.
+    """
+
+    def popen(command, *args, **kwargs):
+        if command and "cloudflared" in str(command[0]):
+            return fake_process
+        return real_popen(command, *args, **kwargs)
+
+    return popen
+
+
 @pytest.mark.unit
 def test_start_cloudflare_tunnel_extracts_url_from_process_output():
     fake_process = FakeCloudflaredProcess(
@@ -233,7 +284,7 @@ def test_start_cloudflare_tunnel_extracts_url_from_process_output():
 
     with (
         patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
-        patch("rigout.mcp_url_launcher.subprocess.Popen", return_value=fake_process) as popen,
+        patch("rigout.mcp_url_launcher.subprocess.Popen", side_effect=cloudflared_only(fake_process)) as popen,
     ):
         process, url = start_cloudflare_tunnel(8765, timeout=5)
 
@@ -249,7 +300,7 @@ def test_start_cloudflare_tunnel_raises_when_process_exits_without_url():
 
     with (
         patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
-        patch("rigout.mcp_url_launcher.subprocess.Popen", return_value=fake_process),
+        patch("rigout.mcp_url_launcher.subprocess.Popen", side_effect=cloudflared_only(fake_process)),
     ):
         with pytest.raises(RuntimeError, match="exited before publishing a tunnel URL"):
             start_cloudflare_tunnel(8765, timeout=5)
@@ -261,7 +312,7 @@ def test_start_cloudflare_tunnel_terminates_process_and_raises_on_timeout():
 
     with (
         patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
-        patch("rigout.mcp_url_launcher.subprocess.Popen", return_value=fake_process),
+        patch("rigout.mcp_url_launcher.subprocess.Popen", side_effect=cloudflared_only(fake_process)),
     ):
         with pytest.raises(RuntimeError, match="Timed out waiting for cloudflared"):
             start_cloudflare_tunnel(8765, timeout=0.3)

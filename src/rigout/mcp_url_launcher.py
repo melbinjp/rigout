@@ -10,6 +10,7 @@ Examples:
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -18,6 +19,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -29,6 +31,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from ._version import __version__
+from .clipboard import copy_to_clipboard
 from .lifecycle import (
     MAX_LOG_TAIL_LINES,
     RuntimePaths,
@@ -45,6 +49,7 @@ from .lifecycle import (
     remove_pid,
     runtime_status,
     secure_file,
+    state_lock,
     terminate_process,
     utc_now,
     write_json_secure,
@@ -60,19 +65,139 @@ from .mcp_http_server import (
     normalize_path,
     write_connection_file,
 )
+from .security_validator import security_validator
 
 CLOUDFLARE_URL_PATTERN = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 CLOUDFLARED_DOWNLOAD_BASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download"
+LOOPBACK_HOST_NAMES = frozenset({"localhost"})
+NO_AUTH_WARNING = (
+    "Warning: --no-auth disables bearer authentication while binding {host}, "
+    "which is reachable beyond this machine. Anyone who can reach it can run commands."
+)
+LIFECYCLE_COMMANDS = frozenset({"start", "status", "logs", "stop", "url"})
+STARTUP_TIMEOUT_SECONDS = 90
+STARTUP_POLL_SECONDS = 0.2
+FOLLOW_POLL_SECONDS = 0.25
+# `logs --follow` only needs to know whether Rigout is still alive so it can stop; asking
+# every poll costs a process-identity lookup, which is a `ps` on systems without /proc.
+FOLLOW_LIVENESS_SECONDS = 1.0
 
 
-def wait_for_health(url: str, timeout: int = 30) -> bool:
+def is_loopback_host(host: str) -> bool:
+    """Return whether a bind address is reachable only from this machine.
+
+    All of 127.0.0.0/8 is loopback, so this cannot be string equality against 127.0.0.1.
+    Wildcard binds ("0.0.0.0", "::", "") and unparseable hosts are not loopback, which is
+    the safe answer: an unrecognized bind gets authentication rather than silence.
+    """
+    candidate = host.strip().strip("[]").lower()
+    if candidate in LOOPBACK_HOST_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False
+
+
+def is_public_start(args: argparse.Namespace) -> bool:
+    """Return whether a start reaches beyond loopback and therefore needs a bearer token."""
+    return bool(args.tunnel != "none" or args.public_url or not is_loopback_host(str(args.host or "")))
+
+
+class StartupInterruptedError(Exception):
+    """The operator interrupted a start before the server was serving."""
+
+
+# Set by the interrupt handler. The startup waits are long -- 30s for health, 45s for the
+# tunnel, and a ~35 MB cloudflared download -- and a handler that only stops processes
+# cannot end them, because during startup those processes do not exist yet.
+STARTUP_INTERRUPTED = threading.Event()
+
+
+def interruptible_sleep(seconds: float) -> None:
+    """Sleep in short steps so an interrupt is noticed promptly.
+
+    Deliberately built from `time.sleep` rather than `Event.wait`: a signal handler runs
+    in the main thread between bytecodes, and short sleeps are interruptible on both
+    Windows and POSIX without depending on how a lock wait handles signals.
+    """
+    deadline = time.monotonic() + seconds
+    while not STARTUP_INTERRUPTED.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
+
+
+class ServerExitedError(RuntimeError):
+    """The server process ended before it began answering."""
+
+
+class AddressInUseError(RuntimeError):
+    """Something is already listening where this server was asked to listen."""
+
+
+def ensure_address_available(host: str, port: int) -> None:
+    """Refuse to start when the address is already taken, before starting anything.
+
+    Checked in advance rather than inferred afterwards, because afterwards is too late
+    to tell. A health check only proves something is listening: when the port is already
+    held, our child fails to bind and exits while the process holding it answers health
+    checks immediately, so the launcher reported a healthy start and wrote a connection
+    file describing a server it had not started. Waiting for the child to die does not
+    close that: the foreign answer arrives first.
+
+    A bind that succeeds here can still lose the port before the child claims it, so the
+    child's exit is still watched. This turns the ordinary case into an immediate,
+    accurate message rather than a wrong one.
+    """
+    # Asked by connecting rather than by binding. A trial bind seems the obvious test and
+    # is the wrong one: uvicorn binds with SO_REUSEADDR and a probe without it fails on
+    # the TIME_WAIT connections an earlier run leaves behind, so stopping Rigout and
+    # starting it again would be refused when the address was in fact free. Nothing
+    # accepts connections on a port held only by TIME_WAIT, so connecting distinguishes
+    # a live listener from the wreckage of a dead one.
+    target = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host.strip("[]")
+    try:
+        with socket.create_connection((target, port), timeout=1.5):
+            pass
+    except OSError:
+        return
+
+    raise AddressInUseError(
+        f"{host}:{port} already has something listening on it, so Rigout did not start. "
+        f"Whatever is answering there is not this server, and starting anyway would have "
+        f"produced a connection file describing it. Run `rigout status` to see whether it "
+        f"is another Rigout, or start this one with a different --port."
+    )
+
+
+def wait_for_health(url: str, timeout: int = 30, process: subprocess.Popen | None = None) -> bool:
+    """Wait until the server answers, and stop early if the server we started has died.
+
+    `process` matters more than it looks. A 200 from this URL only proves that something
+    is listening on that port, not that it is ours: when the port is already taken, our
+    child fails to bind and exits while the process that holds it keeps answering health
+    checks. Without this the launcher reported a healthy start, wrote a connection file,
+    and handed the caller a URL and a token belonging to a server it did not start and
+    whose auth may be different or absent.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if STARTUP_INTERRUPTED.is_set():
+            return False
+        if process is not None and process.poll() is not None:
+            raise ServerExitedError(
+                f"The MCP server exited with status {process.returncode} before it started serving. "
+                "The usual cause is that the address is already in use, in which case anything "
+                "already listening there is not this server; check with `rigout status`, or start "
+                "with a different --port."
+            )
         try:
             with urllib.request.urlopen(url, timeout=2) as response:
                 return bool(response.status == 200)
         except (OSError, urllib.error.URLError):
-            time.sleep(0.5)
+            interruptible_sleep(0.5)
     return False
 
 
@@ -142,7 +267,16 @@ def verify_checksum(path: Path, expected_sha256: str) -> bool:
 
 def download_file(url: str, destination: Path, expected_sha256: str | None = None) -> None:
     with urllib.request.urlopen(url, timeout=120) as response, destination.open("wb") as output:
-        shutil.copyfileobj(response, output)
+        # Copied in chunks rather than with copyfileobj so an interrupt is honoured part
+        # way through: this is a ~35 MB download and it is the longest wait a first run
+        # can hit. The check runs between chunks, so a stalled socket still waits.
+        while True:
+            if STARTUP_INTERRUPTED.is_set():
+                raise StartupInterruptedError
+            chunk = response.read(64 * 1024)
+            if not chunk:
+                break
+            output.write(chunk)
 
     if expected_sha256 and not verify_checksum(destination, expected_sha256):
         destination.unlink()
@@ -310,6 +444,9 @@ def start_cloudflare_tunnel(
 
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if STARTUP_INTERRUPTED.is_set():
+            process.terminate()
+            raise StartupInterruptedError
         if process.poll() is not None:
             raise RuntimeError("cloudflared exited before publishing a tunnel URL")
         try:
@@ -354,6 +491,12 @@ def add_start_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Do not generate a credential-bearing setup URL for public/tunnel mode",
     )
+    parser.add_argument(
+        "--no-copy-url",
+        dest="copy_url",
+        action="store_false",
+        help="Do not copy the agent setup URL to the system clipboard when it is printed",
+    )
     parser.add_argument("--cloudflared-path", help="Use this cloudflared binary instead of PATH/cache lookup")
     parser.add_argument(
         "--no-cloudflared-download",
@@ -365,8 +508,16 @@ def add_start_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Do not generate a bearer token for public/tunnel URLs. Unsafe for internet-exposed servers.",
     )
-    parser.add_argument("--json-response", action="store_true")
-    parser.add_argument("--stateless", action="store_true")
+    parser.add_argument(
+        "--json-response",
+        action="store_true",
+        help="Return MCP responses as JSON bodies instead of a server-sent event stream",
+    )
+    parser.add_argument(
+        "--stateless",
+        action="store_true",
+        help="Handle each MCP request independently, without a persistent session",
+    )
     parser.add_argument("--detach", action="store_true", help="Run in the background and return after startup")
     parser.add_argument("--state-dir", help="Runtime state directory (or set RIGOUT_STATE_DIR)")
     parser.add_argument(
@@ -375,13 +526,25 @@ def add_start_arguments(parser: argparse.ArgumentParser) -> None:
         default="text",
         help="CLI result format; JSON startup output requires --detach",
     )
+    # Internal: set only by start_detached on the child command line, alongside
+    # RIGOUT_DETACHED_CHILD in the child environment. main() rejects it without that
+    # marker, because on its own it skips the single-instance check and the log
+    # truncation, which is how one user-typed flag turns into two launchers sharing a
+    # state directory.
     parser.add_argument("--managed-child", action="store_true", help=argparse.SUPPRESS)
+    add_version_argument(parser)
+
+
+def add_version_argument(parser: argparse.ArgumentParser) -> None:
+    """Add --version to every subcommand, so it works wherever a user reaches for it."""
+    parser.add_argument("--version", "-V", action="version", version=f"rigout {__version__}")
 
 
 def add_management_arguments(parser: argparse.ArgumentParser) -> None:
     """Add options shared by status, logs, and stop."""
     parser.add_argument("--state-dir", help="Runtime state directory (or set RIGOUT_STATE_DIR)")
-    parser.add_argument("--output", choices=["text", "json"], default="text")
+    parser.add_argument("--output", choices=["text", "json"], default="text", help="Result format")
+    add_version_argument(parser)
 
 
 def bounded_tail_count(value: str) -> int:
@@ -395,29 +558,84 @@ def bounded_tail_count(value: str) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse lifecycle commands while preserving the legacy flag-only start form."""
     raw_args = list(sys.argv[1:] if argv is None else argv)
-    command = raw_args[0] if raw_args and raw_args[0] in {"start", "status", "logs", "stop"} else "start"
-    explicit_lifecycle = bool(raw_args and raw_args[0] in {"start", "status", "logs", "stop"})
+    command = raw_args[0] if raw_args and raw_args[0] in LIFECYCLE_COMMANDS else "start"
+    explicit_lifecycle = bool(raw_args and raw_args[0] in LIFECYCLE_COMMANDS)
     command_args = raw_args[1:] if explicit_lifecycle else raw_args
+
+    if raw_args and not explicit_lifecycle and not raw_args[0].startswith("-"):
+        # Otherwise a typo like `rigout stpo` is parsed as a flag-only start and reported
+        # as an unrecognized argument against start's usage, which never names the
+        # subcommands the user was reaching for.
+        parser = argparse.ArgumentParser(prog="rigout")
+        parser.error(
+            f"unknown command {raw_args[0]!r}. Expected one of: {', '.join(sorted(LIFECYCLE_COMMANDS))}. "
+            "Run `rigout --help` for the flag-only start form."
+        )
 
     if command == "start":
         parser = argparse.ArgumentParser(
             prog="rigout start" if explicit_lifecycle else "rigout",
             description="Set up and run a URL-based hardware MCP server",
-            epilog=("Lifecycle commands: rigout start [--detach], rigout status, rigout logs [--follow], rigout stop"),
+            epilog=(
+                "Lifecycle commands: rigout start [--detach], rigout status, rigout url, "
+                "rigout logs [--follow], rigout stop"
+            ),
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         )
         add_start_arguments(parser)
     elif command == "status":
-        parser = argparse.ArgumentParser(prog="rigout status", description="Show managed Rigout status")
+        parser = argparse.ArgumentParser(
+            prog="rigout status",
+            description="Show managed Rigout status",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
         add_management_arguments(parser)
+    elif command == "url":
+        parser = argparse.ArgumentParser(
+            prog="rigout url",
+            description="Print the running server's URL, alone on one line",
+            epilog=(
+                "Prints nothing but the URL to stdout, so it can be copied without selecting "
+                "it out of a busy terminal: `rigout url > url.txt`, `rigout url | xclip -selection clipboard`, "
+                "or `ssh HOST rigout url` from the machine you are actually working on. Reading it "
+                "does not touch the running server."
+            ),
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
+        add_management_arguments(parser)
+        parser.add_argument(
+            "--which",
+            choices=["setup", "mcp", "health"],
+            default="setup",
+            help="Which URL to print; setup is the one an agent needs to fetch the bearer token",
+        )
+        parser.add_argument(
+            "--copy",
+            action="store_true",
+            help="Also copy the URL to the system clipboard",
+        )
     elif command == "logs":
-        parser = argparse.ArgumentParser(prog="rigout logs", description="Read managed Rigout activity")
+        parser = argparse.ArgumentParser(
+            prog="rigout logs",
+            description="Read managed Rigout activity",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
         add_management_arguments(parser)
         parser.add_argument("--tail", type=bounded_tail_count, default=100, help="Number of existing lines to show")
         parser.add_argument("--follow", action="store_true", help="Continue streaming until Rigout stops")
     else:
-        parser = argparse.ArgumentParser(prog="rigout stop", description="Stop managed Rigout")
+        parser = argparse.ArgumentParser(
+            prog="rigout stop",
+            description="Stop managed Rigout",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
         add_management_arguments(parser)
         parser.add_argument("--timeout", type=float, default=10.0, help="Seconds to wait for shutdown")
+        parser.add_argument(
+            "--force",
+            action="store_true",
+            help="Clear recorded state that cannot be verified as Rigout's. Signals no unverified process.",
+        )
 
     parsed = parser.parse_args(command_args)
     parsed.command = command
@@ -473,6 +691,52 @@ def runtime_metadata(
     if resolved_instance_id:
         metadata["instance_id"] = resolved_instance_id
     return metadata
+
+
+def record_child_pids(
+    paths: RuntimePaths,
+    instance_id: str,
+    server_process: subprocess.Popen[str] | None,
+    tunnel_process: subprocess.Popen[str] | None,
+) -> None:
+    """Persist launcher child PIDs so a crashed launcher still leaves them recoverable.
+
+    Identities are resolved before the lock is taken, because that lookup can cost a `ps`
+    and the section is one another launcher may be waiting on.
+    """
+    children = {
+        "server_pid": server_process.pid if server_process else None,
+        "server_process_identity": process_identity(server_process.pid) if server_process else None,
+        "tunnel_pid": tunnel_process.pid if tunnel_process else None,
+        "tunnel_process_identity": process_identity(tunnel_process.pid) if tunnel_process else None,
+    }
+    with state_lock(paths):
+        runtime = read_json(paths.runtime_file)
+        if runtime.get("instance_id") != instance_id:
+            # Another launcher owns the record; recording our children into it would make
+            # `stop` reach for processes that instance never started.
+            return
+        runtime.update(children)
+        write_json_secure(paths.runtime_file, runtime)
+
+
+def stop_recorded_children(paths: RuntimePaths, timeout: float) -> list[int]:
+    """Stop recorded launcher children that outlived their launcher."""
+    runtime = read_json(paths.runtime_file)
+    recorded = (
+        (runtime.get("tunnel_pid"), runtime.get("tunnel_process_identity")),
+        (runtime.get("server_pid"), runtime.get("server_process_identity")),
+    )
+    stopped: list[int] = []
+    for child_pid, identity in recorded:
+        if not isinstance(child_pid, int) or not process_is_running(child_pid):
+            continue
+        # A recycled PID must never be killed, so require the recorded fingerprint
+        if not process_matches_identity(child_pid, identity):
+            continue
+        if terminate_process(child_pid, timeout=timeout):
+            stopped.append(child_pid)
+    return stopped
 
 
 def build_managed_child_command(args: argparse.Namespace, paths: RuntimePaths) -> list[str]:
@@ -535,7 +799,7 @@ def print_json(value: dict[str, Any]) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
-def print_start_result(result: dict[str, Any], setup_url: str | None, output: str) -> None:
+def print_start_result(result: dict[str, Any], setup_url: str | None, output: str, *, copy_url: bool = True) -> None:
     """Print detached startup state for an agent or human."""
     if output == "json":
         print_json(result)
@@ -550,27 +814,56 @@ def print_start_result(result: dict[str, Any], setup_url: str | None, output: st
     print(f"Connection file: {result['connection_file']}")
     print(f"Activity log: {result['activity_log']}")
     if setup_url:
-        print(f"Agent setup URL: {setup_url}")
-        print("Treat the agent setup URL like a password; it can fetch the bearer token.")
-    print("Use `rigout status`, `rigout logs --follow`, and `rigout stop` to manage it.")
+        # Same layout as the foreground start: the URL alone at the left margin, so it
+        # can be selected on its own and nothing else is copied with it.
+        print()
+        print("  Give your AI agent this URL:")
+        print()
+        print(setup_url)
+        print()
+        copied_with = copy_to_clipboard(setup_url) if copy_url else None
+        if copied_with:
+            print(f"  Already copied to your clipboard (via {copied_with}); just paste it.")
+        print("  Treat it like a password: it can fetch the bearer token.")
+        print("  `rigout url` prints it again, alone on one line.")
+    print("Use `rigout status`, `rigout url`, `rigout logs --follow`, and `rigout stop` to manage it.")
+
+
+def reserve_detached_start(
+    args: argparse.Namespace,
+    paths: RuntimePaths,
+    instance_id: str,
+    env: dict[str, str],
+) -> tuple[subprocess.Popen[str] | None, dict[str, Any]]:
+    """Claim the state directory and launch the managed child, or report who holds it.
+
+    Held under the state lock from the "is one already running" question through the PID
+    file write, so two starts cannot both answer "no" and both launch. The launched
+    child's own creation fingerprint is recorded before its PID is published, so a later
+    command can always verify the reservation: there is never a moment where the PID file
+    names a process whose ownership cannot be checked.
+    """
+    with state_lock(paths):
+        existing = runtime_status(paths)
+        if existing["running"]:
+            return None, existing
+
+        initial = runtime_metadata(args, paths, status="starting", pid=0, instance_id=instance_id)
+        write_json_secure(paths.runtime_file, initial)
+        remove_pid(paths)
+
+        command = build_managed_child_command(args, paths)
+        process = launch_detached(command, paths, env)
+        reserved = {**initial, "pid": process.pid, "process_identity": process_identity(process.pid)}
+        write_json_secure(paths.runtime_file, reserved)
+        write_pid(paths, process.pid)
+        return process, reserved
 
 
 def start_detached(args: argparse.Namespace, paths: RuntimePaths) -> int:
     """Launch a background Rigout process and wait for a definitive startup result."""
-    existing = runtime_status(paths)
-    if existing["running"]:
-        message = f"Rigout is already running with PID {existing['pid']}"
-        if args.output == "json":
-            print_json({**existing, "error": message})
-        else:
-            print(message, file=sys.stderr)
-        return 1
-
     paths.prepare()
     instance_id = secrets.token_urlsafe(16)
-    initial = runtime_metadata(args, paths, status="starting", pid=0, instance_id=instance_id)
-    write_json_secure(paths.runtime_file, initial)
-    remove_pid(paths)
 
     env = os.environ.copy()
     env.pop("RIGOUT_AUTH_TOKEN", None)
@@ -584,20 +877,31 @@ def start_detached(args: argparse.Namespace, paths: RuntimePaths) -> int:
     env["RIGOUT_INSTANCE_ID"] = instance_id
     env["PYTHONUNBUFFERED"] = "1"
 
-    command = build_managed_child_command(args, paths)
-    process = launch_detached(command, paths, env)
-    write_pid(paths, process.pid)
+    process, initial = reserve_detached_start(args, paths, instance_id, env)
+    if process is None:
+        message = already_running_message(initial["pid"])
+        if args.output == "json":
+            print_json({**initial, "error": message})
+        else:
+            print(message, file=sys.stderr)
+        return 1
 
-    deadline = time.time() + 90
+    deadline = time.time() + STARTUP_TIMEOUT_SECONDS
     while time.time() < deadline:
-        runtime = runtime_status(paths)
-        owns_runtime = runtime.get("instance_id") == instance_id
-        if owns_runtime and runtime.get("status") == "running" and runtime.get("running"):
-            safe_connection, setup_url = connection_summary(runtime["connection_file"])
-            result = {**runtime, **safe_connection}
-            print_start_result(result, setup_url, args.output)
-            return 0
-        if owns_runtime and runtime.get("status") == "failed":
+        # The record is read directly here rather than through runtime_status: only the
+        # terminal answers need process verification, and verifying on every poll spawns
+        # a `ps` several times a second for the whole startup on systems without /proc.
+        record = read_json(paths.runtime_file)
+        owns_runtime = record.get("instance_id") == instance_id
+        if owns_runtime and record.get("status") == "running":
+            runtime = runtime_status(paths)
+            if runtime.get("running"):
+                safe_connection, setup_url = connection_summary(runtime["connection_file"])
+                result = {**runtime, **safe_connection}
+                print_start_result(result, setup_url, args.output, copy_url=args.copy_url)
+                return 0
+        if owns_runtime and record.get("status") == "failed":
+            runtime = runtime_status(paths)
             message = str(runtime.get("last_error", "Rigout startup failed"))
             if args.output == "json":
                 print_json({**runtime, "error": message})
@@ -614,15 +918,17 @@ def start_detached(args: argparse.Namespace, paths: RuntimePaths) -> int:
                 print(f"Setup failed: {message}", file=sys.stderr)
                 print(f"Activity log: {paths.log_file}", file=sys.stderr)
             return 1
-        time.sleep(0.2)
+        time.sleep(STARTUP_POLL_SECONDS)
 
     runtime = runtime_status(paths)
     runtime_pid = runtime.get("pid") if runtime.get("instance_id") == instance_id else None
     pid_to_stop = runtime_pid if isinstance(runtime_pid, int) else process.pid
     terminate_process(pid_to_stop)
-    remove_pid(paths, pid_to_stop)
     failed = {**initial, "status": "failed", "last_error": "Timed out waiting for managed startup"}
-    write_json_secure(paths.runtime_file, failed)
+    with state_lock(paths):
+        remove_pid(paths, pid_to_stop)
+        if read_json(paths.runtime_file).get("instance_id") == instance_id:
+            write_json_secure(paths.runtime_file, failed)
     if args.output == "json":
         print_json({**runtime_status(paths), "error": failed["last_error"]})
     else:
@@ -631,19 +937,57 @@ def start_detached(args: argparse.Namespace, paths: RuntimePaths) -> int:
     return 1
 
 
+def already_running_message(pid: object) -> str:
+    """Say what is already running and what the operator can do about it."""
+    return (
+        f"Rigout is already running with PID {pid}. Run `rigout status` to see it, or `rigout stop` to stop it first."
+    )
+
+
+def claim_foreground_state(
+    args: argparse.Namespace,
+    paths: RuntimePaths,
+    instance_id: str,
+    detached_child: bool,
+) -> str | None:
+    """Take the state directory for this in-process launcher, or name the holder.
+
+    The "is one already running" question and the PID file write happen under one lock, so
+    the answer cannot go stale between them and let two launchers both claim the directory.
+    """
+    with state_lock(paths):
+        existing = runtime_status(paths)
+        existing_pid = existing.get("pid")
+        # A managed child inherits its parent's instance id, so the reservation its own
+        # parent made is not a conflict, but any other live instance is. Checking by
+        # instance rather than by "am I a child" is what stops a child whose parent lost
+        # a race from writing over the winner's record.
+        if existing["running"] and existing.get("instance_id") != instance_id and existing_pid != os.getpid():
+            return already_running_message(existing_pid)
+        if not detached_child:
+            with open_activity_log(paths, truncate=True):
+                pass
+        write_pid(paths, os.getpid())
+        write_json_secure(
+            paths.runtime_file,
+            runtime_metadata(args, paths, status="starting", pid=os.getpid(), instance_id=instance_id),
+        )
+    return None
+
+
 def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool) -> int:
     """Run the launcher in the foreground, optionally with lifecycle state."""
     detached_child = bool(args.managed_child or os.getenv("RIGOUT_DETACHED_CHILD"))
-    if managed and not detached_child:
-        existing = runtime_status(paths)
-        existing_pid = existing.get("pid")
-        if existing.get("running") and existing_pid != os.getpid():
-            print(f"Setup failed: Rigout is already running with PID {existing_pid}", file=sys.stderr)
-            return 1
+    # Every record this process writes carries this token, and every update it makes later
+    # is refused unless the record on disk still carries it. That is what stops a losing
+    # racer's shutdown from overwriting the winner's live state.
+    instance_id = os.getenv("RIGOUT_INSTANCE_ID") or secrets.token_urlsafe(16)
 
-    is_public = bool(args.tunnel != "none" or args.public_url)
+    is_public = is_public_start(args)
     if not args.auth_token and not args.no_auth and is_public:
         args.auth_token = secrets.token_urlsafe(32)
+    if is_public and args.no_auth and not args.auth_token:
+        print(NO_AUTH_WARNING.format(host=args.host), file=sys.stderr)
     setup_token = None
     if args.auth_token and is_public and not args.no_agent_setup_url:
         setup_token = args.setup_token or secrets.token_urlsafe(32)
@@ -654,20 +998,27 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
     last_error: str | None = None
 
     if managed:
-        paths.prepare()
-        if not detached_child:
-            with open_activity_log(paths, truncate=True):
-                pass
-        write_pid(paths, os.getpid())
-        write_json_secure(paths.runtime_file, runtime_metadata(args, paths, status="starting", pid=os.getpid()))
+        conflict = claim_foreground_state(args, paths, instance_id, detached_child)
+        if conflict:
+            print(f"Setup failed: {conflict}", file=sys.stderr)
+            return 1
 
     def report(message: str = "", *, error: bool = False) -> None:
         print(message, file=sys.stderr if error else sys.stdout)
         if activity_paths:
             append_activity(paths, redact_sensitive_text(message) + "\n")
 
+    STARTUP_INTERRUPTED.clear()
+
     def shutdown(*_: object) -> None:
-        report("\nStopping MCP server...")
+        STARTUP_INTERRUPTED.set()
+        if server_process or tunnel_process:
+            report("\nStopping MCP server...")
+        else:
+            # Announcing a server shutdown before a server exists tells the operator the
+            # opposite of what is happening. Stopping the two Nones below achieves
+            # nothing; what actually ends the start is the flag the waits now watch.
+            report("\nInterrupting startup...")
         stop_process(tunnel_process)
         stop_process(server_process)
 
@@ -684,8 +1035,13 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
                 allow_download=not args.no_cloudflared_download,
                 activity_paths=activity_paths,
             )
+            if managed:
+                record_child_pids(paths, instance_id, server_process, tunnel_process)
 
         mcp_url = resolve_public_mcp_url(args, tunnel_base_url)
+        # Before anything is spawned: a taken port is reported as a taken port, not as a
+        # healthy start against somebody else's server.
+        ensure_address_available(args.host, args.port)
         server_process = start_server(
             args,
             public_url=mcp_url,
@@ -694,13 +1050,16 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
             runtime_cwd=paths.root if managed else None,
         )
         if managed:
+            record_child_pids(paths, instance_id, server_process, tunnel_process)
             threading.Thread(
                 target=stream_process_output,
                 args=(server_process, None, activity_paths),
                 daemon=True,
             ).start()
         local_health_url = health_url_from_mcp_url(local_url(args.host, args.port, args.path), args.path)
-        if not wait_for_health(local_health_url):
+        if not wait_for_health(local_health_url, process=server_process):
+            if STARTUP_INTERRUPTED.is_set():
+                raise StartupInterruptedError
             raise RuntimeError(f"MCP server did not become healthy at {local_health_url}")
 
         setup_url = connection_setup_url(mcp_url, args.path, setup_token) if setup_token else None
@@ -718,30 +1077,69 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
 
         public_health_url = health_url_from_mcp_url(mcp_url, args.path)
         if managed:
-            running = runtime_metadata(args, paths, status="running", pid=os.getpid())
-            running.update(
-                {
-                    "started_at": read_json(paths.runtime_file).get("started_at", utc_now()),
-                    "mcp_url": mcp_url,
-                    "health_url": public_health_url,
-                    "local_health_url": local_health_url,
-                }
-            )
-            write_json_secure(paths.runtime_file, running)
+            running = runtime_metadata(args, paths, status="running", pid=os.getpid(), instance_id=instance_id)
+            with state_lock(paths):
+                running.update(
+                    {
+                        "started_at": read_json(paths.runtime_file).get("started_at", utc_now()),
+                        "mcp_url": mcp_url,
+                        "health_url": public_health_url,
+                        "local_health_url": local_health_url,
+                    }
+                )
+                write_json_secure(paths.runtime_file, running)
+            record_child_pids(paths, instance_id, server_process, tunnel_process)
 
         report()
         report("Hardware MCP server is running.")
         report(f"MCP URL: {mcp_url}")
         report(f"Health: {public_health_url}")
         report(f"Connection file: {Path(args.connection_file).resolve()}")
+        # Always stated. The dangerous case used to be marked by the Auth line being
+        # absent, which is the one posture a reader cannot notice, and the earlier
+        # --no-auth warning has by then scrolled away behind tunnel output.
         if args.auth_token:
-            report("Auth: bearer token written to connection file")
+            report("Auth: bearer token required, written to the connection file")
+        elif is_public:
+            report("Auth: NONE, and this server is reachable beyond this machine.")
+            report("      Anyone who can reach the URL above can run commands on this machine.")
+            report("      Stop it with `rigout stop` and restart without --no-auth to require a token.")
+        else:
+            report("Auth: none, and none needed: bound to loopback, reachable only from this machine")
+            # `rigout` with no arguments is the shortest thing anyone types, and it left
+            # them with a running server and nothing about what to do with it. The two
+            # next steps are the two that exist: point a local client at the URL above,
+            # or expose it to an agent that is somewhere else.
+            report("Next: give the MCP URL above to a client on this machine,")
+            report("      or restart with `rigout --tunnel cloudflare` for an agent elsewhere.")
+            report("      `rigout --help` lists every option.")
         if setup_url and not detached_child:
-            report(f"Agent setup URL: {setup_url}")
-            report("Paste this URL to your AI agent so it can configure itself.")
-            report("Treat the agent setup URL like a password; it can fetch the bearer token.")
+            # Three URLs are on screen by this point and only one of them is the one to
+            # hand over. It is printed alone at the left margin, with everything else
+            # indented, so it is both unmistakable and selectable by itself: a
+            # double- or triple-click gets the URL and no label. Nothing is added to
+            # this line, because anything added would be copied along with it.
+            report()
+            report("  Give your AI agent this URL:")
+            report()
+            report(setup_url)
+            report()
+            copied_with = copy_to_clipboard(setup_url) if args.copy_url else None
+            if copied_with:
+                report(f"  Already copied to your clipboard (via {copied_with}); just paste it.")
+            elif args.copy_url:
+                # Naming the tools turns a dead end into one command to run.
+                report("  No clipboard tool found here, so select the URL above to copy it.")
+                report("  Installing wl-clipboard, xclip, or xsel lets Rigout copy it for you.")
+            report("  Treat it like a password: it can fetch the bearer token.")
+            # Ctrl+C in this terminal stops the server rather than copying, and on a
+            # remote box this is often the only terminal. Both ways out are named here,
+            # before the operator has to go looking for one.
+            report("  Lost it? `rigout url` prints it again, alone on one line.")
+            report("  Only one terminal? Ctrl+C, then start again with --detach to free this one.")
         elif setup_url:
             report("Agent setup URL: stored in the owner-readable connection file")
+            report("Run `rigout url` to print it.")
         report("Press Ctrl+C to stop.")
 
         while server_process.poll() is None:
@@ -753,25 +1151,38 @@ def run_foreground(args: argparse.Namespace, paths: RuntimePaths, managed: bool)
         if return_code in (-signal.SIGTERM, -signal.SIGINT):
             return 0  # normal shutdown via Ctrl+C or terminate
         return return_code
+    except StartupInterruptedError:
+        # An operator-requested stop is not a failure, so the record below reads
+        # "stopped" rather than "failed": last_error is deliberately left unset.
+        report("Startup interrupted. Nothing is running.", error=True)
+        report(f"Activity log: {paths.log_file}", error=True)
+        return 130
     except Exception as exc:
         last_error = str(exc)
         report(f"Setup failed: {exc}", error=True)
+        report(f"Activity log: {paths.log_file}", error=True)
         return 1
     finally:
         stop_process(tunnel_process)
         stop_process(server_process)
         if managed:
-            current = read_json(paths.runtime_file)
-            current.update(
-                {
-                    "status": "failed" if last_error else "stopped",
-                    "stopped_at": utc_now(),
-                }
-            )
-            if last_error:
-                current["last_error"] = last_error
-            write_json_secure(paths.runtime_file, current)
-            remove_pid(paths, os.getpid())
+            with state_lock(paths):
+                current = read_json(paths.runtime_file)
+                # A start that lost a race to bind the port must report its own failure
+                # and nothing else. Without this check it writes "stopped" over the
+                # winner's live record, and the CLI then reports a running server as
+                # stopped and refuses to stop it.
+                if current.get("instance_id") == instance_id:
+                    current.update(
+                        {
+                            "status": "failed" if last_error else "stopped",
+                            "stopped_at": utc_now(),
+                        }
+                    )
+                    if last_error:
+                        current["last_error"] = last_error
+                    write_json_secure(paths.runtime_file, current)
+                remove_pid(paths, os.getpid())
 
 
 def handle_status(args: argparse.Namespace, paths: RuntimePaths) -> int:
@@ -783,6 +1194,13 @@ def handle_status(args: argparse.Namespace, paths: RuntimePaths) -> int:
         print(f"Rigout status: {status['status']}")
         if status.get("pid"):
             print(f"PID: {status['pid']}")
+        if status.get("ownership_mismatch"):
+            # Otherwise this reads as a live PID under a stopped status, with no hint of
+            # why, and no indication that there is a command that resolves it.
+            print(
+                "The recorded PID is live but is not Rigout; another process has reused it. "
+                "Run `rigout stop --force` to clear the recorded state.",
+            )
         if status.get("mcp_url"):
             print(f"MCP URL: {status['mcp_url']}")
         print(f"Connection file: {status['connection_file']}")
@@ -790,13 +1208,140 @@ def handle_status(args: argparse.Namespace, paths: RuntimePaths) -> int:
     return 0 if status["running"] else 1
 
 
+def handle_url(args: argparse.Namespace, paths: RuntimePaths) -> int:
+    """Print one URL for the running server, alone on a line.
+
+    `start` prints the setup URL once, and in the foreground it then scrolls away
+    behind activity. Recovering it meant selecting a long token out of a live
+    terminal, where Ctrl+C stops the server rather than copying anything. This reads
+    the same value back from the connection file, so it works in either mode and as
+    many times as needed.
+
+    Nothing but the URL goes to stdout, which is what makes `rigout url | xclip` and
+    `ssh HOST rigout url` work; every explanation and warning goes to stderr.
+    """
+    status = runtime_status(paths)
+    connection_file = Path(status.get("connection_file") or paths.connection_file)
+    if not connection_file.exists():
+        print(
+            f"No connection file at {connection_file}. Start Rigout first, or pass --state-dir "
+            "if it was started with one.",
+            file=sys.stderr,
+        )
+        return 1
+
+    summary, setup_url = connection_summary(connection_file)
+    urls = {"setup": setup_url, "mcp": summary.get("mcp_url"), "health": summary.get("health_url")}
+
+    if args.output == "json":
+        print_json({"connection_file": str(connection_file), **{f"{k}_url": v for k, v in urls.items()}})
+        # The same warning the text path gives. It was missing here, so the machine
+        # -readable form handed over a credential-bearing URL and said nothing about it;
+        # stderr keeps stdout a single parseable object either way.
+        if urls["setup"]:
+            print("The setup_url is credential-equivalent; it can fetch the bearer token.", file=sys.stderr)
+        return 0 if urls[args.which] else 1
+
+    chosen = urls[args.which]
+    if not chosen:
+        if args.which == "setup":
+            # A local-only server has no setup URL by design, so say which case this
+            # is rather than reporting the value as merely missing.
+            print(
+                "This server has no agent setup URL. One exists only for a server that is "
+                "reachable off this machine and has an auth token; a loopback server does not "
+                "need one. Use `rigout url --which mcp` for the MCP endpoint.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"No {args.which} URL recorded in {connection_file}.", file=sys.stderr)
+        return 1
+
+    print(chosen)
+    if args.copy:
+        copied_with = copy_to_clipboard(chosen)
+        # Both outcomes go to stderr: stdout carries the URL and nothing else, which is
+        # what makes this command safe to pipe.
+        if copied_with:
+            print(f"Copied to the clipboard via {copied_with}.", file=sys.stderr)
+        else:
+            print(
+                "No clipboard tool was found, so nothing was copied. Install wl-clipboard, "
+                "xclip, or xsel, or redirect this command's output instead.",
+                file=sys.stderr,
+            )
+    if args.which == "setup":
+        print("Treat this like a password; it can fetch the bearer token.", file=sys.stderr)
+    return 0
+
+
+def sanitize_activity_line(line: str) -> str:
+    """Redact one activity-log line exactly as the MCP activity tool redacts it.
+
+    `rigout logs` and `get_server_activity` are two views of one file. Leaving the
+    operator view less redacted than the agent view is a trap for whoever next logs
+    something sensitive; the unredacted file is still on disk at the path `status` prints.
+    """
+    return security_validator.sanitize_command_output(redact_sensitive_text(line))
+
+
+def follow_activity_log(paths: RuntimePaths) -> int:
+    """Stream the activity log until Rigout stops, surviving a restart's truncation."""
+    try:
+        source = paths.log_file.open(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        print(f"No activity log exists at {paths.log_file}", file=sys.stderr)
+        return 1
+
+    try:
+        with source:
+            source.seek(0, os.SEEK_END)
+            observed_size = os.fstat(source.fileno()).st_size
+            idle_after_stop = 0
+            running = True
+            checked_at = 0.0
+            while True:
+                line = source.readline()
+                if line:
+                    print(sanitize_activity_line(line), end="")
+                    idle_after_stop = 0
+                    continue
+
+                current_size = os.fstat(source.fileno()).st_size
+                if current_size < observed_size:
+                    # A concurrent `start` truncates this file. An offset kept past the
+                    # new end reads nothing for the life of the new instance, so the
+                    # follower sits silent forever instead of showing the new run.
+                    source.seek(0)
+                    observed_size = current_size
+                    continue
+                observed_size = current_size
+
+                now = time.monotonic()
+                if now - checked_at >= FOLLOW_LIVENESS_SECONDS:
+                    checked_at = now
+                    running = runtime_status(paths)["running"]
+                if running:
+                    time.sleep(FOLLOW_POLL_SECONDS)
+                    continue
+                idle_after_stop += 1
+                if idle_after_stop >= 2:
+                    break
+                time.sleep(FOLLOW_POLL_SECONDS)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
 def handle_logs(args: argparse.Namespace, paths: RuntimePaths) -> int:
     """Print or follow the managed activity log."""
     if args.follow and args.output == "json":
-        print("--output json cannot be combined with --follow; follow output is a text stream", file=sys.stderr)
+        # Reported as JSON, because the caller asked for JSON. The reason is kept: a
+        # refusal that does not say why leaves the caller guessing at the fix.
+        print_json({"error": "--output json cannot be combined with --follow; follow output is a text stream"})
         return 2
 
-    lines = read_tail(paths.log_file, max(0, args.tail))
+    lines = [sanitize_activity_line(line) for line in read_tail(paths.log_file, max(0, args.tail))]
     if args.output == "json":
         print_json(
             {
@@ -810,31 +1355,25 @@ def handle_logs(args: argparse.Namespace, paths: RuntimePaths) -> int:
     for line in lines:
         print(line)
     if not args.follow:
-        return 0 if paths.log_file.exists() else 1
-
-    try:
-        with paths.log_file.open(encoding="utf-8", errors="replace") as source:
-            source.seek(0, os.SEEK_END)
-            idle_after_stop = 0
-            while True:
-                line = source.readline()
-                if line:
-                    print(line, end="")
-                    idle_after_stop = 0
-                    continue
-                if runtime_status(paths)["running"]:
-                    time.sleep(0.25)
-                    continue
-                idle_after_stop += 1
-                if idle_after_stop >= 2:
-                    break
-                time.sleep(0.25)
-    except FileNotFoundError:
-        print(f"No activity log exists at {paths.log_file}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
+        if not paths.log_file.exists():
+            # --follow already said this. Printing zero bytes and exiting 1 on the
+            # default path left the user with no way to tell "no log yet" from "empty".
+            print(f"No activity log exists at {paths.log_file}", file=sys.stderr)
+            return 1
         return 0
-    return 0
+
+    return follow_activity_log(paths)
+
+
+def clear_runtime_state(paths: RuntimePaths, pid: int | None) -> None:
+    """Drop the recorded reservation so the next command starts from a clean slate."""
+    with state_lock(paths):
+        runtime = read_json(paths.runtime_file)
+        runtime.update({"status": "stopped", "stopped_at": utc_now(), "cleared": True})
+        for key in ("pid", "process_identity", "instance_id"):
+            runtime.pop(key, None)
+        write_json_secure(paths.runtime_file, runtime)
+        remove_pid(paths, pid)
 
 
 def handle_stop(args: argparse.Namespace, paths: RuntimePaths) -> int:
@@ -842,12 +1381,19 @@ def handle_stop(args: argparse.Namespace, paths: RuntimePaths) -> int:
     status = runtime_status(paths)
     pid = read_pid(paths)
     if not pid or not process_is_running(pid):
+        # The launcher can die without running its shutdown handler, leaving its
+        # children serving; they stay recorded so stop can still reach them.
+        orphans = stop_recorded_children(paths, args.timeout)
         remove_pid(paths)
         result = {**status, "status": "stopped", "running": False, "pid": None}
+        if orphans:
+            result["stopped_children"] = orphans
         if args.output == "json":
             print_json(result)
         else:
             print("Rigout is not running.")
+            if orphans:
+                print(f"Stopped orphaned child processes: {', '.join(str(child) for child in orphans)}")
         return 0
 
     runtime = read_json(paths.runtime_file)
@@ -856,15 +1402,47 @@ def handle_stop(args: argparse.Namespace, paths: RuntimePaths) -> int:
         or runtime.get("pid") != pid
         or not process_matches_identity(pid, runtime.get("process_identity"))
     ):
-        message = "Refusing to stop a PID that is not recorded as a managed Rigout launcher"
-        if args.output == "json":
-            print_json({**status, "error": message})
-        else:
-            print(message, file=sys.stderr)
-        return 1
+        # The recorded PID is live but is not verifiably this Rigout, so it may belong to
+        # an unrelated process that reused the number. Signalling it is never acceptable.
+        # --force therefore clears the record rather than killing anything: it gets the
+        # user out of a state the CLI cannot otherwise leave, without acting on a process
+        # Rigout does not own.
+        if not args.force:
+            message = (
+                f"Refusing to stop PID {pid}: it is not recorded as a managed Rigout launcher, so it may be an "
+                "unrelated process that reused the number. Nothing was signalled. Run `rigout stop --force` to "
+                "clear the recorded state without signalling any process."
+            )
+            if args.output == "json":
+                print_json({**status, "error": message})
+            else:
+                print(message, file=sys.stderr)
+            return 1
 
-    runtime["status"] = "stopping"
-    write_json_secure(paths.runtime_file, runtime)
+        # Recorded children are still reaped, because each is reaped only when its own
+        # recorded fingerprint matches; that check is unaffected by the launcher's.
+        orphans = stop_recorded_children(paths, args.timeout)
+        clear_runtime_state(paths, pid)
+        forced = (
+            f"Cleared the recorded Rigout state. PID {pid} was not signalled, because it is not verifiably a "
+            "Rigout launcher; if it is a stray Rigout, stop it yourself."
+        )
+        result = {**runtime_status(paths), "forced": forced}
+        if orphans:
+            result["stopped_children"] = orphans
+        if args.output == "json":
+            print_json(result)
+        else:
+            print(forced)
+            if orphans:
+                print(f"Stopped orphaned child processes: {', '.join(str(child) for child in orphans)}")
+        return 0
+
+    with state_lock(paths):
+        runtime = read_json(paths.runtime_file)
+        if runtime.get("pid") == pid:
+            runtime["status"] = "stopping"
+            write_json_secure(paths.runtime_file, runtime)
     stopped = terminate_process(pid, timeout=args.timeout)
     if not stopped:
         message = f"Rigout process {pid} did not stop"
@@ -874,42 +1452,84 @@ def handle_stop(args: argparse.Namespace, paths: RuntimePaths) -> int:
             print(message, file=sys.stderr)
         return 1
 
-    remove_pid(paths, pid)
-    runtime = read_json(paths.runtime_file) or runtime
-    runtime.update({"status": "stopped", "stopped_at": utc_now()})
-    write_json_secure(paths.runtime_file, runtime)
+    orphans = stop_recorded_children(paths, args.timeout)
+    with state_lock(paths):
+        remove_pid(paths, pid)
+        current = read_json(paths.runtime_file)
+        # A start may have reserved the directory while the old launcher was terminating;
+        # recording the old one's shutdown over that reservation would strand the new one.
+        if current.get("pid") == pid or not current:
+            runtime = current or runtime
+            runtime.update({"status": "stopped", "stopped_at": utc_now()})
+            write_json_secure(paths.runtime_file, runtime)
     result = runtime_status(paths)
+    if orphans:
+        result["stopped_children"] = orphans
     if args.output == "json":
         print_json(result)
     else:
         print("Rigout stopped.")
+        if orphans:
+            print(f"Stopped orphaned child processes: {', '.join(str(child) for child in orphans)}")
         print(f"Activity log: {paths.log_file}")
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def run_command(argv: list[str] | None = None) -> int:
+    """Parse one command line and run it."""
     args = parse_args(argv)
     paths = RuntimePaths.resolve(args.state_dir)
 
     if args.command == "status":
         return handle_status(args, paths)
+    if args.command == "url":
+        return handle_url(args, paths)
     if args.command == "logs":
         return handle_logs(args, paths)
     if args.command == "stop":
         return handle_stop(args, paths)
 
+    if args.managed_child and not os.getenv("RIGOUT_DETACHED_CHILD"):
+        print(
+            "--managed-child is internal to `rigout start --detach` and is not a supported option. "
+            "Use `rigout start --detach` to run Rigout in the background.",
+            file=sys.stderr,
+        )
+        return 2
+
     managed = prepare_start_args(args, paths)
     if args.output == "json" and not args.detach and not args.managed_child:
-        print("--output json requires --detach for a finite, machine-readable startup result", file=sys.stderr)
+        message = "--output json requires --detach for a finite, machine-readable startup result"
+        print_json({"error": message})
         return 2
     if args.detach and not args.managed_child:
-        is_public = bool(args.tunnel != "none" or args.public_url)
+        is_public = is_public_start(args)
         if not args.auth_token and not args.no_auth and is_public:
             args.auth_token = secrets.token_urlsafe(32)
+        if is_public and args.no_auth and not args.auth_token:
+            print(NO_AUTH_WARNING.format(host=args.host), file=sys.stderr)
         if args.auth_token and is_public and not args.no_agent_setup_url and not args.setup_token:
             args.setup_token = secrets.token_urlsafe(32)
         return start_detached(args, paths)
     return run_foreground(args, paths, managed)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run one command, turning the two failures a user can cause into messages.
+
+    Without this, an unwritable or blocked state directory ends a first run in a twenty
+    line traceback whose last line is a FileExistsError, with nothing naming the option
+    that fixes it.
+    """
+    try:
+        return run_command(argv)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
+    except OSError as error:
+        print(f"rigout: cannot use the runtime state directory: {error}", file=sys.stderr)
+        print("Pass a writable directory with --state-dir, or set RIGOUT_STATE_DIR.", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

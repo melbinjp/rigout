@@ -4,7 +4,23 @@ from ..ssh_manager import (
     get_tunnel_manager,
     shell_join,
 )
+from ._platform import MACOS, WINDOWS, platform_family
 from ._results import error_result, failure_detail
+
+# Every other tool bounds what it returns; this one did not, and a live server handed
+# back five million characters from a single call. Output that large is a cost and a
+# context problem for the caller long before it is a transport one, and the tail of a
+# build log is rarely the part anyone wanted. Generous enough for real build and test
+# output, and truncation is always stated.
+MAX_COMMAND_OUTPUT_CHARS = 200_000
+
+
+def bounded_command_output(text: str) -> str:
+    """Return command output capped to a stated size."""
+    if len(text) <= MAX_COMMAND_OUTPUT_CHARS:
+        return text
+    dropped = len(text) - MAX_COMMAND_OUTPUT_CHARS
+    return f"{text[:MAX_COMMAND_OUTPUT_CHARS]}\n\n[output truncated: {dropped} more characters]"
 
 
 async def handle_execute_command(arguments: dict) -> CallToolResult:
@@ -36,15 +52,20 @@ async def handle_execute_command(arguments: dict) -> CallToolResult:
         result_text = f"Command executed successfully on {result['endpoint']}\n\n"
         result_text += f"Command: {result['command']}\n"
         result_text += f"Exit Code: {result['exit_code']}\n\n"
-        result_text += f"Output:\n{result['stdout']}"
+        result_text += f"Output:\n{bounded_command_output(result['stdout'])}"
         if result["stderr"]:
-            result_text += f"\n\nErrors:\n{result['stderr']}"
+            result_text += f"\n\nErrors:\n{bounded_command_output(result['stderr'])}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
         result_text = f"Command failed on {result['endpoint']}\n\n"
         result_text += f"Command: {result['command']}\n"
         result_text += f"Exit Code: {result.get('exit_code', 'N/A')}\n"
         result_text += f"Error: {failure_detail(result, 'Command execution failed')}"
+        # A failing command still produces stdout, and it is often the only record of
+        # how far the work got: `build && test` that fails in test discards the whole
+        # build log otherwise. Reported after the error so the failure stays first.
+        if result.get("stdout"):
+            result_text += f"\n\nOutput:\n{bounded_command_output(result['stdout'])}"
         return error_result(result_text)
 
 
@@ -54,6 +75,16 @@ async def handle_create_terminal_session(arguments: dict) -> CallToolResult:
     endpoint = await get_tunnel_manager().auto_failover()
     if not endpoint:
         return error_result("No available hardware endpoints")
+
+    # create_terminal_session returns None both for a name already in use and for a
+    # shell that would not start. Those need different responses from the caller, so
+    # the recoverable one is named here rather than reported as a failure.
+    if session_name and session_name in get_tunnel_manager().terminal_sessions:
+        return error_result(
+            f"Terminal session '{session_name}' already exists. Run commands in it with "
+            "execute_in_terminal, close it with close_terminal_session, or pass a different "
+            "session_name."
+        )
 
     session = await get_tunnel_manager().create_terminal_session(endpoint, session_name)
 
@@ -65,20 +96,35 @@ async def handle_create_terminal_session(arguments: dict) -> CallToolResult:
         result_text += "You can now execute commands in this persistent session using execute_in_terminal."
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
-        return error_result("Failed to create terminal session")
+        return error_result(
+            f"Failed to start a terminal session on {endpoint.hostname}. The endpoint is "
+            "reachable, so the shell itself did not start; check the activity log for the "
+            "underlying error."
+        )
 
 
 async def handle_execute_in_terminal(arguments: dict) -> CallToolResult:
     session_id = arguments["session_id"]
     command = arguments["command"]
     timeout = arguments.get("timeout", 30)
+    use_sudo = arguments.get("use_sudo", False)
+    bypass_security = arguments.get("bypass_security", False)
 
-    result = await get_tunnel_manager().execute_in_session(session_id, command, timeout)
+    if use_sudo and not command.startswith("sudo"):
+        command = f"sudo {command}"
+
+    result = await get_tunnel_manager().execute_in_session(
+        session_id,
+        command,
+        timeout,
+        allow_sudo=use_sudo,
+        bypass_security=bypass_security,
+    )
 
     if result["success"]:
         result_text = f"Command executed in session {session_id}\n\n"
         result_text += f"Command: {result['command']}\n\n"
-        result_text += f"Output:\n{result['output']}"
+        result_text += f"Output:\n{bounded_command_output(result['output'])}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
         return error_result(
@@ -120,13 +166,12 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
         return error_result("No available hardware endpoints")
 
     if package_manager == "auto":
-        endpoint_platform = endpoint.platform.lower()
-        if "win" in endpoint_platform:
+        family = platform_family(endpoint.platform)
+        endpoint_platform = str(endpoint.platform or "").lower()
+        if family == WINDOWS:
             package_manager = "choco"
-        elif "darwin" in endpoint_platform or "mac" in endpoint_platform:
+        elif family == MACOS:
             package_manager = "brew"
-        elif "ubuntu" in endpoint_platform or "debian" in endpoint_platform or "linux" in endpoint_platform:
-            package_manager = "apt"
         elif "centos" in endpoint_platform or "rhel" in endpoint_platform:
             package_manager = "yum"
         else:
@@ -139,6 +184,8 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
         command = f"sudo yum install -y {quoted_packages}"
     elif package_manager == "dnf":
         command = f"sudo dnf install -y {quoted_packages}"
+    elif package_manager == "pacman":
+        command = f"sudo pacman -S --noconfirm {quoted_packages}"
     elif package_manager == "pip":
         command = f"pip install {quoted_packages}"
     elif package_manager == "npm":
@@ -157,10 +204,14 @@ async def handle_install_software(arguments: dict) -> CallToolResult:
         result_text += f"Packages: {', '.join(packages)}\n"
         result_text += f"Package Manager: {package_manager}\n"
         result_text += f"Endpoint: {result['endpoint']}\n\n"
-        result_text += f"Output:\n{result['stdout']}"
+        result_text += f"Output:\n{bounded_command_output(result['stdout'])}"
         return CallToolResult(content=[TextContent(type="text", text=result_text)])
     else:
         result_text = "Software installation failed\n\n"
         result_text += f"Packages: {', '.join(packages)}\n"
         result_text += f"Error: {failure_detail(result, 'Software installation failed')}"
+        # The package manager's own output names the conflict or the missing
+        # repository; without it the caller only learns that installing failed.
+        if result.get("stdout"):
+            result_text += f"\n\nOutput:\n{bounded_command_output(result['stdout'])}"
         return error_result(result_text)

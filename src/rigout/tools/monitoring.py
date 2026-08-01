@@ -4,7 +4,18 @@ from datetime import datetime
 from mcp.types import CallToolResult, TextContent
 
 from ..ssh_manager import get_tunnel_manager
+from ._platform import MACOS, WINDOWS, platform_family
 from ._results import error_result, failure_detail
+
+# `duration` used to be read and then printed without ever being used, so a
+# caller asking for a minute of observation received one instantaneous sample
+# labelled "Duration: 60s". It now controls real sampling, within these bounds:
+# a long window must not outlast an MCP client's request timeout, and a report
+# must not grow without limit.
+MAX_SAMPLE_WINDOW_SECONDS = 120
+SAMPLE_INTERVAL_SECONDS = 5
+MAX_SAMPLES = 4
+MAX_METRIC_OUTPUT_CHARS = 4000
 
 
 async def handle_get_hardware_info(arguments: dict) -> CallToolResult:
@@ -32,9 +43,46 @@ async def handle_get_hardware_info(arguments: dict) -> CallToolResult:
         return error_result("Failed to retrieve hardware information")
 
 
+def bounded_metric_output(text: str) -> str:
+    """Return command output capped to a stated size.
+
+    A single unbounded metric (a busy process table, a long GPU dump) would
+    otherwise be pulled into the caller's context in full.
+    """
+    if len(text) <= MAX_METRIC_OUTPUT_CHARS:
+        return text
+    kept = text[:MAX_METRIC_OUTPUT_CHARS]
+    dropped = len(text) - MAX_METRIC_OUTPUT_CHARS
+    return f"{kept}\n[output truncated: {dropped} more characters]"
+
+
+def sample_plan(window_seconds: int) -> tuple[int, float]:
+    """Return how many samples to take over a window, and the gap between them.
+
+    A zero or sub-second window means one instantaneous sample, which is what
+    this tool has always done. Longer windows are spread over at most
+    `MAX_SAMPLES` rounds so a long observation stays a bounded report.
+    """
+    if window_seconds <= 0:
+        return 1, 0.0
+    samples = min(MAX_SAMPLES, max(2, window_seconds // SAMPLE_INTERVAL_SECONDS + 1))
+    return samples, window_seconds / (samples - 1)
+
+
 async def handle_system_monitoring(arguments: dict) -> CallToolResult:
     metrics = arguments.get("metrics", ["all"])
-    duration = arguments.get("duration", 10)
+
+    # Absent means "one sample now", which keeps every existing caller's
+    # latency unchanged. A caller that asks for a window gets that window.
+    requested_duration = arguments.get("duration")
+    if requested_duration is None:
+        window_seconds = 0
+    elif isinstance(requested_duration, bool) or not isinstance(requested_duration, int):
+        return error_result("The duration argument must be an integer number of seconds")
+    elif requested_duration < 0:
+        return error_result("The duration argument must not be negative")
+    else:
+        window_seconds = min(requested_duration, MAX_SAMPLE_WINDOW_SECONDS)
 
     manager = get_tunnel_manager()
     endpoint = await manager.auto_failover()
@@ -42,11 +90,9 @@ async def handle_system_monitoring(arguments: dict) -> CallToolResult:
         return error_result("No available hardware endpoints")
 
     commands = []
-    endpoint_platform = (endpoint.platform or "").lower()
-    is_windows = "win" in endpoint_platform
-    is_macos = "darwin" in endpoint_platform or "mac" in endpoint_platform
+    family = platform_family(endpoint.platform)
 
-    if is_windows:
+    if family == WINDOWS:
         if "all" in metrics or "cpu" in metrics:
             commands.append(
                 'powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Select-Object -First 1 LoadPercentage,NumberOfLogicalProcessors | ConvertTo-Json -Compress"'
@@ -71,7 +117,7 @@ async def handle_system_monitoring(arguments: dict) -> CallToolResult:
             commands.append(
                 'nvidia-smi 2>NUL || powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json -Compress"'
             )
-    elif is_macos:
+    elif family == MACOS:
         if "all" in metrics or "cpu" in metrics:
             commands.append("top -l 1 | grep 'CPU usage' || sysctl -n hw.ncpu")
         if "all" in metrics or "memory" in metrics:
@@ -122,16 +168,34 @@ async def handle_system_monitoring(arguments: dict) -> CallToolResult:
                 detail = str(exc).strip() or type(exc).__name__
                 return f"Command: {command}\nError: {detail}\n", False
         if result["success"]:
-            return f"Command: {command}\n{result['stdout']}\n", True
+            return f"Command: {command}\n{bounded_metric_output(str(result['stdout']))}\n", True
         detail = failure_detail(result, "Monitoring command failed")
         return f"Command: {command}\nError: {detail}\n", False
 
-    metric_results = await asyncio.gather(*(execute_metric(command) for command in commands))
-    results = [text for text, _ in metric_results]
-    all_succeeded = all(succeeded for _, succeeded in metric_results)
+    sample_count, interval = sample_plan(window_seconds)
+    started = asyncio.get_running_loop().time()
+    results: list[str] = []
+    all_succeeded = True
 
+    for sample_index in range(sample_count):
+        if sample_index:
+            elapsed = asyncio.get_running_loop().time() - started
+            await asyncio.sleep(max(0.0, sample_index * interval - elapsed))
+        offset = asyncio.get_running_loop().time() - started
+        metric_results = await asyncio.gather(*(execute_metric(command) for command in commands))
+        all_succeeded = all_succeeded and all(succeeded for _, succeeded in metric_results)
+        if sample_count > 1:
+            results.append(f"--- Sample {sample_index + 1} of {sample_count} at +{offset:.1f}s ---")
+        results.extend(text for text, _ in metric_results)
+
+    observed = asyncio.get_running_loop().time() - started
     result_text = f"System Monitoring Report for {endpoint.hostname}\n"
-    result_text += f"Duration: {duration}s\n"
+    if sample_count > 1:
+        result_text += f"Samples: {sample_count} over {observed:.1f}s (requested {requested_duration}s)\n"
+    else:
+        result_text += "Samples: 1 (instantaneous; pass duration to sample over a window)\n"
+    if isinstance(requested_duration, int) and requested_duration > MAX_SAMPLE_WINDOW_SECONDS:
+        result_text += f"Requested duration capped at {MAX_SAMPLE_WINDOW_SECONDS}s\n"
     result_text += f"Timestamp: {datetime.now().isoformat()}\n\n"
     result_text += "\n".join(results)
     if not all_succeeded:

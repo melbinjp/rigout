@@ -14,6 +14,63 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Rate limit used when security_config says nothing (or says something invalid).
+DEFAULT_MAX_REQUESTS_PER_MINUTE = 60
+
+# Where SSH host keys are read from when nothing else is configured.
+DEFAULT_KNOWN_HOSTS_PATH = "~/.ssh/known_hosts"
+
+STRICT_HOST_KEYS_ENV = "RIGOUT_STRICT_HOST_KEYS"
+KNOWN_HOSTS_ENV = "RIGOUT_KNOWN_HOSTS"
+
+# A known_hosts setting of "none" (either source) turns host key loading off entirely.
+_KNOWN_HOSTS_DISABLED = {"none", "off", "disabled"}
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def env_flag(name: str) -> bool | None:
+    """Read a boolean environment variable. None means "not set, defer to config"."""
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    logger.warning(f"Ignoring unrecognised value for {name}: {raw!r}")
+    return None
+
+
+def resolve_strict_host_keys(configured: bool) -> bool:
+    """Strict host key checking, environment first, then config, default off.
+
+    Off is the 0.3.0 default deliberately: turning it on would lock out every
+    deployment whose hosts are not already in known_hosts.
+    """
+    from_env = env_flag(STRICT_HOST_KEYS_ENV)
+    if from_env is not None:
+        return from_env
+    return bool(configured)
+
+
+def resolve_known_hosts_path(configured: str) -> Path | None:
+    """Resolve the known_hosts file to read, environment first, then config.
+
+    An empty value means "use the default path"; "none" means do not read any
+    known_hosts file at all, which restores pre-0.3.0 behaviour exactly.
+    """
+    raw = os.getenv(KNOWN_HOSTS_ENV)
+    if raw is None:
+        raw = configured or ""
+    value = raw.strip()
+    if value.lower() in _KNOWN_HOSTS_DISABLED:
+        return None
+    if not value:
+        value = DEFAULT_KNOWN_HOSTS_PATH
+    return Path(value).expanduser()
+
 
 @dataclass
 class ServerConfig:
@@ -56,12 +113,16 @@ class SecurityConfig:
     """Security configuration structure"""
 
     enable_rate_limiting: bool = True
-    max_requests_per_minute: int = 60
+    max_requests_per_minute: int = DEFAULT_MAX_REQUESTS_PER_MINUTE
     enable_command_validation: bool = True
     enable_audit_logging: bool = True
     ai_agent_mode: bool = False  # Enable maximum flexibility for AI agents
     allowed_sudo_commands: list[str] = None
     blocked_commands: list[str] = None
+    # SSH host key checking. Appended rather than grouped with the other security
+    # flags so existing positional construction of SecurityConfig keeps working.
+    strict_host_keys: bool = False  # 0.3.0 default: warn and accept. Flips in 0.4.0.
+    known_hosts_path: str = ""  # "" = ~/.ssh/known_hosts, "none" = read no known_hosts
 
     def __post_init__(self):
         if self.allowed_sudo_commands is None:
@@ -267,6 +328,15 @@ class ConfigManager:
         if self.security_config.max_requests_per_minute < 1:
             issues.append("Max requests per minute must be at least 1")
 
+        # Strict host key checking is useless without a known_hosts file to check against.
+        # Resolved through the environment, so this reports what will actually happen.
+        if resolve_strict_host_keys(self.security_config.strict_host_keys):
+            known_hosts = resolve_known_hosts_path(self.security_config.known_hosts_path)
+            if known_hosts is None:
+                issues.append("Strict host key checking is enabled but known_hosts loading is turned off")
+            elif not known_hosts.exists():
+                issues.append(f"Strict host key checking is enabled but known_hosts file not found: {known_hosts}")
+
         return issues
 
     def get_config_summary(self) -> dict[str, Any]:
@@ -296,6 +366,8 @@ class ConfigManager:
                 "command_validation_enabled": self.security_config.enable_command_validation,
                 "audit_logging_enabled": self.security_config.enable_audit_logging,
                 "max_requests_per_minute": self.security_config.max_requests_per_minute,
+                "strict_host_keys": resolve_strict_host_keys(self.security_config.strict_host_keys),
+                "known_hosts_path": str(resolve_known_hosts_path(self.security_config.known_hosts_path) or ""),
             },
         }
 

@@ -75,6 +75,18 @@ class TestHTTPTransport:
         assert data["security"]["activity_access"]["tool"] == "get_server_activity"
         assert "hardware_info" in data
 
+    def test_deprecated_audit_log_key_is_present_but_null(self, client):
+        """A 0.2.0 client reading security.audit_log gets None, not a KeyError.
+
+        Rigout no longer writes an audit-log file, so the honest value is null. The key
+        itself is retained through 0.3.x so upgrading does not raise on subscript access;
+        it is scheduled for removal in 0.4.0.
+        """
+        security = client.get("/connection.json").json()["security"]
+        assert "audit_log" in security
+        assert security["audit_log"] is None
+        assert security["activity_access"]["tool"] == "get_server_activity"
+
     def test_auth_token_is_advertised_and_required_for_mcp_path(self):
         """Public URL mode should be able to protect the MCP transport with bearer auth."""
         app = create_app(connection_file=None, auth_token="test-token")

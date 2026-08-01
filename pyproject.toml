@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rigout"
-version = "0.2.0"
+version = "0.3.0"
 description = "Let AI agents use your computer through MCP."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,21 +23,34 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+# Bounding policy: rigout is an installed application, not a library others build
+# on, so every runtime dependency is capped below its next major version - the
+# range CI actually tests. An untested major buys our users nothing, and mcp 2.0.0
+# showed that an uncapped one breaks `pip install rigout` silently. Patch and minor
+# releases, including security fixes, still flow through uncapped. Dependabot
+# proposes each major as its own PR and the scheduled CI run catches breakage that
+# lands inside the allowed range.
+#
+# Only packages rigout actually imports are listed. cryptography and pyyaml were
+# declared but imported nowhere; requests is used only by scripts/ and its tests,
+# which are not shipped, so it moved to the dev extra. cryptography still arrives
+# transitively via paramiko, which owns the version it needs.
 dependencies = [
     "mcp>=1.0.0,<2",
     "starlette>=0.37.0,<2",
     "uvicorn>=0.29.0,<1",
     "paramiko>=3.0.0,<6",
-    "requests>=2.28.0",
-    "cryptography>=3.4.8",
-    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "build>=1.2.0",
+    # Used by scripts/jules_review.py and tests/unit/test_jules_review.py only;
+    # neither is shipped in the wheel or sdist.
+    "requests>=2.28.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.3.1",
@@ -79,6 +92,24 @@ markers = [
 ]
 asyncio_mode = "auto"
 addopts = "--strict-markers -v --tb=short"
+# Per-test cap, so a hang fails with a stack trace naming the test instead of
+# running until the CI job's own limit and presenting as runner trouble. This
+# suite spawns subprocesses, opens sockets and polls for health - shapes that
+# hang rather than fail - and the scheduled workflow runs it unattended weekly.
+#
+# 60s is ~40x the slowest test in the suite (1.52s, measured with --durations),
+# so it cannot trip a legitimately slow test even on a loaded Windows runner,
+# and it matches the --timeout=60 ci.yml already passes to the integration job.
+# An explicit --timeout on the command line still overrides this, so debugging
+# a single test locally is unaffected.
+#
+# timeout_method is deliberately NOT set. pytest-timeout uses the signal method
+# where SIGALRM exists (Linux, macOS), which fails only the offending test and
+# lets the run continue; Windows has no SIGALRM so it falls back to the thread
+# method by itself. Pinning either value would force the worse behaviour onto
+# the other platforms. A test that genuinely needs longer should carry its own
+# @pytest.mark.timeout(N) rather than raising this number.
+timeout = 60
 
 [tool.ruff]
 line-length = 120
@@ -105,7 +136,6 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = [
-    "rigout.mcp_workspace_manager",
     "rigout.config_manager"
 ]
 ignore_errors = true

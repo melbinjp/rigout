@@ -1,112 +1,100 @@
-import io
-import json
-from pathlib import Path
+"""Live SSH endpoint tests, driven through Rigout's own TunnelManager.
 
-import paramiko
+These replace three tests that could never run. They required an `ssh_config` block
+containing an inline `private_key`, a `hostname` and a `port`, read from the
+connection file. No version of Rigout has ever written that: `build_connection_data`
+emits no `ssh_config` at v0.1.0 or v0.2.0, and `SSHConfig` holds a
+`private_key_path`, not key material. So they skipped silently for the project's
+whole life, and their skip message named a missing file rather than a schema that
+never existed.
+
+They also drove `paramiko` directly, so had they run they would have tested paramiko
+rather than Rigout. These go through `TunnelManager.execute_command`, which is the
+code that actually ships, so they exercise the remote path's output sanitization and
+command validation - both of which changed in 0.3.0.
+
+Configure with environment variables and they run; leave them unset and they skip
+with a reason that is true:
+
+    RIGOUT_TEST_SSH_HOST      hostname or address of a throwaway machine
+    RIGOUT_TEST_SSH_PORT      optional, defaults to 22
+    RIGOUT_TEST_SSH_USER      optional, defaults to root
+    RIGOUT_TEST_SSH_KEY       path to a private key file
+
+Nothing here writes to the remote host or leaves anything behind.
+"""
+
+import os
+
 import pytest
+
+from rigout.ssh_manager import TunnelEndpoint, TunnelManager
+
+
+def _endpoint() -> TunnelEndpoint:
+    """Build an endpoint from the environment, or skip with an accurate reason."""
+    host = os.getenv("RIGOUT_TEST_SSH_HOST")
+    key = os.getenv("RIGOUT_TEST_SSH_KEY")
+    if not host or not key:
+        pytest.skip("No live SSH endpoint configured; set RIGOUT_TEST_SSH_HOST and RIGOUT_TEST_SSH_KEY")
+    if not os.path.exists(key):
+        pytest.skip(f"RIGOUT_TEST_SSH_KEY points at {key}, which does not exist")
+
+    return TunnelEndpoint(
+        name="integration",
+        hostname=host,
+        port=int(os.getenv("RIGOUT_TEST_SSH_PORT", "22")),
+        username=os.getenv("RIGOUT_TEST_SSH_USER", "root"),
+        private_key_path=key,
+        platform="linux",
+    )
+
+
+@pytest.fixture
+def manager_and_endpoint():
+    endpoint = _endpoint()
+    manager = TunnelManager()
+    manager.endpoints[endpoint.name] = endpoint
+    return manager, endpoint
 
 
 @pytest.mark.integration
-class TestAIAgentConnection:
-    """Connection integration tests based on ai_agent_connection.json"""
+@pytest.mark.asyncio
+async def test_command_executes_over_ssh(manager_and_endpoint):
+    """A command runs on the remote host and its output comes back."""
+    manager, endpoint = manager_and_endpoint
 
-    @pytest.fixture(autouse=True)
-    def check_connection_file(self):
-        """Load connection file or skip if not found"""
-        connection_files = ["ai_agent_connection.json", "connection.json"]
-        self.connection_file = None
-        for file in connection_files:
-            if Path(file).exists():
-                self.connection_file = file
-                break
+    result = await manager.execute_command(endpoint, "echo rigout-integration-ok")
 
-        if not self.connection_file:
-            pytest.skip("No connection configuration file found (ai_agent_connection.json)")
+    assert result["success"], result.get("error") or result.get("stderr")
+    assert "rigout-integration-ok" in result["stdout"]
 
-        with open(self.connection_file, encoding="utf-8") as f:
-            self.connection_info = json.load(f)
 
-        if "ssh_config" not in self.connection_info:
-            pytest.skip("Connection file is not using SSH (e.g. it is HTTP streamable)")
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_credentials_are_scrubbed_from_remote_output(manager_and_endpoint):
+    """Output crossing the SSH channel is sanitized before it reaches the caller.
 
-    @pytest.mark.asyncio
-    async def test_ssh_connection(self):
-        """Test SSH connection using credentials in connection file"""
-        ssh_config = self.connection_info["ssh_config"]
+    This is the property that keeps a secret out of an agent's context and out of
+    whatever model serves it. Unit tests cover the scrubber; only a live endpoint
+    proves it is applied on the path the shipped code actually takes.
+    """
+    manager, endpoint = manager_and_endpoint
+    secret = "sk-live-INTEGRATION-SHOULD-NOT-APPEAR"
 
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    result = await manager.execute_command(endpoint, f"echo 'api_key={secret}'")
 
-        private_key_file = io.StringIO(ssh_config["private_key"])
-        private_key = paramiko.Ed25519Key.from_private_key(private_key_file)
+    assert result["success"], result.get("error") or result.get("stderr")
+    assert secret not in result["stdout"], "credential survived sanitization on the SSH branch"
 
-        ssh.connect(
-            hostname=ssh_config["hostname"],
-            port=ssh_config["port"],
-            username=ssh_config["username"],
-            pkey=private_key,
-            timeout=10,
-        )
 
-        stdin, stdout, stderr = ssh.exec_command('echo "AI Agent Connection Test"')
-        result = stdout.read().decode().strip()
-        ssh.close()
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_destructive_command_is_refused_over_ssh(manager_and_endpoint):
+    """Validation governs the remote path, not just the local one."""
+    manager, endpoint = manager_and_endpoint
 
-        assert result == "AI Agent Connection Test"
+    result = await manager.execute_command(endpoint, "rm -rf /")
 
-    @pytest.mark.asyncio
-    async def test_system_access(self):
-        """Test system commands execution"""
-        ssh_config = self.connection_info["ssh_config"]
-
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        private_key_file = io.StringIO(ssh_config["private_key"])
-        private_key = paramiko.Ed25519Key.from_private_key(private_key_file)
-
-        ssh.connect(
-            hostname=ssh_config["hostname"],
-            port=ssh_config["port"],
-            username=ssh_config["username"],
-            pkey=private_key,
-            timeout=10,
-        )
-
-        # Run system commands
-        stdin, stdout, stderr = ssh.exec_command("whoami")
-        whoami = stdout.read().decode().strip()
-        ssh.close()
-
-        assert len(whoami) > 0
-
-    @pytest.mark.asyncio
-    async def test_sudo_access(self):
-        """Test sudo command execution"""
-        ssh_config = self.connection_info["ssh_config"]
-
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        private_key_file = io.StringIO(ssh_config["private_key"])
-        private_key = paramiko.Ed25519Key.from_private_key(private_key_file)
-
-        ssh.connect(
-            hostname=ssh_config["hostname"],
-            port=ssh_config["port"],
-            username=ssh_config["username"],
-            pkey=private_key,
-            timeout=10,
-        )
-
-        stdin, stdout, stderr = ssh.exec_command('sudo -n echo "Sudo test"', timeout=10)
-        output = stdout.read().decode().strip()
-        error = stderr.read().decode().strip()
-        ssh.close()
-
-        # If passwordless sudo is configured, this should work. Otherwise we expect permission denied or prompt.
-        if "Sudo test" in output:
-            assert True
-        else:
-            # We don't fail the test if sudo requires a password, but we log the check
-            assert "password" in error.lower() or len(error) >= 0
+    assert not result["success"], "a recursive delete of / was not refused over SSH"
+    assert "dangerous" in (result.get("error") or "").lower()

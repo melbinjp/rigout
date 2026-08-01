@@ -6,6 +6,8 @@
 pip install rigout
 ```
 
+Requires Python 3.10 or newer.
+
 ## Run
 
 ```bash
@@ -23,15 +25,21 @@ python -m rigout.mcp_url_launcher --tunnel cloudflare
 
 `rigout --tunnel cloudflare` is the primary foreground shortcut. It prints the agent setup URL and runs until Ctrl+C. Cloudflare quick-tunnel URLs are ephemeral.
 
-## Managed Lifecycle
+## Managed lifecycle
 
 ```bash
 rigout start --tunnel cloudflare --detach
 rigout status
+rigout url
 rigout logs --tail 100
 rigout logs --follow
 rigout stop
+rigout stop --force
 ```
+
+`stop --force` clears recorded state that cannot be verified as Rigout's. It signals no process.
+
+`rigout url` prints the agent setup URL alone on one line and nothing else, so it can be redirected or piped instead of selected out of a running terminal: `rigout url | xclip -selection clipboard`, `rigout url > url.txt`, or `ssh HOST rigout url`. It reads the connection file, so it works in foreground and detached mode alike and never touches the running server. `--which mcp` and `--which health` print the other endpoints. The "treat this like a password" warning goes to stderr, keeping stdout pipeable.
 
 Machine-readable commands:
 
@@ -44,7 +52,15 @@ rigout stop --output json
 
 `--output json` startup requires `--detach`. `logs --follow` is text-only.
 
-## Source Checkout
+Exit codes: 0 succeeded, or `status` found Rigout running. 1 nothing to report or the command failed, including `status` when Rigout is not running. 2 usage error. `stop` exits 0 when nothing was running.
+
+## Connect your agent
+
+Read `connection.json` from the state directory; `rigout status` prints its path. Its `mcp` object holds `transport` (`streamable-http`), `url`, `health_url`, and `headers`. Register `url` with your MCP client as a streamable HTTP server and send every header in `headers`. Client-side field names come from your client's documentation, not from Rigout.
+
+`headers` is empty on a plain local server. With a token it is `{"Authorization": "Bearer <token>"}`, and the connection file is the only place that token is written.
+
+## Source checkout
 
 ```bash
 python -m pip install -e .
@@ -65,6 +81,7 @@ rigout-stdio
 - `connection.json`: generated MCP client configuration; contains the bearer token.
 - `activity.log`: managed startup/runtime output.
 - `runtime.json` and `rigout.pid`: credential-free lifecycle metadata.
+- `rigout.lock`: contentless lock that serializes concurrent lifecycle commands; recreated on demand.
 - `pyproject.toml`: package metadata and build configuration.
 - `src/rigout/`: package source.
 - `tests/`: pytest coverage.
@@ -72,7 +89,7 @@ rigout-stdio
 
 Use `--state-dir PATH` or `RIGOUT_STATE_DIR` to override the state root. Managed files use owner-only modes on POSIX.
 
-## Agent Diagnostics
+## Agent diagnostics
 
 Call `get_server_activity` for bounded, sanitized JSON containing lifecycle status and the most recent 1-200 activity lines (default 50). MCP access does not automatically expose the host's raw terminal window.
 
@@ -87,7 +104,7 @@ python -m build
 python -m twine check dist/rigout-*
 ```
 
-## PyPI Release
+## PyPI release
 
 Rigout publishes from the GitHub Actions tag workflow through PyPI Trusted Publishing. No PyPI API token is required.
 
@@ -106,7 +123,7 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-## Cleanup Before Publishing
+## Cleanup before publishing
 
 ```bash
 git status --short

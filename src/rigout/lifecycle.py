@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,27 @@ from typing import Any, TextIO
 SETUP_TOKEN_PATTERN = re.compile(r"([?&]setup_token=)[^&\s\"'<>]+", re.IGNORECASE)
 BEARER_TOKEN_PATTERN = re.compile(r"(\bBearer\s+)[A-Za-z0-9._~+\-/]+=*", re.IGNORECASE)
 MAX_LOG_TAIL_LINES = 10_000
+STATE_LOCK_NAME = "rigout.lock"
+STATE_LOCK_TIMEOUT = 10.0
+# `ps -o lstart=` costs a fork and exec, and the identity it reports has one-second
+# granularity, so a cache no longer than that granularity cannot make the answer any
+# less precise than the source already is. See process_identity.
+PS_IDENTITY_CACHE_SECONDS = 1.0
+PS_IDENTITY_CACHE_LIMIT = 128
+# Keys runtime_status always reports, so `status --output json` has one shape whether or
+# not Rigout has ever started. They are null until a run records them.
+OPTIONAL_STATUS_KEYS = (
+    "mcp_url",
+    "health_url",
+    "local_health_url",
+    "host",
+    "port",
+    "path",
+    "tunnel",
+    "started_at",
+    "stopped_at",
+    "last_error",
+)
 
 
 def redact_sensitive_text(value: str) -> str:
@@ -51,9 +73,63 @@ def default_state_dir(override: str | Path | None = None) -> Path:
     return (base / "rigout").resolve()
 
 
+def redact_home_path(value: str) -> str:
+    """Replace the current user's home directory prefix with `~`.
+
+    Runtime paths are reported to remote agents, and an absolute path under a home
+    directory names the operating system account that runs Rigout.
+    """
+    try:
+        home = str(Path.home())
+    except (OSError, RuntimeError):
+        return value
+    if not home or len(value) < len(home):
+        return value
+
+    prefix = value[: len(home)]
+    matches = prefix.lower() == home.lower() if os.name == "nt" else prefix == home
+    remainder = value[len(home) :]
+    if not matches or (remainder and remainder[0] not in {"/", "\\"}):
+        return value
+    return f"~{remainder}"
+
+
+_SHARED_DIRECTORY_WARNINGS: set[str] = set()
+
+
+def warn_about_shared_directory(path: Path) -> None:
+    """Warn once when runtime state lives in a directory other users can reach."""
+    if os.name != "posix" or str(path) in _SHARED_DIRECTORY_WARNINGS:
+        return
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    if not mode & (stat.S_IRWXG | stat.S_IRWXO):
+        return
+    _SHARED_DIRECTORY_WARNINGS.add(str(path))
+    print(
+        f"rigout: warning: runtime directory {redact_home_path(str(path))} is reachable by other users "
+        f"(mode {stat.filemode(mode)}). Rigout will not change permissions on a directory it did not "
+        "create; runtime files are still written owner-only.",
+        file=sys.stderr,
+    )
+
+
 def secure_directory(path: Path) -> None:
-    """Create a user-state directory with owner-only POSIX permissions."""
-    path.mkdir(parents=True, exist_ok=True)
+    """Create a user-state directory with owner-only POSIX permissions.
+
+    Permissions are only tightened on a directory Rigout created. A caller that points
+    `--state-dir` or `--connection-file` at an existing shared directory such as /tmp must
+    not have that directory's mode rewritten for everyone else on the machine.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=False, mode=stat.S_IRWXU)
+    except FileExistsError:
+        if not path.is_dir():
+            raise
+        warn_about_shared_directory(path)
+        return
     if os.name == "posix":
         path.chmod(stat.S_IRWXU)
 
@@ -81,6 +157,7 @@ class RuntimePaths:
     runtime_file: Path
     log_file: Path
     connection_file: Path
+    lock_file: Path
 
     @classmethod
     def resolve(cls, state_dir: str | Path | None = None) -> RuntimePaths:
@@ -92,11 +169,86 @@ class RuntimePaths:
             runtime_file=root / "runtime.json",
             log_file=root / "activity.log",
             connection_file=root / "connection.json",
+            lock_file=root / STATE_LOCK_NAME,
         )
 
     def prepare(self) -> None:
         """Create the state directory with restrictive permissions."""
         secure_directory(self.root)
+
+
+def try_lock_descriptor(descriptor: int) -> bool:
+    """Take an exclusive OS-level lock on an open descriptor without blocking.
+
+    Both back ends are released by the kernel when the holding process exits, however it
+    exits. That is the property being bought here: a lock file with a hand-written stale
+    check has to decide whether a holder is dead, and a waiter that decides wrong deletes
+    a live holder's lock.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+    import fcntl
+
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def state_lock(paths: RuntimePaths, timeout: float = STATE_LOCK_TIMEOUT) -> Iterator[bool]:
+    """Serialize the read-modify-write sections that own one state directory.
+
+    runtime.json and the PID file are two files that have to agree, and every lifecycle
+    command reads them, decides, and writes them back. Without this, two `rigout start`
+    moments apart both read "not running", both launch, and the loser's shutdown path
+    overwrites the winner's record.
+
+    Yields whether the lock was actually taken. A filesystem that cannot lock still gets a
+    working CLI: every critical section is additionally guarded by the recorded instance
+    id, so an unlocked section degrades to the previous behaviour rather than failing.
+    """
+    paths.prepare()
+    descriptor: int | None = None
+    held = False
+    try:
+        descriptor = os.open(paths.lock_file, os.O_CREAT | os.O_RDWR, stat.S_IRUSR | stat.S_IWUSR)
+        secure_descriptor(descriptor)
+        deadline = time.monotonic() + timeout
+        while True:
+            held = try_lock_descriptor(descriptor)
+            if held or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        if not held:
+            print(
+                f"rigout: warning: could not lock {redact_home_path(str(paths.root))} within {timeout:g}s; "
+                "continuing without it. Concurrent rigout commands on this state directory may disagree.",
+                file=sys.stderr,
+            )
+    except OSError:
+        held = False
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            descriptor = None
+
+    try:
+        yield held
+    finally:
+        # Closing releases both back ends; there is no unlock step that can be skipped.
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
 
 def write_text_secure(path: Path, value: str) -> None:
@@ -238,6 +390,29 @@ def process_identity(pid: int | None) -> str | None:
     except (FileNotFoundError, IndexError, OSError):
         pass
 
+    return ps_identity(pid)
+
+
+_PS_IDENTITY_CACHE: dict[int, tuple[float, str | None]] = {}
+
+
+def ps_identity(pid: int) -> str | None:
+    """Return a `ps`-derived creation fingerprint for a live PID, cached briefly.
+
+    This is the fallback for systems without /proc, which means every macOS run. Callers
+    poll process state several times a second, and a fork plus exec of `ps` at that rate
+    is a real cost on the platform that can least afford it.
+
+    The cache cannot weaken the PID-reuse guard: `ps -o lstart=` reports whole seconds, so
+    it already cannot tell apart two processes that held one PID within the same second,
+    and the cache is not held longer than that. Callers reach this only after
+    process_is_running has confirmed the PID is still live.
+    """
+    cached = _PS_IDENTITY_CACHE.get(pid)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < PS_IDENTITY_CACHE_SECONDS:
+        return cached[1]
+
     try:
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="],
@@ -249,7 +424,12 @@ def process_identity(pid: int | None) -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     started = result.stdout.strip()
-    return f"ps-lstart:{started}" if result.returncode == 0 and started else None
+    identity = f"ps-lstart:{started}" if result.returncode == 0 and started else None
+
+    if len(_PS_IDENTITY_CACHE) >= PS_IDENTITY_CACHE_LIMIT:
+        _PS_IDENTITY_CACHE.clear()
+    _PS_IDENTITY_CACHE[pid] = (now, identity)
+    return identity
 
 
 def process_matches_identity(pid: int | None, expected_identity: object) -> bool:
@@ -262,13 +442,18 @@ def runtime_status(paths: RuntimePaths) -> dict[str, Any]:
     runtime = read_json(paths.runtime_file)
     pid = read_pid(paths)
     process_exists = process_is_running(pid)
+    # A live PID counts as Rigout only when the recorded creation fingerprint still names
+    # that exact process. There is deliberately no "trust any live process at this PID"
+    # path: an unrelated process that inherits a recorded PID would then make status,
+    # stop and start all believe Rigout is running, with no supported way back out.
     identity_matches = process_matches_identity(pid, runtime.get("process_identity"))
-    ownership_pending = bool(
-        process_exists and runtime.get("status") == "starting" and not runtime.get("process_identity")
-    )
-    running = bool(process_exists and (identity_matches or ownership_pending))
+    running = bool(process_exists and identity_matches)
 
     result: dict[str, Any] = {
+        # Seeded first so a caller can read status["mcp_url"] before the first start and
+        # get null instead of a KeyError. A JSON contract whose key set changes with the
+        # state is not a contract; the recorded values below still win.
+        **dict.fromkeys(OPTIONAL_STATUS_KEYS),
         **runtime,
         "status": runtime.get("status", "stopped"),
         "pid": pid,
@@ -277,9 +462,7 @@ def runtime_status(paths: RuntimePaths) -> dict[str, Any]:
         "connection_file": str(runtime.get("connection_file", paths.connection_file)),
         "activity_log": str(paths.log_file),
     }
-    if ownership_pending:
-        result["ownership_pending"] = True
-    elif process_exists and not identity_matches:
+    if process_exists and not identity_matches:
         result["ownership_mismatch"] = True
     if not running and result["status"] in {"starting", "running", "stopping"}:
         result["status"] = "stopped"
@@ -330,6 +513,27 @@ def launch_detached(
         log.close()
 
 
+def posix_kill_tree(pid: int, signal_number: int) -> None:
+    """Signal a detached launcher's whole process group, falling back to the process itself.
+
+    `launch_detached` starts a new session, so a detached launcher leads its own group and
+    its children are reachable in one call. A launcher that does not lead a group shares the
+    caller's group, which must never be signalled.
+    """
+    get_process_group = getattr(os, "getpgid", None)
+    kill_process_group = getattr(os, "killpg", None)
+    if get_process_group is not None and kill_process_group is not None:
+        try:
+            if get_process_group(pid) == pid:
+                kill_process_group(pid, signal_number)
+                return
+        except OSError:
+            # A dead or foreign process falls through to the single-PID path below,
+            # which reports the same errors the caller already handles.
+            pass
+    os.kill(pid, signal_number)
+
+
 def terminate_process(pid: int, timeout: float = 10.0) -> bool:
     """Stop a managed launcher and wait for its process to disappear."""
     if not process_is_running(pid):
@@ -354,7 +558,7 @@ def terminate_process(pid: int, timeout: float = 10.0) -> bool:
 
     if os.name != "nt":
         try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            posix_kill_tree(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         except ProcessLookupError:
             return True
         deadline = time.time() + 2

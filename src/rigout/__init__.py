@@ -10,6 +10,7 @@ from .ssh_manager import (
     TunnelEndpoint,
     TunnelManager,
     build_env_assignments,
+    build_write_command,
     get_tunnel_manager,
     heredoc_redirect,
     shell_join,
@@ -29,6 +30,9 @@ __all__ = [
     "shell_quote",
     "shell_join",
     "build_env_assignments",
+    "build_write_command",
+    # Deprecated alias for build_write_command, kept because v0.2.0 exported it.
+    # Removed in 0.4.0.
     "heredoc_redirect",
     "TerminalSession",
     "SecurityValidator",

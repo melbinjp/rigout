@@ -7,7 +7,12 @@ from unittest.mock import patch
 import pytest
 
 from rigout.config_manager import (
+    DEFAULT_KNOWN_HOSTS_PATH,
+    DEFAULT_MAX_REQUESTS_PER_MINUTE,
     ConfigManager,
+    SecurityConfig,
+    resolve_known_hosts_path,
+    resolve_strict_host_keys,
 )
 
 
@@ -251,3 +256,92 @@ class TestConfigManager:
         finally:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
+
+
+@pytest.fixture
+def host_key_env(monkeypatch):
+    """Neutralise host key environment variables so tests do not read the dev machine."""
+    monkeypatch.delenv("RIGOUT_STRICT_HOST_KEYS", raising=False)
+    monkeypatch.delenv("RIGOUT_KNOWN_HOSTS", raising=False)
+    return monkeypatch
+
+
+@pytest.mark.unit
+class TestHostKeySettings:
+    """The host key options an operator can set, and how they resolve."""
+
+    def test_defaults_are_backwards_compatible(self, host_key_env):
+        """0.3.0 must behave like 0.2.x for anyone who sets nothing."""
+        security = SecurityConfig()
+
+        assert security.strict_host_keys is False
+        assert security.known_hosts_path == ""
+        assert security.max_requests_per_minute == DEFAULT_MAX_REQUESTS_PER_MINUTE
+        assert resolve_strict_host_keys(security.strict_host_keys) is False
+
+    def test_environment_overrides_configured_strict_mode(self, host_key_env):
+        host_key_env.setenv("RIGOUT_STRICT_HOST_KEYS", "yes")
+        assert resolve_strict_host_keys(False) is True
+
+        host_key_env.setenv("RIGOUT_STRICT_HOST_KEYS", "off")
+        assert resolve_strict_host_keys(True) is False
+
+        # An unreadable value is ignored rather than guessed at
+        host_key_env.setenv("RIGOUT_STRICT_HOST_KEYS", "maybe")
+        assert resolve_strict_host_keys(True) is True
+
+    def test_known_hosts_path_resolution(self, host_key_env, tmp_path):
+        assert resolve_known_hosts_path("") == Path(DEFAULT_KNOWN_HOSTS_PATH).expanduser()
+        assert resolve_known_hosts_path(str(tmp_path / "kh")) == tmp_path / "kh"
+        assert resolve_known_hosts_path("none") is None
+
+        host_key_env.setenv("RIGOUT_KNOWN_HOSTS", str(tmp_path / "from-env"))
+        assert resolve_known_hosts_path("ignored") == tmp_path / "from-env"
+
+        host_key_env.setenv("RIGOUT_KNOWN_HOSTS", "none")
+        assert resolve_known_hosts_path(str(tmp_path / "kh")) is None
+
+    def test_validate_config_flags_strict_mode_without_known_hosts(self, host_key_env, tmp_path):
+        manager = ConfigManager(str(tmp_path / "config.json"))
+        manager.load_config()
+        manager.ssh_config.private_key_path = ""
+        manager.security_config.strict_host_keys = True
+        manager.security_config.known_hosts_path = str(tmp_path / "absent")
+
+        issues = manager.validate_config()
+        assert any("known_hosts file not found" in issue for issue in issues)
+
+        manager.security_config.known_hosts_path = "none"
+        issues = manager.validate_config()
+        assert any("known_hosts loading is turned off" in issue for issue in issues)
+
+        (tmp_path / "known_hosts").write_text("", encoding="utf-8")
+        manager.security_config.known_hosts_path = str(tmp_path / "known_hosts")
+        issues = manager.validate_config()
+        assert not any("known_hosts" in issue for issue in issues)
+
+    def test_config_summary_reports_effective_host_key_settings(self, host_key_env, tmp_path):
+        manager = ConfigManager(str(tmp_path / "config.json"))
+        manager.load_config()
+
+        summary = manager.get_config_summary()
+        assert summary["security"]["strict_host_keys"] is False
+        assert summary["security"]["max_requests_per_minute"] == DEFAULT_MAX_REQUESTS_PER_MINUTE
+
+        host_key_env.setenv("RIGOUT_STRICT_HOST_KEYS", "1")
+        assert manager.get_config_summary()["security"]["strict_host_keys"] is True
+
+    def test_host_key_settings_round_trip_through_the_config_file(self, host_key_env, tmp_path):
+        config_path = tmp_path / "config.json"
+        manager = ConfigManager(str(config_path))
+        manager.load_config()
+        manager.security_config.strict_host_keys = True
+        manager.security_config.known_hosts_path = str(tmp_path / "known_hosts")
+        manager.security_config.max_requests_per_minute = 120
+        assert manager.save_config() is True
+
+        reloaded = ConfigManager(str(config_path))
+        assert reloaded.load_config() is True
+        assert reloaded.security_config.strict_host_keys is True
+        assert reloaded.security_config.known_hosts_path == str(tmp_path / "known_hosts")
+        assert reloaded.security_config.max_requests_per_minute == 120

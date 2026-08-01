@@ -1,10 +1,19 @@
 import asyncio
+import json
+import os
+import tempfile
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from mcp.types import CallToolResult
+from mcp.types import CallToolResult, ImageContent, ResourceLink, TextContent
 
+from rigout import server as rigout_server
+from rigout.security_validator import security_validator
+from rigout.ssh_manager import TunnelManager
+from rigout.terminal_session import LocalTerminalSession
 from rigout.tools import (
+    file_ops,
     handle_bulk_file_transfer,
     handle_close_terminal_session,
     handle_connect_hardware,
@@ -96,6 +105,31 @@ class TestToolHandlers:
         assert "Command failed" in result.content[0].text
         assert "No such file or directory" in result.content[0].text
 
+    async def test_handle_execute_command_failure_keeps_the_output_it_produced(self, mock_manager):
+        """A failing command's stdout is often the only record of how far it got.
+
+        `make && ./run-tests` that fails in the tests discarded the whole build log,
+        and a compound command whose last step failed reported nothing but that last
+        error. The failure stays first; the output it produced follows.
+        """
+        mock_manager.auto_failover.return_value = MagicMock()
+        mock_manager.execute_command.return_value = {
+            "success": False,
+            "endpoint": "test-host",
+            "command": "make && ./run-tests",
+            "exit_code": 1,
+            "stdout": "compiled 41 objects\nlinked target\n",
+            "stderr": "3 tests failed",
+        }
+
+        result = await handle_execute_command({"command": "make && ./run-tests"})
+        text = result.content[0].text
+
+        assert result.isError is True
+        assert "compiled 41 objects" in text
+        assert "3 tests failed" in text
+        assert text.index("3 tests failed") < text.index("compiled 41 objects")
+
     async def test_handle_execute_command_failure_falls_back_to_exit_status(self, mock_manager):
         """A silent nonzero command still returns a deterministic diagnostic."""
         mock_manager.auto_failover.return_value = MagicMock()
@@ -132,6 +166,24 @@ class TestToolHandlers:
         assert isinstance(result, CallToolResult)
         assert "Terminal session created successfully" in result.content[0].text
         assert "sess-123" in result.content[0].text
+
+    async def test_duplicate_session_name_says_so_instead_of_failing_generically(self, mock_manager):
+        """A name already in use is recoverable; a shell that will not start is not.
+
+        create_terminal_session returns None for both, so "Failed to create terminal
+        session" told a caller neither which had happened nor what to do about it. The
+        recoverable case now names itself and offers the three ways out.
+        """
+        mock_manager.auto_failover.return_value = MagicMock()
+        mock_manager.terminal_sessions = {"build": MagicMock()}
+
+        result = await handle_create_terminal_session({"session_name": "build"})
+
+        assert result.isError is True
+        message = result.content[0].text
+        assert "already exists" in message and "build" in message
+        for way_out in ("execute_in_terminal", "close_terminal_session", "session_name"):
+            assert way_out in message, f"the message does not offer {way_out} as a next step"
 
     async def test_handle_execute_in_terminal(self, mock_manager):
         """Test handle_execute_in_terminal"""
@@ -190,6 +242,23 @@ class TestToolHandlers:
         result = await handle_install_software(args)
         assert "completed successfully" in result.content[0].text
 
+    async def test_handle_install_software_pacman(self, mock_manager):
+        """The advertised pacman manager installs instead of erroring as unsupported"""
+        endpoint = MagicMock()
+        mock_manager.auto_failover.return_value = endpoint
+        mock_manager.execute_command.return_value = {
+            "success": True,
+            "endpoint": "test-host",
+            "stdout": "Installed successfully",
+        }
+
+        args = {"packages": ["curl", "git"], "package_manager": "pacman"}
+        result = await handle_install_software(args)
+
+        assert result.isError is False
+        assert "completed successfully" in result.content[0].text
+        assert mock_manager.execute_command.call_args.args[1] == "sudo pacman -S --noconfirm curl git"
+
     async def test_handle_docker_operations(self, mock_manager):
         """Test handle_docker_operations"""
         endpoint = MagicMock()
@@ -221,6 +290,47 @@ class TestToolHandlers:
 
         assert result.isError is True
         assert "Command exited with status 127" in result.content[0].text
+
+    async def test_handle_docker_failure_keeps_the_output_it_produced(self, mock_manager):
+        """Docker writes pull progress and container logs to stdout before it fails."""
+        mock_manager.auto_failover.return_value = MagicMock()
+        mock_manager.execute_command.return_value = {
+            "success": False,
+            "endpoint": "test-host",
+            "command": "docker logs app",
+            "exit_code": 1,
+            "stdout": "app listening on 8080\nOOMKilled\n",
+            "stderr": "container exited",
+        }
+
+        result = await handle_docker_operations({"operation": "logs", "container_name": "app"})
+
+        assert result.isError is True
+        assert "OOMKilled" in result.content[0].text
+
+    async def test_handle_environment_setup_failure_names_the_step_that_failed(self, mock_manager):
+        """environment_setup runs an `&&` chain, so stdout is what says which step got there.
+
+        Without it, a missing interpreter and a single requirement that would not
+        build are the same message.
+        """
+        mock_manager.auto_failover.return_value = MagicMock()
+        mock_manager.execute_command.return_value = {
+            "success": False,
+            "endpoint": "test-host",
+            "command": "python3 -m venv ... && pip install ...",
+            "exit_code": 1,
+            "stdout": "created venv\ncollecting numpy\n",
+            "stderr": "no matching distribution for numpy==999",
+        }
+
+        result = await handle_environment_setup(
+            {"environment_type": "python", "workspace_path": "/tmp/ws", "requirements": ["numpy==999"]}
+        )
+
+        assert result.isError is True
+        assert "created venv" in result.content[0].text
+        assert "no matching distribution" in result.content[0].text
 
     async def test_handle_environment_setup(self, mock_manager):
         """Test handle_environment_setup"""
@@ -370,3 +480,399 @@ class TestToolHandlers:
         result = await handle_manage_tunnels({"action": "list"})
         assert "Configured Tunnel Endpoints" in result.content[0].text
         assert "test-host" in result.content[0].text
+
+
+class StubLocalSession(LocalTerminalSession):
+    """A LocalTerminalSession that records commands instead of running a shell."""
+
+    def __init__(self, session_id: str = "sess-local", output: str = ""):
+        self.session_id = session_id
+        self.endpoint = MagicMock()
+        self.created = datetime.now()
+        self.last_activity = datetime.now()
+        self.is_interactive = True
+        self.output = output
+        self.executed: list[str] = []
+
+    def execute(self, command: str, timeout: int = 30) -> dict:
+        self.executed.append(command)
+        return {
+            "success": True,
+            "exit_code": 0,
+            "output": self.output,
+            "session_id": self.session_id,
+            "command": command,
+        }
+
+
+def make_ssh_session(output: str) -> MagicMock:
+    """A non-local terminal session whose channel replays one chunk of output."""
+    session = MagicMock()
+    session.channel.recv_ready.return_value = True
+    session.channel.recv.return_value = f"{output}\nuser@host:~$ ".encode()
+    return session
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestTerminalSessionSecurity:
+    """Terminal sessions must validate commands and sanitize output like execute_command"""
+
+    @pytest.fixture
+    def temp_config_file(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            config = {
+                "server_config": {"name": "test-server", "version": "1.0.0"},
+                "ssh_config": {"private_key_path": "/test/key", "username": "testuser"},
+                "cloudflare_config": {"domain": "test.com"},
+                "security_config": {"ai_agent_mode": True},
+                "endpoints": [],
+            }
+            json.dump(config, f)
+            f.flush()
+            yield f.name
+        if os.path.exists(f.name):
+            os.unlink(f.name)
+
+    @pytest.fixture
+    def real_manager(self, temp_config_file):
+        """The real TunnelManager, wired into the command tool handlers."""
+        with (
+            patch("rigout.ssh_manager.TunnelManager._start_background_tasks"),
+            patch("rigout.tools.command.get_tunnel_manager") as mock_get_command,
+        ):
+            manager = TunnelManager(config_file=temp_config_file)
+            mock_get_command.return_value = manager
+            yield manager
+
+    async def test_local_terminal_output_is_sanitized(self, real_manager):
+        """Secrets in local terminal session output are redacted before reaching the agent."""
+        session = StubLocalSession(output="DB_PASSWORD=hunter2\napi_key=sk-live-abcdef\n")
+        real_manager.terminal_sessions["sess-local"] = session
+
+        result = await handle_execute_in_terminal({"session_id": "sess-local", "command": "env"})
+
+        assert result.isError is False
+        assert "hunter2" not in result.content[0].text
+        assert "sk-live-abcdef" not in result.content[0].text
+        assert "password=***" in result.content[0].text
+        assert "api_key=***" in result.content[0].text
+
+    async def test_ssh_terminal_output_is_sanitized(self, real_manager):
+        """Secrets in SSH terminal session output are redacted before reaching the agent."""
+        real_manager.terminal_sessions["sess-ssh"] = make_ssh_session("DB_PASSWORD=hunter2 token=abc123")
+
+        result = await handle_execute_in_terminal({"session_id": "sess-ssh", "command": "env"})
+
+        assert result.isError is False
+        assert "hunter2" not in result.content[0].text
+        assert "abc123" not in result.content[0].text
+        assert "password=***" in result.content[0].text
+        assert "token=***" in result.content[0].text
+
+    async def test_destructive_command_in_terminal_is_rejected(self, real_manager):
+        """A destructive command never reaches the session shell."""
+        session = StubLocalSession()
+        real_manager.terminal_sessions["sess-local"] = session
+
+        result = await handle_execute_in_terminal({"session_id": "sess-local", "command": "rm -rf /"})
+
+        assert result.isError is True
+        assert "Security validation failed" in result.content[0].text
+        assert session.executed == []
+
+    async def test_bypass_security_runs_destructive_command_in_terminal(self, real_manager):
+        """The documented escape hatch works the same way as on the one-shot path."""
+        session = StubLocalSession(output="removed")
+        real_manager.terminal_sessions["sess-local"] = session
+
+        result = await handle_execute_in_terminal(
+            {"session_id": "sess-local", "command": "rm -rf /", "bypass_security": True}
+        )
+
+        assert result.isError is False
+        assert session.executed == ["rm -rf /"]
+
+    async def test_sudo_in_terminal_requires_use_sudo(self, real_manager):
+        """Sudo is gated by use_sudo in a session, exactly as on the one-shot path."""
+        session = StubLocalSession(output="restarted")
+        real_manager.terminal_sessions["sess-local"] = session
+
+        blocked = await handle_execute_in_terminal(
+            {"session_id": "sess-local", "command": "sudo systemctl restart nginx"}
+        )
+
+        assert blocked.isError is True
+        assert "Sudo commands not allowed" in blocked.content[0].text
+        assert session.executed == []
+
+        allowed = await handle_execute_in_terminal(
+            {"session_id": "sess-local", "command": "systemctl restart nginx", "use_sudo": True}
+        )
+
+        assert allowed.isError is False
+        assert session.executed == ["sudo systemctl restart nginx"]
+
+    async def test_terminal_session_commands_are_rate_limited(self, real_manager):
+        """Commands in a session are counted, exactly as one-shot commands are."""
+        session = StubLocalSession(output="agent")
+        real_manager.terminal_sessions["sess-local"] = session
+        real_manager._max_requests_per_minute = 2
+
+        for _ in range(2):
+            allowed = await handle_execute_in_terminal({"session_id": "sess-local", "command": "whoami"})
+            assert allowed.isError is False
+
+        limited = await handle_execute_in_terminal({"session_id": "sess-local", "command": "whoami"})
+
+        assert limited.isError is True
+        assert "Rate limit exceeded" in limited.content[0].text
+        assert session.executed == ["whoami", "whoami"]
+
+    async def test_terminal_session_shares_the_endpoint_command_budget(self, real_manager):
+        """A session does not get a second budget of its own on top of the endpoint's."""
+        endpoint = real_manager.get_local_endpoint()
+        session = StubLocalSession(output="agent")
+        session.endpoint = endpoint
+        real_manager.terminal_sessions["sess-local"] = session
+        real_manager._max_requests_per_minute = 1
+
+        # Spend the endpoint's only slot the way execute_command would
+        assert real_manager._check_rate_limit(real_manager._execute_rate_limit_key(endpoint)) is True
+
+        limited = await handle_execute_in_terminal({"session_id": "sess-local", "command": "whoami"})
+
+        assert limited.isError is True
+        assert "Rate limit exceeded" in limited.content[0].text
+        assert session.executed == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestCallToolErrorChannel:
+    """The MCP error round trip must not discard content blocks silently."""
+
+    async def _raise_from(self, content):
+        result = CallToolResult(content=content, isError=True)
+        with patch("rigout.server._handle_call_tool_result", AsyncMock(return_value=result)):
+            with pytest.raises(RuntimeError) as excinfo:
+                await rigout_server.handle_call_tool("file_operations", {})
+        return str(excinfo.value)
+
+    async def test_text_only_error_message_is_unchanged(self):
+        """The common case must keep the exact message it has today."""
+        message = await self._raise_from([TextContent(type="text", text="File operation failed")])
+        assert message == "File operation failed"
+
+    async def test_empty_error_content_falls_back_to_tool_name(self):
+        message = await self._raise_from([])
+        assert message == "Tool 'file_operations' failed"
+
+    async def test_non_text_error_content_is_not_dropped_silently(self):
+        """An image or resource on an error path must survive into the message.
+
+        The SDK can only signal isError by raising, and renders the exception as a
+        single string, so these cannot survive as blocks. They must not vanish.
+        """
+        message = await self._raise_from(
+            [
+                TextContent(type="text", text="Capture failed"),
+                ImageContent(type="image", data="aGk=", mimeType="image/png"),
+                ResourceLink(
+                    type="resource_link",
+                    uri="file:///var/log/rigout.log",
+                    name="rigout.log",
+                ),
+            ]
+        )
+
+        assert "Capture failed" in message
+        assert "image" in message
+        assert "file:///var/log/rigout.log" in message
+
+    async def test_error_content_without_any_text_block_is_still_reported(self):
+        """A purely non-text error must not collapse to a bare fallback."""
+        message = await self._raise_from([ImageContent(type="image", data="aGk=", mimeType="image/png")])
+
+        assert message != "Tool 'file_operations' failed"
+        assert "image" in message
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestFileOperationsParity:
+    """The local and SSH branches of file_ops must not disagree about safety."""
+
+    SECRET = "export API_KEY=sk-live-ABCDEFG\npassword=hunter2\ntoken=ghp_realtokenvalue\n"
+
+    @pytest.fixture
+    def local_manager(self):
+        endpoint = MagicMock()
+        endpoint.private_key_path = "__local__"
+        manager = MagicMock()
+        manager.auto_failover = AsyncMock(return_value=endpoint)
+        with patch("rigout.tools.file_ops.get_tunnel_manager", return_value=manager):
+            yield manager
+
+    @pytest.fixture
+    def remote_manager(self):
+        endpoint = MagicMock()
+        endpoint.private_key_path = "/home/agent/.ssh/id_ed25519"
+        manager = MagicMock()
+        manager.auto_failover = AsyncMock(return_value=endpoint)
+        manager.execute_command = AsyncMock(return_value={"success": True, "endpoint": "test-host", "stdout": ""})
+        with patch("rigout.tools.file_ops.get_tunnel_manager", return_value=manager):
+            yield manager
+
+    @pytest.fixture
+    def secret_file(self, tmp_path):
+        target = tmp_path / "secretfile.env"
+        target.write_text(self.SECRET, encoding="utf-8")
+        return target
+
+    async def test_local_read_redacts_credentials(self, local_manager, secret_file):
+        """A secret refused through execute_command must not be handed over here."""
+        result = await handle_file_operations({"operation": "read", "path": str(secret_file)})
+
+        text = result.content[0].text
+        assert "sk-live-ABCDEFG" not in text
+        assert "hunter2" not in text
+        assert "ghp_realtokenvalue" not in text
+        assert "api_key=***" in text
+        assert "password=***" in text
+
+    async def test_local_bulk_download_redacts_credentials(self, local_manager, secret_file, tmp_path):
+        """The same leak was reachable through the transfer tool."""
+        result = await handle_bulk_file_transfer(
+            {"operation": "download", "source": str(secret_file), "destination": str(tmp_path / "out")}
+        )
+
+        text = result.content[0].text
+        assert "sk-live-ABCDEFG" not in text
+        assert "hunter2" not in text
+        assert "api_key=***" in text
+
+    async def test_local_read_is_bounded_and_says_so(self, local_manager, tmp_path):
+        """An unbounded read exhausts memory and floods the model's context."""
+        big = tmp_path / "big.txt"
+        big.write_bytes(b"A" * (file_ops.MAX_READ_BYTES + 5000))
+
+        result = await handle_file_operations({"operation": "read", "path": str(big)})
+
+        text = result.content[0].text
+        assert len(text) < file_ops.MAX_READ_BYTES + 500
+        assert "truncated" in text
+
+    async def test_local_delete_refuses_a_directory_without_recursive(self, local_manager, tmp_path):
+        """Passing a directory by mistake must not silently destroy the tree."""
+        target = tmp_path / "logdir"
+        (target / "nested").mkdir(parents=True)
+        (target / "nested" / "keep.txt").write_text("important", encoding="utf-8")
+
+        result = await handle_file_operations({"operation": "delete", "path": str(target)})
+
+        assert result.isError is True
+        assert "recursive=true" in result.content[0].text
+        assert (target / "nested" / "keep.txt").exists()
+
+    async def test_local_delete_removes_a_directory_when_asked(self, local_manager, tmp_path):
+        target = tmp_path / "logdir"
+        target.mkdir()
+        (target / "a.txt").write_text("x", encoding="utf-8")
+
+        result = await handle_file_operations({"operation": "delete", "path": str(target), "recursive": True})
+
+        assert result.isError is False
+        assert not target.exists()
+
+    async def test_remote_delete_is_recursive_only_when_asked(self, remote_manager):
+        """The SSH branch must follow the same rule as the local branch."""
+        await handle_file_operations({"operation": "delete", "path": "/tmp/logdir"})
+        plain = remote_manager.execute_command.await_args.args[1]
+
+        await handle_file_operations({"operation": "delete", "path": "/tmp/logdir", "recursive": True})
+        recursive = remote_manager.execute_command.await_args.args[1]
+
+        assert plain.startswith("rm -f ")
+        assert recursive.startswith("rm -rf ")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Use the `rm` builtin carefully.\n",
+            "VER=$(git rev-parse HEAD)\n",
+            "cd /tmp && rm stale.log\n",
+            "it's got an apostrophe\n",
+            "'; rm -rf / #\n",
+            "-leading-dash\n",
+            "100% coverage\n",
+            "",
+        ],
+    )
+    async def test_remote_write_and_append_accept_ordinary_file_content(self, remote_manager, content):
+        """Ordinary file content must be writable and must stay inert.
+
+        Content reaches the shell single-quoted, so it can never be read as syntax
+        no matter what it holds. Every command built here therefore has to pass
+        validation on its own merits: writes must not need a security bypass.
+        """
+        for operation in ("write", "append"):
+            await handle_file_operations({"operation": operation, "path": "/tmp/notes.md", "content": content})
+            command = remote_manager.execute_command.await_args.args[1]
+
+            is_safe, err = security_validator.validate_command(command)
+            assert is_safe is True, f"{operation} of {content!r} was refused: {err}"
+            assert not remote_manager.execute_command.await_args.kwargs.get("bypass_security", False)
+
+    async def test_remote_upload_accepts_ordinary_content_without_a_bypass(self, remote_manager):
+        await handle_bulk_file_transfer({"operation": "upload", "source": "x=$(id)\n", "destination": "/tmp/x.sh"})
+
+        call = remote_manager.execute_command.await_args
+        assert not call.kwargs.get("bypass_security", False)
+        assert security_validator.validate_command(call.args[1])[0] is True
+
+    @pytest.mark.parametrize("operation", ["write", "append"])
+    @pytest.mark.parametrize("device", ["/dev/sda", "/dev/nvme0n1", "/dev/mem"])
+    async def test_remote_write_to_a_raw_device_is_still_refused(self, remote_manager, operation, device):
+        """Not bypassing validation is what keeps this protection reachable.
+
+        A write is a real command once the content is quoted, so redirecting one at
+        a raw disk stays blocked. Passing bypass_security would have discarded this.
+
+        Append is covered because it is a separate code path, not because it is
+        fragile: two independent rules refuse it. `_semantic_danger` lists `>>` in
+        its redirect tokens by design, and the `[<>]` DANGEROUS_PATTERNS entry also
+        matches the first chevron of `>>`. Disabling either one alone leaves this
+        test green, which is the point of asserting the property rather than the
+        mechanism -- the test survives a rewrite of either rule.
+        """
+        await handle_file_operations({"operation": operation, "path": device, "content": "x"})
+
+        command = remote_manager.execute_command.await_args.args[1]
+        is_safe, err = security_validator.validate_command(command)
+        assert is_safe is False, f"{operation} to {device} must be refused: {command!r}"
+        assert "dangerous pattern" in err.lower()
+
+    async def test_remote_operations_never_bypass_validation(self, remote_manager):
+        """No file operation disables the validator, including the content ones."""
+        for arguments in (
+            {"operation": "read", "path": "/tmp/a"},
+            {"operation": "write", "path": "/tmp/a", "content": "x"},
+            {"operation": "append", "path": "/tmp/a", "content": "x"},
+            {"operation": "delete", "path": "/tmp/a"},
+            {"operation": "copy", "path": "/tmp/a", "destination": "/tmp/b"},
+            {"operation": "move", "path": "/tmp/a", "destination": "/tmp/b"},
+            {"operation": "chmod", "path": "/tmp/a", "permissions": "755"},
+        ):
+            await handle_file_operations(arguments)
+            assert not remote_manager.execute_command.await_args.kwargs.get("bypass_security", False)
+
+    async def test_remote_read_is_bounded_at_the_source(self, remote_manager):
+        """Bounding only the local branch would recreate the asymmetry being fixed."""
+        expected = f"head -c {file_ops.MAX_READ_BYTES + 1} "
+
+        await handle_file_operations({"operation": "read", "path": "/tmp/big.log"})
+        assert remote_manager.execute_command.await_args.args[1].startswith(expected)
+
+        await handle_bulk_file_transfer({"operation": "download", "source": "/tmp/big.log", "destination": "/tmp/x"})
+        assert remote_manager.execute_command.await_args.args[1].startswith(expected)

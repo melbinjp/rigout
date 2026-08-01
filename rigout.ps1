@@ -1,10 +1,31 @@
 <#
 .SYNOPSIS
-  Rigout - Rig up your hardware for AI agents.
+  Rigout - convenience wrapper for running from a source checkout.
 
 .DESCRIPTION
-  Unified launcher for the Rigout MCP gateway server and Cloudflare tunnel.
-  By default runs in the foreground. Press Ctrl+C to stop.
+  DEPRECATED as of 0.3.0. Every action here now delegates to the packaged
+  lifecycle CLI, which is the supported entry point:
+
+    rigout start [--detach]   rigout status   rigout logs [--follow]   rigout stop
+
+  Not a like-for-like alias:
+
+    .\rigout.ps1              ->  rigout start --tunnel cloudflare
+    .\rigout.ps1 -Background  ->  rigout start --detach --tunnel cloudflare
+    .\rigout.ps1 stop         ->  rigout stop
+    .\rigout.ps1 status       ->  rigout status
+
+  This wrapper's historical default is --tunnel cloudflare, which puts this
+  machine on a PUBLIC Cloudflare quick-tunnel URL. The installed `rigout` CLI
+  defaults to --tunnel none, serving on loopback only. The default is kept here
+  because changing it would break existing scripts, so the difference is stated
+  instead. For a local-only server, pass -Tunnel none explicitly.
+
+  The wrapper remains so that a checkout with no `pip install` still has a
+  one-command start, and so existing scripts that call it keep working. It
+  deliberately implements no lifecycle logic of its own: the previous version
+  polled for a connection file the launcher writes elsewhere, timed out after
+  45 seconds, and then killed the healthy server it had just started.
 
 .PARAMETER Action
   start (default) | stop | status
@@ -19,11 +40,12 @@
   Tunnel provider: "cloudflare" or "none" (default: cloudflare).
 
 .EXAMPLE
-  .\rigout.ps1                # Start in foreground (Ctrl+C to stop)
-  .\rigout.ps1 start          # Same as above
-  .\rigout.ps1 -Background    # Start in background
-  .\rigout.ps1 stop           # Stop background server
-  .\rigout.ps1 status         # Check if server is running
+  .\rigout.ps1                     # Foreground, PUBLIC Cloudflare tunnel (Ctrl+C to stop)
+  .\rigout.ps1 start               # Same as above
+  .\rigout.ps1 -Tunnel none        # Foreground, loopback only - no public URL
+  .\rigout.ps1 -Background         # Background, PUBLIC Cloudflare tunnel
+  .\rigout.ps1 stop                # Stop background server
+  .\rigout.ps1 status              # Check if server is running
 #>
 
 # Default values
@@ -53,6 +75,10 @@ while ($i -lt $args.Count) {
             $Tunnel = $args[$i + 1]
             $i += 2
         }
+        "^(--help|-h|-Help)$" {
+            Get-Help $MyInvocation.MyCommand.Definition -Detailed
+            exit 0
+        }
         default {
             Write-Error "Unknown option: $arg"
             exit 1
@@ -61,10 +87,19 @@ while ($i -lt $args.Count) {
 }
 
 $ErrorActionPreference = "Stop"
+# PowerShell 7.4+ turns a non-zero native exit code into a terminating error when
+# ErrorActionPreference is Stop. This script forwards exit codes deliberately
+# (`rigout status` exits 1 when stopped), so that behaviour must be off.
+if (Test-Path Variable:PSNativeCommandUseErrorActionPreference) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$PidFile = Join-Path $ScriptDir ".rigout.pid"
-$ConnectionFile = Join-Path $ScriptDir "ai_agent_connection.json"
+# Pre-0.3.0 wrappers supervised the server themselves and left these behind.
+# They are read for cleanup only; nothing writes them any more.
+$LegacyPidFile = Join-Path $ScriptDir ".rigout.pid"
+$LegacyConnectionFile = Join-Path $ScriptDir "ai_agent_connection.json"
 $BinDir = Join-Path $ScriptDir "bin"
+$PythonBin = if ($env:PYTHON) { $env:PYTHON } else { "python" }
 
 # -- Helpers ---------------------------------------------------------------
 
@@ -77,13 +112,18 @@ function Write-Banner {
     Write-Host ""
 }
 
-function Ensure-Path {
+function Write-DeprecationNotice {
+    Write-Warning "rigout.ps1 is deprecated; it now forwards to the packaged CLI (rigout start/status/stop)."
+}
+
+function Initialize-Environment {
     # Add local bin/ to PATH so cloudflared is found
     if (Test-Path $BinDir) {
         if ($env:PATH -notlike "*$BinDir*") {
             $env:PATH = "$BinDir;$env:PATH"
         }
     }
+    # Let `python -m rigout...` resolve from the checkout when the package is not installed.
     $srcPath = Join-Path $ScriptDir "src"
     if (Test-Path $srcPath) {
         if (-not $env:PYTHONPATH) {
@@ -94,220 +134,109 @@ function Ensure-Path {
     }
 }
 
-function Get-SavedPids {
-    if (Test-Path $PidFile) {
-        return Get-Content $PidFile | ForEach-Object { [int]$_ }
-    }
-    return @()
-}
-
-function Test-ServerRunning {
-    $pids = Get-SavedPids
-    if ($pids.Count -eq 0) { return $false }
-    foreach ($procId in $pids) {
-        try {
-            $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-            if ($proc -and -not $proc.HasExited) { return $true }
-        } catch {}
-    }
-    return $false
-}
-
-function Wait-ForConnection {
-    param([int]$TimeoutSeconds = 45)
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        if (Test-Path $ConnectionFile) {
-            $json = Get-Content $ConnectionFile -Raw | ConvertFrom-Json
-            if ($json.mcp_server_url) {
-                return $json
-            }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    return $null
-}
-
-function Show-ConnectionInfo {
-    param($ConnData)
-    Write-Host ""
-    Write-Host "  [OK] Server is running!" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "  MCP URL:    " -NoNewline -ForegroundColor White
-    Write-Host $ConnData.mcp_server_url -ForegroundColor Yellow
-    Write-Host "  Health:     " -NoNewline -ForegroundColor White
-    Write-Host $ConnData.mcp.health_url -ForegroundColor Yellow
-    Write-Host "  Transport:  " -NoNewline -ForegroundColor White
-    Write-Host $ConnData.mcp.transport -ForegroundColor DarkCyan
-    Write-Host ""
-    $hw = $ConnData.hardware_info
-    Write-Host "  Hardware:   $($hw.platform) $($hw.architecture), $($hw.cpu_count) CPUs" -ForegroundColor DarkGray
-    Write-Host "  Config:     $ConnectionFile" -ForegroundColor DarkGray
-    Write-Host ""
-}
-
-# -- Actions ---------------------------------------------------------------
-
-function Start-Foreground {
-    Write-Banner
-    Ensure-Path
-
-    if (Test-ServerRunning) {
-        Write-Host "  [!] Server is already running in the background." -ForegroundColor Yellow
-        Write-Host "  Run .\rigout.ps1 stop first, or use .\rigout.ps1 status." -ForegroundColor Yellow
-        return
-    }
-
-    # Remove stale connection file so we can detect a fresh one
-    if (Test-Path $ConnectionFile) { Remove-Item $ConnectionFile -Force }
-
-    Write-Host "  Starting MCP server (port $Port, tunnel: $Tunnel)..." -ForegroundColor Cyan
-    Write-Host "  Press Ctrl+C to stop." -ForegroundColor DarkGray
-    Write-Host ""
-
-    # Run in foreground -- Ctrl+C will terminate it naturally
-    $setupArgs = @(
-        "-m",
-        "rigout.mcp_url_launcher",
-        "--tunnel", $Tunnel,
-        "--port", $Port
-    )
-    & python @setupArgs
-}
-
-function Start-Background {
-    Write-Banner
-    Ensure-Path
-
-    if (Test-ServerRunning) {
-        Write-Host "  [!] Server is already running." -ForegroundColor Yellow
-        Write-Host "  Run .\rigout.ps1 stop first, or use .\rigout.ps1 status." -ForegroundColor Yellow
-        return
-    }
-
-    # Remove stale connection file so we can detect a fresh one
-    if (Test-Path $ConnectionFile) { Remove-Item $ConnectionFile -Force }
-
-    Write-Host "  Starting MCP server in background (port $Port, tunnel: $Tunnel)..." -ForegroundColor Cyan
-
-    $logFile = Join-Path $ScriptDir ".rigout.log"
-
-    # Ensure bin/ is in PATH for the child process (cloudflared lives there)
-    Ensure-Path
-
-    $proc = Start-Process -FilePath python `
-        -ArgumentList "-m rigout.mcp_url_launcher --tunnel $Tunnel --port $Port" `
-        -WorkingDirectory $ScriptDir `
-        -WindowStyle Hidden `
-        -PassThru
-
-    # Save PID
-    $proc.Id | Out-File -FilePath $PidFile -Encoding ascii
-
-    Write-Host "  Waiting for server to become ready..." -ForegroundColor DarkGray
-
-    $connData = Wait-ForConnection -TimeoutSeconds 45
-    if ($connData) {
-        Show-ConnectionInfo $connData
-        Write-Host "  To stop:    .\rigout.ps1 stop" -ForegroundColor DarkGray
-        Write-Host "  To check:   .\rigout.ps1 status" -ForegroundColor DarkGray
-        Write-Host ""
-    } else {
-        Write-Host "  [ERROR] Server did not start within 45 seconds." -ForegroundColor Red
-        Write-Host "  Check logs or try running in foreground: .\rigout.ps1" -ForegroundColor Yellow
-        # Clean up
-        try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
-        if (Test-Path $PidFile) { Remove-Item $PidFile -Force }
+# Fail with an instruction rather than a ModuleNotFoundError traceback.
+function Test-RigoutImportable {
+    & $PythonBin -c "import rigout" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [ERROR] Could not import rigout using '$PythonBin'." -ForegroundColor Red
+        Write-Host "  Install it first:  $PythonBin -m pip install -e `"$ScriptDir`"" -ForegroundColor Yellow
+        exit 1
     }
 }
 
-function Stop-Server {
-    Write-Banner
-
-    $pids = Get-SavedPids
-    if ($pids.Count -eq 0) {
-        Write-Host "  [i] No background server found (no .rigout.pid file)." -ForegroundColor Yellow
-        Write-Host "  If running in foreground, press Ctrl+C in that terminal." -ForegroundColor DarkGray
-        return
-    }
-
-    $stopped = 0
-    foreach ($procId in $pids) {
-        try {
-            $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-            if ($proc -and -not $proc.HasExited) {
-                # Also kill child processes such as cloudflared.
-                Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $procId } | ForEach-Object {
-                    try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
-                }
-                Stop-Process -Id $procId -Force
-                $stopped++
-                Write-Host "  [OK] Stopped process $procId" -ForegroundColor Green
-            } else {
-                Write-Host "  [i] Process $procId already exited" -ForegroundColor DarkGray
-            }
-        } catch {
-            Write-Host "  [!] Could not stop process ${procId}: $_" -ForegroundColor Yellow
-        }
-    }
-
-    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-    Write-Host ""
-    if ($stopped -gt 0) {
-        Write-Host "  Server stopped." -ForegroundColor Green
-    } else {
-        Write-Host "  No running processes found." -ForegroundColor DarkGray
-    }
-    Write-Host ""
+function Get-LegacyPids {
+    if (-not (Test-Path $LegacyPidFile)) { return @() }
+    return Get-Content $LegacyPidFile | Where-Object { $_ -match '^\s*\d+\s*$' } | ForEach-Object { [int]$_.Trim() }
 }
 
-function Show-Status {
-    Write-Banner
-
-    # Check background processes
-    $isRunning = Test-ServerRunning
-    if ($isRunning) {
-        Write-Host "  [RUNNING] Background server is active" -ForegroundColor Green
-        $pids = Get-SavedPids
-        $pidList = $pids -join ", "
-        Write-Host "     PIDs: $pidList" -ForegroundColor DarkGray
-    } else {
-        Write-Host "  [STOPPED] No background server detected" -ForegroundColor Red
-    }
-
-    # Check health endpoint
-    Write-Host ""
+function Test-LegacyProcessAlive {
+    param([int]$ProcessId)
     try {
-        $response = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 3 -ErrorAction Stop
-        Write-Host "  [HEALTHY] Health check: $($response.status)" -ForegroundColor Green
-        Write-Host "     Server:    $($response.server)" -ForegroundColor DarkGray
-        Write-Host "     Transport: $($response.transport)" -ForegroundColor DarkGray
-        Write-Host "     MCP URL:   $($response.mcp_url)" -ForegroundColor DarkGray
+        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        return ($null -ne $proc -and -not $proc.HasExited)
     } catch {
-        Write-Host "  [DOWN] Health check: server not responding on port $Port" -ForegroundColor Red
+        return $false
     }
+}
 
-    # Show connection file info
-    if (Test-Path $ConnectionFile) {
-        Write-Host ""
-        $connData = Get-Content $ConnectionFile -Raw | ConvertFrom-Json
-        Write-Host "  Connection file: $ConnectionFile" -ForegroundColor DarkGray
-        Write-Host "  Public URL: $($connData.mcp_server_url)" -ForegroundColor Yellow
+# A server started by a pre-0.3.0 wrapper is not in the managed state directory,
+# so `rigout stop` cannot see it. Clean it up here or it becomes unstoppable.
+function Stop-LegacyProcesses {
+    $pids = Get-LegacyPids
+    if ($pids.Count -eq 0) {
+        if (Test-Path $LegacyPidFile) { Remove-Item $LegacyPidFile -Force -ErrorAction SilentlyContinue }
+        return
     }
+    foreach ($procId in $pids) {
+        if (Test-LegacyProcessAlive $procId) {
+            # Also kill child processes such as cloudflared.
+            Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $procId } | ForEach-Object {
+                try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+            }
+            try {
+                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+                Write-Host "  [OK] Stopped legacy background process $procId (started by an older rigout.ps1)." -ForegroundColor Green
+            } catch {
+                Write-Host "  [!] Could not stop legacy process ${procId}: $_" -ForegroundColor Yellow
+            }
+        }
+    }
+    Remove-Item $LegacyPidFile -Force -ErrorAction SilentlyContinue
+}
 
-    Write-Host ""
+# Never start over the top of a live legacy server: refuse and let the user
+# decide, rather than killing something healthy on their behalf.
+function Assert-NoLegacyServerRunning {
+    $pids = Get-LegacyPids
+    foreach ($procId in $pids) {
+        if (Test-LegacyProcessAlive $procId) {
+            Write-Host "  [!] A Rigout server started by an older rigout.ps1 is still running (PID $procId)." -ForegroundColor Yellow
+            Write-Host "  Stop it first:  .\rigout.ps1 stop" -ForegroundColor Yellow
+            exit 1
+        }
+    }
+    # Only the file is left; no live process. Safe to clear.
+    if (Test-Path $LegacyPidFile) { Remove-Item $LegacyPidFile -Force -ErrorAction SilentlyContinue }
+}
+
+function Show-LegacyLeftovers {
+    if (Test-Path $LegacyPidFile) {
+        Write-Warning "$LegacyPidFile is left over from an older rigout.ps1. Run .\rigout.ps1 stop to clear it."
+    }
+    if (Test-Path $LegacyConnectionFile) {
+        Write-Warning "$LegacyConnectionFile is stale and no longer used; the live one is shown by 'rigout status'."
+    }
 }
 
 # -- Main ------------------------------------------------------------------
+# The launcher is invoked inline rather than through a helper function: a
+# PowerShell function returns everything written to the success stream, so
+# wrapping the call would capture the launcher's output instead of letting it
+# reach the caller's console, pipeline or redirection.
 
+Write-Banner
+Write-DeprecationNotice
+Initialize-Environment
+Test-RigoutImportable
+
+# --port and --tunnel are always passed explicitly so this wrapper keeps its own
+# historical defaults (tunnel=cloudflare) rather than inheriting the CLI's.
 switch ($Action) {
     "start" {
-        if ($Background) {
-            Start-Background
-        } else {
-            Start-Foreground
-        }
+        Assert-NoLegacyServerRunning
+        $startArgs = @("start", "--tunnel", $Tunnel, "--port", "$Port")
+        if ($Background) { $startArgs += "--detach" }
+        & $PythonBin -m rigout.mcp_url_launcher @startArgs
+        exit $LASTEXITCODE
     }
-    "stop"   { Stop-Server }
-    "status" { Show-Status }
+    "stop" {
+        Stop-LegacyProcesses
+        & $PythonBin -m rigout.mcp_url_launcher stop
+        exit $LASTEXITCODE
+    }
+    "status" {
+        Show-LegacyLeftovers
+        & $PythonBin -m rigout.mcp_url_launcher status
+        exit $LASTEXITCODE
+    }
 }

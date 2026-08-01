@@ -1,9 +1,30 @@
 #!/usr/bin/env bash
+#
+# Rigout convenience wrapper for running from a source checkout.
+#
+# DEPRECATED as of 0.3.0. Every action here now delegates to the packaged
+# lifecycle CLI, which is the supported entry point:
+#
+#   rigout start [--detach]   rigout status   rigout logs [--follow]   rigout stop
+#
+# Not a like-for-like alias: this wrapper's historical default is --tunnel
+# cloudflare (a PUBLIC quick-tunnel URL), where the packaged CLI defaults to
+# --tunnel none (loopback only). The default is kept because changing it would
+# break existing scripts, so the difference is stated instead - see usage().
+#
+# The wrapper remains so that a checkout with no `pip install` still has a
+# one-command start, and so existing scripts that call it keep working. It
+# deliberately implements no lifecycle logic of its own: the previous version
+# polled for a connection file the launcher writes elsewhere, timed out after
+# 45 seconds, and then killed the healthy server it had just started.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PID_FILE="$SCRIPT_DIR/.rigout.pid"
-CONNECTION_FILE="$SCRIPT_DIR/ai_agent_connection.json"
+# Pre-0.3.0 wrappers supervised the server themselves and left these behind.
+# They are read for cleanup only; nothing writes them any more.
+LEGACY_PID_FILE="$SCRIPT_DIR/.rigout.pid"
+LEGACY_CONNECTION_FILE="$SCRIPT_DIR/ai_agent_connection.json"
 PORT="${RIGOUT_PORT:-8765}"
 TUNNEL="${RIGOUT_TUNNEL:-cloudflare}"
 BACKGROUND=false
@@ -12,6 +33,7 @@ PYTHON_BIN="${PYTHON:-python3}"
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     PYTHON_BIN="python"
 fi
+# Let `python -m rigout...` resolve from the checkout when the package is not installed.
 export PYTHONPATH="$SCRIPT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 
 usage() {
@@ -20,120 +42,77 @@ Usage:
   ./rigout.sh [start] [--background] [--port 8765] [--tunnel cloudflare|none]
   ./rigout.sh stop
   ./rigout.sh status
+
+Deprecated. These map onto the packaged CLI, which supports many more options:
+  ./rigout.sh              ->  rigout start --tunnel cloudflare
+  ./rigout.sh --background ->  rigout start --detach --tunnel cloudflare
+  ./rigout.sh stop         ->  rigout stop
+  ./rigout.sh status       ->  rigout status
+
+Note the --tunnel above. This wrapper defaults to a Cloudflare quick tunnel,
+which puts this machine on a PUBLIC URL. The installed `rigout` CLI defaults to
+--tunnel none, serving on loopback only. `./rigout.sh` and `rigout start` are
+NOT equivalent. For a local-only server here, pass --tunnel none explicitly.
 EOF
 }
 
-get_saved_pids() {
-    [ -f "$PID_FILE" ] && cat "$PID_FILE"
+deprecation_notice() {
+    echo "rigout.sh is deprecated; it now forwards to the packaged CLI (rigout start/status/stop)." >&2
 }
 
-is_running() {
+# Fail with an instruction rather than a ModuleNotFoundError traceback.
+require_rigout() {
+    if ! "$PYTHON_BIN" -c "import rigout" >/dev/null 2>&1; then
+        echo "Could not import rigout using '$PYTHON_BIN'." >&2
+        echo "Install it first:  $PYTHON_BIN -m pip install -e \"$SCRIPT_DIR\"" >&2
+        return 1
+    fi
+}
+
+launcher() {
+    "$PYTHON_BIN" -m rigout.mcp_url_launcher "$@"
+}
+
+# A server started by a pre-0.3.0 wrapper is not in the managed state directory,
+# so `rigout stop` cannot see it. Clean it up here or it becomes unstoppable.
+stop_legacy_processes() {
+    [ -f "$LEGACY_PID_FILE" ] || return 0
     local pids
-    pids="$(get_saved_pids || true)"
-    [ -z "$pids" ] && return 1
+    pids="$(cat "$LEGACY_PID_FILE" 2>/dev/null || true)"
     for pid in $pids; do
-        kill -0 "$pid" 2>/dev/null && return 0
-    done
-    return 1
-}
-
-wait_for_connection() {
-    local timeout="${1:-45}"
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout" ]; do
-        if [ -f "$CONNECTION_FILE" ]; then
-            "$PYTHON_BIN" - <<PY 2>/dev/null && return 0 || true
-import json
-with open(r"$CONNECTION_FILE", encoding="utf-8") as f:
-    data = json.load(f)
-print(data.get("mcp_server_url") or data.get("mcp", {}).get("url") or "")
-PY
+        if kill -0 "$pid" 2>/dev/null; then
+            pkill -P "$pid" 2>/dev/null || true
+            kill "$pid" 2>/dev/null || true
+            echo "Stopped legacy background process $pid (started by an older rigout.sh)."
         fi
-        sleep 1
-        elapsed=$((elapsed + 1))
     done
-    return 1
+    rm -f "$LEGACY_PID_FILE"
 }
 
-show_connection_info() {
-    "$PYTHON_BIN" - <<PY
-import json
-from pathlib import Path
-path = Path(r"$CONNECTION_FILE")
-data = json.loads(path.read_text(encoding="utf-8"))
-mcp = data.get("mcp", {})
-print("")
-print("Rigout is running")
-print(f"MCP URL:   {mcp.get('url') or data.get('mcp_server_url')}")
-print(f"Health:    {mcp.get('health_url')}")
-print(f"Transport: {mcp.get('transport')}")
-print(f"Config:    {path}")
-print("")
-PY
-}
-
-start_foreground() {
-    if is_running; then
-        echo "Rigout is already running in the background. Run './rigout.sh stop' first."
-        return 1
-    fi
-    rm -f "$CONNECTION_FILE"
-    echo "Starting Rigout on port $PORT with tunnel '$TUNNEL'. Press Ctrl+C to stop."
-    "$PYTHON_BIN" -m rigout.mcp_url_launcher --tunnel "$TUNNEL" --port "$PORT"
-}
-
-start_background() {
-    if is_running; then
-        echo "Rigout is already running."
-        return 1
-    fi
-    rm -f "$CONNECTION_FILE"
-    echo "Starting Rigout in background on port $PORT with tunnel '$TUNNEL'."
-    nohup "$PYTHON_BIN" -m rigout.mcp_url_launcher --tunnel "$TUNNEL" --port "$PORT" > "$SCRIPT_DIR/.rigout.log" 2>&1 &
-    echo "$!" > "$PID_FILE"
-
-    if wait_for_connection 45 >/dev/null; then
-        show_connection_info
-        echo "Stop with: ./rigout.sh stop"
-    else
-        echo "Rigout did not become ready within 45 seconds. Check .rigout.log."
-        stop_server >/dev/null 2>&1 || true
-        return 1
-    fi
-}
-
-stop_server() {
+# Never start over the top of a live legacy server: refuse and let the user
+# decide, rather than killing something healthy on their behalf.
+refuse_if_legacy_running() {
+    [ -f "$LEGACY_PID_FILE" ] || return 0
     local pids
-    pids="$(get_saved_pids || true)"
-    if [ -z "$pids" ]; then
-        echo "No background Rigout process found."
-        return 0
-    fi
+    pids="$(cat "$LEGACY_PID_FILE" 2>/dev/null || true)"
     for pid in $pids; do
-        pkill -P "$pid" 2>/dev/null || true
-        kill "$pid" 2>/dev/null || true
-        echo "Stopped process $pid"
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "A Rigout server started by an older rigout.sh is still running (PID $pid)." >&2
+            echo "Stop it first:  ./rigout.sh stop" >&2
+            return 1
+        fi
     done
-    rm -f "$PID_FILE"
+    # Only the file is left; no live process. Safe to clear.
+    rm -f "$LEGACY_PID_FILE"
 }
 
-show_status() {
-    if is_running; then
-        echo "Rigout background process: running ($(get_saved_pids | tr '\n' ' '))"
-    else
-        echo "Rigout background process: stopped"
+note_legacy_leftovers() {
+    if [ -f "$LEGACY_PID_FILE" ]; then
+        echo "Note: $LEGACY_PID_FILE is left over from an older rigout.sh. Run './rigout.sh stop' to clear it." >&2
     fi
-    "$PYTHON_BIN" - <<PY 2>/dev/null || true
-import json
-import urllib.request
-try:
-    with urllib.request.urlopen("http://127.0.0.1:$PORT/health", timeout=3) as r:
-        data = json.load(r)
-    print(f"Health: {data.get('status')} ({data.get('mcp_url')})")
-except Exception as exc:
-    print(f"Health: unavailable ({exc})")
-PY
-    [ -f "$CONNECTION_FILE" ] && show_connection_info
+    if [ -f "$LEGACY_CONNECTION_FILE" ]; then
+        echo "Note: $LEGACY_CONNECTION_FILE is stale and no longer used; the live one is shown by 'rigout status'." >&2
+    fi
 }
 
 ACTION="start"
@@ -167,14 +146,26 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+deprecation_notice
+require_rigout
+
+# --port and --tunnel are always passed explicitly so this wrapper keeps its own
+# historical defaults (tunnel=cloudflare) rather than inheriting the CLI's.
 case "$ACTION" in
     start)
-        if "$BACKGROUND"; then
-            start_background
+        refuse_if_legacy_running
+        if [ "$BACKGROUND" = true ]; then
+            launcher start --detach --tunnel "$TUNNEL" --port "$PORT"
         else
-            start_foreground
+            launcher start --tunnel "$TUNNEL" --port "$PORT"
         fi
         ;;
-    stop) stop_server ;;
-    status) show_status ;;
+    stop)
+        stop_legacy_processes
+        launcher stop
+        ;;
+    status)
+        note_legacy_leftovers
+        launcher status
+        ;;
 esac

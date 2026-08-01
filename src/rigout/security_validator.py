@@ -7,10 +7,10 @@ Provides comprehensive security checks and validation
 import hashlib
 import logging
 import os
+import posixpath
 import re
 import secrets
 import shlex
-import stat
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +18,68 @@ logger = logging.getLogger(__name__)
 class SecurityValidator:
     """Comprehensive security validation for MCP server operations"""
 
-    # Dangerous command patterns that should be blocked or sanitized
+    # Prefix for every rejection that names a destructive construct.
+    DANGEROUS_PREFIX = "Command contains dangerous pattern: "
+
+    # Prefix for a rejection that came from the body of `sh -c`/`bash -c`. Kept
+    # distinct so a nested rejection is not wrapped in DANGEROUS_PREFIX twice.
+    NESTED_PREFIX = "Nested shell command rejected: "
+
+    # Executables that are destructive whatever their arguments. DANGEROUS_PATTERNS
+    # below catches the bare spellings; these catch the same commands when quoting
+    # hides the name from a pattern that matches it (`"mkfs.ext4" /dev/sda1`).
+    DESTRUCTIVE_EXECUTABLES = {
+        "fdisk": "disk partitioning",
+        "parted": "disk partitioning",
+        "format": "filesystem format",
+    }
+
+    # Recursive force delete is catastrophic at the filesystem root and at the
+    # top-level system directories, and ordinary work anywhere below them. The
+    # `rm -rf /` regex this replaces could not tell those apart: it matched any
+    # absolute path, so `rm -rf /tmp/build` was refused, while a quoted name or a
+    # long flag (`'rm' -Rf /usr`) walked straight past it.
+    PROTECTED_ROOTS = frozenset(
+        {
+            "/",
+            "/bin",
+            "/boot",
+            "/dev",
+            "/etc",
+            "/home",
+            "/lib",
+            "/lib32",
+            "/lib64",
+            "/mnt",
+            "/opt",
+            "/proc",
+            "/root",
+            "/sbin",
+            "/srv",
+            "/sys",
+            "/tmp",
+            "/usr",
+            "/var",
+        }
+    )
+
+    # Raw disk devices and kernel memory. Unanchored so it can be searched inside a
+    # `dd` operand as well as matched against a whole redirect target.
+    RAW_DEVICE = re.compile(r"/dev/(?:sd[a-z]|hd[a-z]|nvme\w*|mmcblk\w*|mem\b|kmem|port)", re.IGNORECASE)
+
+    # Dangerous command patterns that should be blocked or sanitized.
+    #
+    # `dd if=... of=...` is deliberately absent: having both flags is not what makes
+    # a dd dangerous, naming a raw device is, and the flag-pair proxy refused
+    # `dd if=/dev/urandom of=/tmp/testfile`. _semantic_danger checks the operands.
+    #
+    # `;\s*rm\s+`, `&&\s*rm\s+` and `\|\s*rm\s+` are deliberately absent too. They
+    # blocked a chained `rm` that the identical unchained command was allowed to
+    # run, so they taxed the operator rather than defending a boundary, and a
+    # spurious refusal teaches callers to reach for bypass_security -- which
+    # disables the checks that do defend one. Every destructive chain they caught
+    # is caught by _semantic_danger, which splits at those operators already.
     DANGEROUS_PATTERNS = [
-        r"rm\s+-rf\s+/",
-        r"dd\s+if=.*of=.*",
         r"mkfs\.",
         r"fdisk\s+",
         r"parted\s+",
@@ -35,12 +93,42 @@ class SecurityValidator:
         r"eval\s+\$\(",
         r"`[^`]*`",
         r"\$\([^)]*\)",
-        r";\s*rm\s+",
-        r"&&\s*rm\s+",
-        r"\|\s*rm\s+",
         r"nc\s+.*\s+\d+.*<",
         r"netcat\s+.*\s+\d+.*<",
     ]
+
+    # What each pattern means, in the words a caller can act on. Without this the
+    # refusal reads `Command contains dangerous pattern: \$\([^)]*\)`, which asks the
+    # reader to parse a regex to find out what Rigout objected to, while every
+    # _semantic_danger refusal already says something like "raw disk copy". The
+    # substitution entries carry a way forward as well, because they are the two that
+    # ordinary work runs into; without one, the only route the message offers is
+    # bypass_security, which switches off every check including the ones that matter.
+    DANGEROUS_PATTERN_REASONS = {
+        r"mkfs\.": "filesystem creation",
+        r"fdisk\s+": "disk partitioning",
+        r"parted\s+": "disk partitioning",
+        r"format\s+": "disk formatting",
+        r"del\s+/[sq]\s+": "recursive or quiet Windows delete",
+        r"rmdir\s+/[sq]\s+": "recursive or quiet Windows directory delete",
+        r"[<>]\s*/dev/(sd[a-z]|hd[a-z]|nvme\w*|mmcblk\w*|mem\b|kmem|port)": (
+            "redirection to or from a raw disk device or kernel memory"
+        ),
+        r"curl\s+.*\|\s*(ba)?sh\b": "a downloaded script piped straight into a shell",
+        r"wget\s+.*\|\s*(ba)?sh\b": "a downloaded script piped straight into a shell",
+        r"eval\s+\$\(": "eval of a command substitution",
+        r"`[^`]*`": (
+            "command substitution in backticks, whose contents Rigout cannot inspect. "
+            "Run the inner command first and pass its output, or write it to a file and "
+            "read that"
+        ),
+        r"\$\([^)]*\)": (
+            "command substitution, whose contents Rigout cannot inspect. Run the inner "
+            "command first and pass its output, or write it to a file and read that"
+        ),
+        r"nc\s+.*\s+\d+.*<": "netcat sending a file to a network address",
+        r"netcat\s+.*\s+\d+.*<": "netcat sending a file to a network address",
+    }
 
     # Allowed command prefixes for system operations
     ALLOWED_COMMANDS = [
@@ -198,6 +286,19 @@ class SecurityValidator:
         return [segment for segment in segments if segment]
 
     @staticmethod
+    def _pipelines(tokens: list[str]) -> list[list[list[str]]]:
+        """Group tokens into pipelines, each one a list of pipe-separated segments."""
+        pipelines: list[list[list[str]]] = [[[]]]
+        for token in tokens:
+            if token in {"&&", "||", ";", "&"}:
+                pipelines.append([[]])
+            elif token == "|":
+                pipelines[-1].append([])
+            else:
+                pipelines[-1][-1].append(token)
+        return pipelines
+
+    @staticmethod
     def _segment_command(segment: list[str]) -> tuple[str, list[str]]:
         """Return the executable and arguments from one shell segment."""
         words = list(segment)
@@ -207,12 +308,36 @@ class SecurityValidator:
             return "", []
         return os.path.basename(words[0]).lower(), words[1:]
 
+    @classmethod
+    def _is_protected_root(cls, target: str) -> bool:
+        """Is this delete target the filesystem root or a top-level system directory?
+
+        Paths below one of those are ordinary work (`/tmp/build`, `/var/log/app/old`)
+        and stay available. posixpath is used explicitly because these are remote
+        POSIX paths even when Rigout itself is running on Windows.
+        """
+        if target.startswith("/*"):
+            return True
+        return posixpath.normpath(target) in cls.PROTECTED_ROOTS
+
     def _semantic_danger(self, tokens: list[str]) -> str | None:
-        """Detect destructive behavior that quote masking alone could hide."""
-        raw_devices = re.compile(r"/dev/(?:sd[a-z]|hd[a-z]|nvme\w*|mmcblk\w*|mem\b|kmem|port)$", re.IGNORECASE)
+        """Detect destructive behavior that quote masking alone could hide.
+
+        Returns a complete error message, already prefixed, or None. The message is
+        built here rather than by the caller so a nested `sh -c` rejection can say
+        that it was nested instead of being wrapped in the outer prefix a second time.
+        """
         for index, token in enumerate(tokens[:-1]):
-            if token in {">", ">>", "<", "<<"} and raw_devices.fullmatch(tokens[index + 1]):
-                return "raw device redirection"
+            if token in {">", ">>", "<", "<<"} and self.RAW_DEVICE.fullmatch(tokens[index + 1]):
+                return f"{self.DANGEROUS_PREFIX}raw device redirection"
+
+        # `curl ... | sh` stays dangerous when quoting hides either name. Only real
+        # pipes count, so `curl -o setup.sh url && bash setup.sh` is unaffected.
+        for pipeline in self._pipelines(tokens):
+            names = [self._segment_command(segment)[0] for segment in pipeline]
+            for index, name in enumerate(names):
+                if name in {"curl", "wget"} and any(later in {"sh", "bash"} for later in names[index + 1 :]):
+                    return f"{self.DANGEROUS_PREFIX}remote script piped to shell"
 
         segments = self._command_segments(tokens)
         for segment in segments:
@@ -221,26 +346,51 @@ class SecurityValidator:
                 executable = os.path.basename(args[0]).lower()
                 args = args[1:]
 
+            if executable == "mkfs" or executable.startswith("mkfs."):
+                return f"{self.DANGEROUS_PREFIX}filesystem creation"
+
+            if executable in self.DESTRUCTIVE_EXECUTABLES:
+                return f"{self.DANGEROUS_PREFIX}{self.DESTRUCTIVE_EXECUTABLES[executable]}"
+
+            # Both directions matter: `of=` a raw device destroys it, `if=` a raw
+            # device copies a disk or kernel memory out to somewhere readable.
+            if executable == "dd" and any(
+                arg.startswith(("if=", "of=")) and self.RAW_DEVICE.search(arg) for arg in args
+            ):
+                return f"{self.DANGEROUS_PREFIX}raw disk copy"
+
+            if executable in {"del", "rmdir"} and any(arg.lower() in {"/s", "/q"} for arg in args):
+                return f"{self.DANGEROUS_PREFIX}recursive force delete"
+
             if executable == "rm":
-                flags = "".join(arg[1:] for arg in args if arg.startswith("-") and not arg.startswith("--"))
+                # -R and --recursive are the same flag as -r, so recognize every
+                # spelling; the regex above only knows the literal `-rf`.
+                short_flags = "".join(
+                    arg[1:].lower() for arg in args if arg.startswith("-") and not arg.startswith("--")
+                )
+                long_flags = {arg.lower() for arg in args if arg.startswith("--")}
+                recursive = "r" in short_flags or "--recursive" in long_flags
+                force = "f" in short_flags or "--force" in long_flags
                 targets = [arg for arg in args if not arg.startswith("-")]
-                if (
-                    "r" in flags
-                    and "f" in flags
-                    and any(target == "/" or target.startswith("/*") for target in targets)
-                ):
-                    return "executable rm -rf /"
+                if recursive and force and any(self._is_protected_root(target) for target in targets):
+                    return f"{self.DANGEROUS_PREFIX}recursive delete of a protected system directory"
 
             if executable in {"bash", "sh"} and len(args) >= 2 and args[0] == "-c":
                 nested_safe, nested_error = self.validate_command(args[1], allow_sudo=True)
                 if not nested_safe:
-                    return nested_error
+                    return f"{self.NESTED_PREFIX}{nested_error}"
 
         return None
 
     def validate_hostname(self, hostname: str) -> tuple[bool, str]:
         """
         Validate hostname for security and format compliance
+
+        This is not the enforcement path. Every endpoint hostname is already checked
+        by ``TunnelEndpoint._is_valid_hostname`` (ssh_manager.py) in ``__post_init__``,
+        which rejects shell metacharacters explicitly and cannot be bypassed by
+        constructing an endpoint. This method is the standalone equivalent, used by
+        ``production_validation.py`` and by callers of the public ``SecurityValidator``.
 
         Args:
             hostname: The hostname to validate
@@ -316,12 +466,14 @@ class SecurityValidator:
                 scan_text = unquoted_command
             if re.search(pattern, scan_text, re.IGNORECASE):
                 self.blocked_commands.append(command)
-                return False, f"Command contains dangerous pattern: {pattern}"
+                reason = self.DANGEROUS_PATTERN_REASONS.get(pattern, pattern)
+                return False, f"{self.DANGEROUS_PREFIX}{reason}"
 
+        # _semantic_danger returns an already-formatted message; do not re-prefix it.
         semantic_danger = self._semantic_danger(tokens)
         if semantic_danger:
             self.blocked_commands.append(command)
-            return False, f"Command contains dangerous pattern: {semantic_danger}"
+            return False, semantic_danger
 
         # Inspect every segment of a chained/piped command the same way as the
         # main command: sudo is gated by allow_sudo, destructive patterns are
@@ -342,103 +494,6 @@ class SecurityValidator:
             if segment_command not in self.ALLOWED_COMMANDS:
                 logger.warning(f"Command not in allowed list: {segment_command}")
                 # Don't block, but log for monitoring
-
-        return True, ""
-
-    def validate_file_path(self, file_path: str, operation: str = "read") -> tuple[bool, str]:
-        """
-        Validate file path for security risks
-
-        Args:
-            file_path: The file path to validate
-            operation: The operation type (read, write, execute)
-
-        Returns:
-            Tuple of (is_safe, error_message)
-        """
-        if not file_path or not isinstance(file_path, str):
-            return False, "File path must be a non-empty string"
-
-        # Normalize path
-        try:
-            normalized_path = os.path.normpath(file_path)
-        except Exception as e:
-            return False, f"Invalid file path: {e}"
-
-        # Check for path traversal attempts
-        if ".." in normalized_path:
-            return False, "Path traversal attempt detected"
-
-        # Check for access to sensitive system files
-        sensitive_paths = [
-            "/etc/passwd",
-            "/etc/shadow",
-            "/etc/sudoers",
-            "/root/",
-            "/proc/kcore",
-            "/dev/mem",
-            "/dev/kmem",
-            "/sys/firmware/",
-            "/boot/",
-        ]
-
-        for sensitive_path in sensitive_paths:
-            normalized_sensitive = os.path.normpath(sensitive_path)
-            if normalized_path.startswith(normalized_sensitive):
-                if operation in ["write", "execute"]:
-                    return False, f"Write/execute access denied to sensitive path: {sensitive_path}"
-                else:
-                    logger.warning(f"Read access to sensitive path: {normalized_path}")
-
-        return True, ""
-
-    def validate_ssh_key(self, key_path: str) -> tuple[bool, str]:
-        """
-        Validate SSH private key file
-
-        Args:
-            key_path: Path to the SSH private key
-
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        if not key_path or not isinstance(key_path, str):
-            return False, "Key path must be a non-empty string"
-
-        # Check if file exists
-        if not os.path.exists(key_path):
-            return False, f"SSH key file not found: {key_path}"
-
-        # Check file permissions
-        try:
-            file_stat = os.stat(key_path)
-            file_mode = stat.filemode(file_stat.st_mode)
-
-            # SSH keys should have restrictive permissions (600 or 400)
-            if file_stat.st_mode & 0o077:  # Check if group/other have any permissions
-                return False, f"SSH key has insecure permissions: {file_mode}"
-
-        except Exception as e:
-            return False, f"Cannot check key file permissions: {e}"
-
-        # Basic key format validation
-        try:
-            with open(key_path) as f:
-                key_content = f.read()
-
-            # Check for valid key headers
-            valid_headers = [
-                "-----BEGIN OPENSSH PRIVATE KEY-----",
-                "-----BEGIN RSA PRIVATE KEY-----",
-                "-----BEGIN EC PRIVATE KEY-----",
-                "-----BEGIN PRIVATE KEY-----",
-            ]
-
-            if not any(header in key_content for header in valid_headers):
-                return False, "Invalid SSH key format"
-
-        except Exception as e:
-            return False, f"Cannot read SSH key file: {e}"
 
         return True, ""
 

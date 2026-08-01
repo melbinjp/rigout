@@ -14,7 +14,6 @@ import os
 import platform
 import secrets
 import socket
-import stat
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -32,6 +31,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
 from ._version import __version__
+from .lifecycle import write_text_secure
 from .server import server
 
 DEFAULT_HOST = "127.0.0.1"
@@ -209,6 +209,10 @@ def build_connection_data(
         "security": {
             "ai_agent_mode": True,
             "bypass_security_available": True,
+            # Deprecated, retained through 0.3.x so a client that reads this key gets None
+            # instead of a KeyError. Rigout no longer writes an audit-log file; read activity
+            # through the tool named in activity_access. Scheduled for removal in 0.4.0.
+            "audit_log": None,
             "activity_access": {
                 "tool": "get_server_activity",
                 "format": "json",
@@ -247,14 +251,12 @@ def write_connection_file(
     auth_token: str | None = None,
     agent_setup_url: str | None = None,
 ) -> None:
-    connection_path = Path(path)
-    connection_path.write_text(
+    # The file can contain a bearer token, so it is written through the atomic helper that
+    # applies owner-only mode before the content is ever visible at the final path.
+    write_text_secure(
+        Path(path),
         json.dumps(build_connection_data(mcp_url, host, port, mcp_path, auth_token, agent_setup_url), indent=2),
-        encoding="utf-8",
     )
-    if os.name == "posix":
-        # The file can contain a bearer token; keep it owner-readable only
-        connection_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
 def create_app(
