@@ -58,9 +58,26 @@ cloudflared service install    # runs it at boot
 ```
 
 **A reverse proxy**, if the machine already has a public address and a certificate.
-Point the vhost at `http://127.0.0.1:8765` and let it hold the TLS. Rigout speaks
-Streamable HTTP with Server-Sent Events, so disable response buffering: `proxy_buffering
-off` in nginx, or Caddy's defaults, which already stream.
+Point the vhost at `http://127.0.0.1:8765` and let it hold the TLS:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8765;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+}
+```
+
+`proxy_http_version 1.1` with an empty `Connection` header is the part that must be
+right; the defaults downgrade to HTTP/1.0 and break keep-alive. A full MCP session -
+initialize, list tools, call a tool - was measured working through nginx with
+`proxy_buffering` both on and off, because those exchanges finish quickly and nginx
+flushes at the end. Turn it off regardless: with buffering on, a response is held until
+nginx decides the body is complete, which costs latency on every call and holds back
+anything that streams for longer than one exchange. `proxy_read_timeout` matters for the
+same reason - the default minute will cut a long-running command off mid-flight.
 
 **A private network** such as Tailscale or WireGuard, if the agent runs somewhere you
 control. This is the smallest exposure of the three: there is no public listener at all,
@@ -166,3 +183,19 @@ requiring the token, and should be stopped until it does.
 
 Restart it and run both again. The hostname and the token should be unchanged, which is
 the entire point of the arrangement.
+
+## What here was measured, and what was not
+
+The Rigout half was run on a Linux host against a 0.3.0 build: `--public-url` advertised
+in `connection.json` instead of the loopback address, `--auth-token` used verbatim, a
+`--public-url` start still requiring bearer auth, the socket staying on `127.0.0.1`, and
+the URL and token both identical after a stop and start. Then the whole chain through an
+nginx reverse proxy: `/health`, a `401` on an unauthenticated POST, and a full MCP
+session including a tool call, with buffering on and off. The systemd unit above was
+checked with `systemd-analyze verify`.
+
+Not run here: `cloudflared tunnel create` and DNS routing, which need a Cloudflare
+account and a domain, and starting the unit under a live systemd, which a container does
+not have. Those are ordinary usage of those tools rather than anything specific to
+Rigout - what differs between a named tunnel and the nginx above is DNS and TLS, and
+neither of those is what could break MCP.
