@@ -4,5 +4,5 @@ starlette>=0.37.0
 uvicorn>=0.29.0
 paramiko>=3.0.0
 requests>=2.28.0
-cryptography>=3.4.8
+cryptography>=50.0.0
 pyyaml>=6.0
