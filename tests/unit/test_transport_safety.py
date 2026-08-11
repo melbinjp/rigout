@@ -20,6 +20,7 @@ from rigout.tools import file_ops
 from rigout.tools._results import (
     MAX_RESULT_CHARS,
     error_result,
+    result_is_error,
     transport_safe_result,
     transport_safe_text,
 )
@@ -85,7 +86,7 @@ def test_error_results_are_cleaned_too():
     """An error carrying raw bytes breaks the stream exactly as a success does."""
     cleaned = transport_safe_result(error_result("failed on \x00\x01 input"))
 
-    assert cleaned.isError is True
+    assert result_is_error(cleaned) is True
     assert "\x00" not in cleaned.content[0].text
 
 

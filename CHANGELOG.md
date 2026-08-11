@@ -13,9 +13,11 @@ All notable changes to this project are documented here. Format follows
   and `openWorldHint`. Rigout advertised fifteen tools identically, so reading a
   CPU count and running an arbitrary command as root reached a client looking
   the same and anything wanting to warn before the second had only the name to
-  go on. Four tools are read-only; the rest are destructive. Anything that runs
-  a caller's command is marked destructive and not idempotent, because what it
-  does is decided by the caller and cannot be known here.
+  go on. Four tools are read-only, nine are destructive, and two are neither -
+  they change something but only add or open it, never overwrite or remove.
+  Anything that runs a caller's command is marked destructive and not
+  idempotent, because what it does is decided by the caller and cannot be
+  known here.
 
 ### Changed
 - The `mcp` bound widens to `>=1.0.0,<3`: Rigout now runs on both majors. 1.x

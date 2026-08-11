@@ -334,12 +334,13 @@ def validate_runtime_contracts() -> list[str]:
         from rigout import __version__
         from rigout.mcp_http_server import create_app
         from rigout.server import handle_call_tool_result, server
+        from rigout.tools._results import result_is_error
 
         if getattr(server, "version", None) != __version__:
             issues.append(f"MCP server version is {getattr(server, 'version', None)}, expected {__version__}")
 
         unknown_result = asyncio.run(handle_call_tool_result("definitely_unknown_tool", {}))
-        if not unknown_result.isError:
+        if not result_is_error(unknown_result):
             issues.append("Unknown MCP tools are not marked with isError=true")
 
         app = create_app(connection_file=None, setup_token="setup-check", auth_token="bearer-check")

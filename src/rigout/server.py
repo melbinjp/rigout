@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from mcp.server import NotificationOptions, Server
@@ -35,7 +35,7 @@ from .tools import (
     handle_manage_tunnels,
     handle_system_monitoring,
 )
-from .tools._results import result_is_error, transport_safe_result
+from .tools._results import build_result, result_is_error, transport_safe_result
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,46 @@ if not logging.getLogger().handlers:
     )
 
 server = Server("enhanced-hardware-server", version=__version__)
+
+# --- constructing mcp types on either major ---------------------------------------------
+#
+# 2.x renamed these fields to snake_case and kept the camelCase spellings as construction
+# aliases, so every call below runs unchanged on both. The type checker does not see an
+# alias, only the field, and it only ever sees the major that happens to be installed - so
+# without these the fifteen tool definitions are fifteen errors on 2.x and none on 1.x.
+# Same reasoning as the handler registration at the bottom of this file: keep the fork in
+# one named place, and keep everything around it checked.
+
+
+def _rename_for_installed_mcp(
+    kwargs: dict[str, Any], pairs: dict[str, str], fields: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Respell camelCase keys as snake_case when the model no longer declares them."""
+    for camel, snake in pairs.items():
+        if camel in kwargs and camel not in fields:
+            kwargs[snake] = kwargs.pop(camel)
+    return kwargs
+
+
+def _tool(**kwargs: Any) -> Tool:
+    """Build a Tool. Callers spell the schema `inputSchema`, as both majors accept."""
+    return Tool(**_rename_for_installed_mcp(kwargs, {"inputSchema": "input_schema"}, Tool.model_fields))
+
+
+def _tool_annotations(**kwargs: Any) -> ToolAnnotations:
+    """Build ToolAnnotations. Callers spell the hints in camelCase."""
+    return ToolAnnotations(
+        **_rename_for_installed_mcp(
+            kwargs,
+            {
+                "readOnlyHint": "read_only_hint",
+                "destructiveHint": "destructive_hint",
+                "idempotentHint": "idempotent_hint",
+                "openWorldHint": "open_world_hint",
+            },
+            ToolAnnotations.model_fields,
+        )
+    )
 
 
 # What each tool does to the machine, in the terms MCP defines, so a client can tell a
@@ -100,7 +140,7 @@ def annotate(tools: list[Tool]) -> list[Tool]:
             continue
         title, read_only, destructive, idempotent, open_world = entry
         tool.title = title
-        tool.annotations = ToolAnnotations(
+        tool.annotations = _tool_annotations(
             title=title,
             readOnlyHint=read_only,
             destructiveHint=destructive,
@@ -114,7 +154,7 @@ async def handle_list_tools() -> list[Tool]:
     """List available tools for AI agents"""
     return annotate(
         [
-            Tool(
+            _tool(
                 name="connect_hardware",
                 description="Connect to remote hardware with automatic failover",
                 inputSchema={
@@ -128,7 +168,7 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
             ),
-            Tool(
+            _tool(
                 name="execute_command",
                 description="Execute command on remote hardware with full system access",
                 inputSchema={
@@ -160,7 +200,7 @@ async def handle_list_tools() -> list[Tool]:
                     "required": ["command"],
                 },
             ),
-            Tool(
+            _tool(
                 name="create_terminal_session",
                 description="Create a persistent interactive terminal session",
                 inputSchema={
@@ -170,7 +210,7 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
             ),
-            Tool(
+            _tool(
                 name="execute_in_terminal",
                 description="Execute command in existing terminal session (maintains state)",
                 inputSchema={
@@ -193,12 +233,12 @@ async def handle_list_tools() -> list[Tool]:
                     "required": ["session_id", "command"],
                 },
             ),
-            Tool(
+            _tool(
                 name="list_terminal_sessions",
                 description="List all active terminal sessions",
                 inputSchema={"type": "object", "properties": {}},
             ),
-            Tool(
+            _tool(
                 name="close_terminal_session",
                 description="Close a terminal session",
                 inputSchema={
@@ -207,7 +247,7 @@ async def handle_list_tools() -> list[Tool]:
                     "required": ["session_id"],
                 },
             ),
-            Tool(
+            _tool(
                 name="get_hardware_info",
                 description="Get detailed hardware information from remote system",
                 inputSchema={
@@ -221,7 +261,7 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
             ),
-            Tool(
+            _tool(
                 name="get_server_activity",
                 description="Read bounded, sanitized Rigout lifecycle status and recent activity",
                 inputSchema={
@@ -237,7 +277,7 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
             ),
-            Tool(
+            _tool(
                 name="manage_tunnels",
                 description="Manage tunnel endpoints (add, remove, test, failover)",
                 inputSchema={
@@ -267,7 +307,7 @@ async def handle_list_tools() -> list[Tool]:
                     "required": ["action"],
                 },
             ),
-            Tool(
+            _tool(
                 name="install_software",
                 description="Install software packages on remote hardware",
                 inputSchema={
@@ -288,7 +328,7 @@ async def handle_list_tools() -> list[Tool]:
                     "required": ["packages"],
                 },
             ),
-            Tool(
+            _tool(
                 name="file_operations",
                 description="Perform file operations on remote hardware",
                 inputSchema={
@@ -316,7 +356,7 @@ async def handle_list_tools() -> list[Tool]:
                     "required": ["operation", "path"],
                 },
             ),
-            Tool(
+            _tool(
                 name="system_monitoring",
                 description="Monitor system resources and performance",
                 inputSchema={
@@ -335,7 +375,7 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
             ),
-            Tool(
+            _tool(
                 name="docker_operations",
                 description="Manage Docker containers and images for AI agent workflows",
                 inputSchema={
@@ -354,7 +394,7 @@ async def handle_list_tools() -> list[Tool]:
                     "required": ["operation"],
                 },
             ),
-            Tool(
+            _tool(
                 name="bulk_file_transfer",
                 description="Transfer multiple files or directories for AI agent workflows",
                 inputSchema={
@@ -381,7 +421,7 @@ async def handle_list_tools() -> list[Tool]:
                     "required": ["operation", "source", "destination"],
                 },
             ),
-            Tool(
+            _tool(
                 name="environment_setup",
                 description="Set up development environments for AI agent projects",
                 inputSchema={
@@ -454,12 +494,12 @@ async def _dispatch_tool(name: str, arguments: dict) -> CallToolResult:
         elif name == "environment_setup":
             return await handle_environment_setup(arguments)
         else:
-            return CallToolResult(
+            return build_result(
                 content=[TextContent(type="text", text=f"Unknown tool: {name}")],
                 isError=True,
             )
     except Exception as e:
-        return CallToolResult(
+        return build_result(
             content=[TextContent(type="text", text=f"Error executing tool '{name}': {str(e)}")],
             isError=True,
         )
@@ -507,8 +547,8 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
 def register_tool_handlers() -> None:
     """Register the tool handlers against whichever mcp major is installed."""
     if hasattr(server, "list_tools"):
-        server.list_tools()(handle_list_tools)
-        server.call_tool()(handle_call_tool)
+        server.list_tools()(handle_list_tools)  # type: ignore[attr-defined]
+        server.call_tool()(handle_call_tool)  # type: ignore[attr-defined]
         return
 
     from mcp.types import CallToolRequestParams, ListToolsResult, PaginatedRequestParams

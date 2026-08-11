@@ -29,6 +29,7 @@ from rigout.tools import (
     handle_manage_tunnels,
     handle_system_monitoring,
 )
+from rigout.tools._results import result_is_error
 
 
 @pytest.mark.unit
@@ -80,7 +81,7 @@ class TestToolHandlers:
         result = await handle_execute_command(args)
 
         assert isinstance(result, CallToolResult)
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert "file1.txt" in result.content[0].text
         assert "Command executed successfully" in result.content[0].text
         mock_manager.execute_command.assert_called_once()
@@ -101,7 +102,7 @@ class TestToolHandlers:
         result = await handle_execute_command(args)
 
         assert isinstance(result, CallToolResult)
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "Command failed" in result.content[0].text
         assert "No such file or directory" in result.content[0].text
 
@@ -125,7 +126,7 @@ class TestToolHandlers:
         result = await handle_execute_command({"command": "make && ./run-tests"})
         text = result.content[0].text
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "compiled 41 objects" in text
         assert "3 tests failed" in text
         assert text.index("3 tests failed") < text.index("compiled 41 objects")
@@ -144,7 +145,7 @@ class TestToolHandlers:
 
         result = await handle_execute_command({"command": "false"})
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "Command exited with status 1" in result.content[0].text
 
     async def test_handle_create_terminal_session(self, mock_manager):
@@ -179,7 +180,7 @@ class TestToolHandlers:
 
         result = await handle_create_terminal_session({"session_name": "build"})
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         message = result.content[0].text
         assert "already exists" in message and "build" in message
         for way_out in ("execute_in_terminal", "close_terminal_session", "session_name"):
@@ -224,7 +225,7 @@ class TestToolHandlers:
 
         mock_manager.close_terminal_session.return_value = False
         result = await handle_close_terminal_session({"session_id": "sess-123"})
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "Failed to close" in result.content[0].text
 
     async def test_handle_install_software(self, mock_manager):
@@ -255,7 +256,7 @@ class TestToolHandlers:
         args = {"packages": ["curl", "git"], "package_manager": "pacman"}
         result = await handle_install_software(args)
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert "completed successfully" in result.content[0].text
         assert mock_manager.execute_command.call_args.args[1] == "sudo pacman -S --noconfirm curl git"
 
@@ -288,7 +289,7 @@ class TestToolHandlers:
 
         result = await handle_docker_operations({"operation": "list"})
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "Command exited with status 127" in result.content[0].text
 
     async def test_handle_docker_failure_keeps_the_output_it_produced(self, mock_manager):
@@ -305,7 +306,7 @@ class TestToolHandlers:
 
         result = await handle_docker_operations({"operation": "logs", "container_name": "app"})
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "OOMKilled" in result.content[0].text
 
     async def test_handle_environment_setup_failure_names_the_step_that_failed(self, mock_manager):
@@ -328,7 +329,7 @@ class TestToolHandlers:
             {"environment_type": "python", "workspace_path": "/tmp/ws", "requirements": ["numpy==999"]}
         )
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "created venv" in result.content[0].text
         assert "no matching distribution" in result.content[0].text
 
@@ -400,7 +401,7 @@ class TestToolHandlers:
 
         result = await handle_system_monitoring({"metrics": ["cpu", "memory", "disk"]})
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert maximum_active > 1
         assert mock_manager.execute_command.call_count == 3
 
@@ -419,7 +420,7 @@ class TestToolHandlers:
 
         result = await handle_system_monitoring({"metrics": ["cpu", "memory"]})
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "cpu available" in result.content[0].text
         assert "memory unavailable" in result.content[0].text
 
@@ -552,7 +553,7 @@ class TestTerminalSessionSecurity:
 
         result = await handle_execute_in_terminal({"session_id": "sess-local", "command": "env"})
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert "hunter2" not in result.content[0].text
         assert "sk-live-abcdef" not in result.content[0].text
         assert "password=***" in result.content[0].text
@@ -564,7 +565,7 @@ class TestTerminalSessionSecurity:
 
         result = await handle_execute_in_terminal({"session_id": "sess-ssh", "command": "env"})
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert "hunter2" not in result.content[0].text
         assert "abc123" not in result.content[0].text
         assert "password=***" in result.content[0].text
@@ -577,7 +578,7 @@ class TestTerminalSessionSecurity:
 
         result = await handle_execute_in_terminal({"session_id": "sess-local", "command": "rm -rf /"})
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "Security validation failed" in result.content[0].text
         assert session.executed == []
 
@@ -590,7 +591,7 @@ class TestTerminalSessionSecurity:
             {"session_id": "sess-local", "command": "rm -rf /", "bypass_security": True}
         )
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert session.executed == ["rm -rf /"]
 
     async def test_sudo_in_terminal_requires_use_sudo(self, real_manager):
@@ -602,7 +603,7 @@ class TestTerminalSessionSecurity:
             {"session_id": "sess-local", "command": "sudo systemctl restart nginx"}
         )
 
-        assert blocked.isError is True
+        assert result_is_error(blocked) is True
         assert "Sudo commands not allowed" in blocked.content[0].text
         assert session.executed == []
 
@@ -610,7 +611,7 @@ class TestTerminalSessionSecurity:
             {"session_id": "sess-local", "command": "systemctl restart nginx", "use_sudo": True}
         )
 
-        assert allowed.isError is False
+        assert result_is_error(allowed) is False
         assert session.executed == ["sudo systemctl restart nginx"]
 
     async def test_terminal_session_commands_are_rate_limited(self, real_manager):
@@ -621,11 +622,11 @@ class TestTerminalSessionSecurity:
 
         for _ in range(2):
             allowed = await handle_execute_in_terminal({"session_id": "sess-local", "command": "whoami"})
-            assert allowed.isError is False
+            assert result_is_error(allowed) is False
 
         limited = await handle_execute_in_terminal({"session_id": "sess-local", "command": "whoami"})
 
-        assert limited.isError is True
+        assert result_is_error(limited) is True
         assert "Rate limit exceeded" in limited.content[0].text
         assert session.executed == ["whoami", "whoami"]
 
@@ -642,7 +643,7 @@ class TestTerminalSessionSecurity:
 
         limited = await handle_execute_in_terminal({"session_id": "sess-local", "command": "whoami"})
 
-        assert limited.isError is True
+        assert result_is_error(limited) is True
         assert "Rate limit exceeded" in limited.content[0].text
         assert session.executed == []
 
@@ -771,7 +772,7 @@ class TestFileOperationsParity:
 
         result = await handle_file_operations({"operation": "delete", "path": str(target)})
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "recursive=true" in result.content[0].text
         assert (target / "nested" / "keep.txt").exists()
 
@@ -782,7 +783,7 @@ class TestFileOperationsParity:
 
         result = await handle_file_operations({"operation": "delete", "path": str(target), "recursive": True})
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert not target.exists()
 
     async def test_remote_delete_is_recursive_only_when_asked(self, remote_manager):
