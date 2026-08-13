@@ -13,6 +13,7 @@ from rigout.lifecycle import (
     write_json_secure,
     write_pid,
 )
+from rigout.tools._results import result_is_error
 from rigout.tools.activity import MAX_ACTIVITY_LINES, handle_get_server_activity
 
 
@@ -42,7 +43,7 @@ async def test_server_activity_returns_bounded_sanitized_json(tmp_path, monkeypa
 
     result = await handle_get_server_activity({"lines": 3})
 
-    assert result.isError is False
+    assert result_is_error(result) is False
     payload = json.loads(result.content[0].text)
     assert set(payload) == {"status", "running", "pid", "state_dir", "activity_log", "lines"}
     assert payload["status"] == "running"
@@ -83,5 +84,5 @@ async def test_server_activity_does_not_leak_the_operator_home_directory(tmp_pat
 async def test_server_activity_rejects_unbounded_or_invalid_line_counts(line_count):
     result = await handle_get_server_activity({"lines": line_count})
 
-    assert result.isError is True
+    assert result_is_error(result) is True
     assert "lines argument" in result.content[0].text
