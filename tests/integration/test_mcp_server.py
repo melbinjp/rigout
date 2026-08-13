@@ -10,6 +10,31 @@ from rigout.config_manager import ConfigManager
 from rigout.security_validator import SecurityValidator
 from rigout.server import handle_call_tool, handle_call_tool_result, handle_list_tools, server
 from rigout.ssh_manager import TunnelEndpoint, get_tunnel_manager
+from rigout.tools._results import result_is_error
+
+
+async def call_via_sdk_handler(name: str, arguments: dict) -> object:
+    """Invoke the handler the SDK itself will invoke, on either mcp major.
+
+    The registry is the one place the two majors differ, and it differs three ways:
+    1.x keys `request_handlers` by request type, hands the handler the whole request,
+    and wraps the result in a `ServerResult`; 2.x exposes `get_request_handler` keyed
+    by method name, hands over `(context, params)`, and returns the result unwrapped.
+
+    Same `hasattr` fork `register_tool_handlers()` makes in `server.py`, for the same
+    reason: what is installed decides, and there is nothing to configure.
+    """
+    params = CallToolRequestParams(name=name, arguments=arguments)
+
+    handlers = getattr(server, "request_handlers", None)
+    if handlers is not None:  # mcp 1.x
+        response = await handlers[CallToolRequest](CallToolRequest(params=params))
+        return response.root
+
+    entry = server.get_request_handler("tools/call")  # mcp 2.x
+    assert entry is not None, "no tools/call handler is registered"
+    handler = getattr(entry, "handler", entry)
+    return await handler(None, params)
 
 
 @pytest.mark.integration
@@ -100,19 +125,16 @@ class TestMCPServerIntegration:
         # Test execute_command should fail gracefully when no endpoints are active
         with patch("rigout.ssh_manager.TunnelManager.auto_failover", return_value=None):
             result = await handle_call_tool_result("execute_command", {"command": "ls"})
-            assert result.isError is True
+            assert result_is_error(result) is True
             assert "No available hardware endpoints" in result.content[0].text
 
     @pytest.mark.asyncio
     async def test_registered_handler_preserves_mcp_error_flag(self):
         """The SDK-facing handler must emit isError for unknown tools."""
-        handler = server.request_handlers[CallToolRequest]
-        response = await handler(
-            CallToolRequest(params=CallToolRequestParams(name="definitely_unknown_tool", arguments={}))
-        )
+        result = await call_via_sdk_handler("definitely_unknown_tool", {})
 
-        assert response.root.isError is True
-        assert "Unknown tool" in response.root.content[0].text
+        assert result_is_error(result) is True
+        assert "Unknown tool" in result.content[0].text
 
     @pytest.mark.asyncio
     async def test_live_endpoint_when_configured(self):

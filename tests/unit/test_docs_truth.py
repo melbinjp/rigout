@@ -51,6 +51,21 @@ if not (REPO_ROOT / "pyproject.toml").is_file():  # pragma: no cover - not a sou
     pytest.skip("documentation truth tests need the source checkout", allow_module_level=True)
 
 
+def tool_input_schema(tool):
+    """A tool's input schema under either mcp major's spelling.
+
+    2.x renamed `inputSchema` to `input_schema` and kept the camelCase spelling as
+    a construction alias only, so reading `.inputSchema` raises there. Same shape
+    as `rigout.tools._results.result_is_error`, kept local because the server has
+    no reason to read a schema off its own tools.
+    """
+    sentinel = object()
+    schema = getattr(tool, "inputSchema", sentinel)
+    if schema is sentinel:
+        schema = getattr(tool, "input_schema", None)
+    return schema
+
+
 def read(path: Path) -> str:
     """Read a repository text file with universal newlines, so CRLF checkouts match."""
     return path.read_text(encoding="utf-8")
@@ -264,7 +279,7 @@ def advertised_schema_words() -> frozenset[str]:
                 walk(item)
 
     for tool in advertised_tools():
-        walk(tool.inputSchema)
+        walk(tool_input_schema(tool))
     return frozenset(words)
 
 
@@ -290,7 +305,7 @@ def advertised_argument_names() -> frozenset[str]:
                 walk(item)
 
     for tool in advertised_tools():
-        walk(tool.inputSchema)
+        walk(tool_input_schema(tool))
     return frozenset(names)
 
 
@@ -1678,7 +1693,7 @@ def test_documented_setup_token_lifetime_matches_the_code():
 def test_documented_activity_line_bounds_match_the_tool_schema():
     """ "1-200 recent activity lines" is the advertised schema, not a wish."""
     schema = next(
-        (tool.inputSchema for tool in advertised_tools() if tool.name == "get_server_activity"),
+        (tool_input_schema(tool) for tool in advertised_tools() if tool.name == "get_server_activity"),
         None,
     )
     if not schema:

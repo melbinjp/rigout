@@ -21,6 +21,7 @@ from rigout.tools._platform import (
     is_windows_platform,
     platform_family,
 )
+from rigout.tools._results import result_is_error
 from rigout.tools.command import handle_install_software
 from rigout.tools.docker import handle_docker_operations
 from rigout.tools.environment import handle_environment_setup
@@ -132,7 +133,7 @@ class TestMonitoringPlatformBranch:
         with patch_manager("monitoring", manager):
             result = await handle_system_monitoring({"metrics": ["all"]})
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert manager.commands, "no monitoring commands were built"
         assert "powershell" not in manager.joined.lower()
         assert "Get-CimInstance" not in manager.joined
@@ -219,7 +220,7 @@ class TestEnvironmentSetupWindowsLocal:
             )
 
         command = manager.only_command
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert "if not exist" not in command
         assert command.startswith(f'cd /d "{workspace}"')
         assert "python -m venv venv" in command
@@ -232,7 +233,7 @@ class TestEnvironmentSetupWindowsLocal:
         with patch_manager("environment", manager):
             result = await handle_environment_setup({"environment_type": "python"})
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert "/tmp/ai_workspace" not in manager.only_command
         assert str(tmp_path / "ai_workspace") in manager.only_command
         assert (tmp_path / "ai_workspace").is_dir(), "the workspace was never created"
@@ -253,7 +254,7 @@ class TestEnvironmentSetupWindowsLocal:
                 {"environment_type": "python", "workspace_path": "/home/agent/work"}
             )
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "POSIX absolute path" in text_of(result)
         assert manager.commands == [], "a doomed command was sent anyway"
 
@@ -270,7 +271,7 @@ class TestEnvironmentSetupWindowsLocal:
                 }
             )
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert "powershell" not in manager.only_command.lower()
         dockerfile = workspace / "Dockerfile"
         assert dockerfile.is_file()
@@ -289,7 +290,7 @@ class TestEnvironmentSetupWindowsLocal:
                 }
             )
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "cannot be quoted for cmd.exe" in text_of(result)
         assert manager.commands == []
 
@@ -305,7 +306,7 @@ class TestEnvironmentSetupWindowsLocal:
                 }
             )
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert 'venv\\Scripts\\python.exe -m pip install "numpy>=1.26,<2"' in manager.only_command
 
     async def test_windows_path_translation(self, tmp_path, monkeypatch):
@@ -329,7 +330,7 @@ class TestEnvironmentSetupPosixLocal:
             result = await handle_environment_setup({"environment_type": "python", "workspace_path": str(workspace)})
 
         command = manager.only_command
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert "if not exist" not in command
         assert "cd /d" not in command
         assert "python3 -m venv venv" in command
@@ -446,7 +447,7 @@ class TestManageTunnelsRemove:
         with patch_manager("tunnel", manager):
             result = await handle_manage_tunnels({"action": "remove", "hostname": "gone.example.com"})
 
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert client.closed is True, "a pooled SSH client stayed open and authenticated"
         assert session.closed is True, "a terminal session still reaches the removed host"
         assert "gone.example.com:22" not in manager._connection_pool
@@ -470,7 +471,7 @@ class TestManageTunnelsAdd:
         with patch_manager("tunnel", manager):
             result = await handle_manage_tunnels({"action": "add", "username": "agent"})
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "hostname" in text_of(result)
         assert manager.added == []
 
@@ -527,7 +528,7 @@ class TestManageTunnelsAdd:
                 }
             )
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "port" in text_of(result).lower()
         assert manager.added == [], "a refused endpoint must not be registered"
 
@@ -558,7 +559,7 @@ class TestManageTunnelsAdd:
             )
 
         assert len(manager.tested) == 1, "add claimed to test the connection but never did"
-        assert result.isError is False
+        assert result_is_error(result) is False
         assert "connection test PASSED" in text_of(result)
 
     async def test_failed_connection_test_is_reported_as_failure(self, tmp_path):
@@ -573,7 +574,7 @@ class TestManageTunnelsAdd:
                 }
             )
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "connection test FAILED" in text_of(result)
 
     async def test_missing_private_key_is_refused(self, tmp_path):
@@ -588,7 +589,7 @@ class TestManageTunnelsAdd:
                 }
             )
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "Private key not found" in text_of(result)
         assert manager.added == [], "an endpoint with an unusable key was saved anyway"
 
@@ -604,7 +605,7 @@ class TestManageTunnelsAdd:
                 }
             )
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "already configured" in text_of(result)
         assert manager.added == []
 
@@ -653,7 +654,7 @@ class TestMonitoringDuration:
         with patch_manager("monitoring", manager):
             result = await handle_system_monitoring({"metrics": ["cpu"], "duration": "60"})
 
-        assert result.isError is True
+        assert result_is_error(result) is True
         assert "must be an integer" in text_of(result)
         assert manager.commands == []
 
