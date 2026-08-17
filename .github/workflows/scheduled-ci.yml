@@ -331,19 +331,31 @@ jobs:
           EOF
           )"
 
-          existing="$(gh issue list --repo "$REPO" \
-            --label scheduled-ci-failure --state open \
-            --json number --jq '.[0].number // empty')"
-
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body "$body"
-            echo "Commented on existing issue #$existing"
-          else
-            gh issue create --repo "$REPO" \
-              --title "Scheduled CI is failing" \
-              --label scheduled-ci-failure \
-              --body "$body"
-          fi
+          # Re-derive the issue state on EVERY attempt rather than retrying a remembered
+          # decision. A blanket retry around `gh issue create` would file a duplicate if the
+          # create actually succeeded and only the response was lost; re-listing first means
+          # the next pass finds the issue and comments on it instead. Idempotent by
+          # construction rather than by assuming a 503 never reached the backend.
+          for attempt in 1 2 3 4 5; do
+            if existing="$(gh issue list --repo "$REPO" \
+                 --label scheduled-ci-failure --state open \
+                 --json number --jq '.[0].number // empty')"; then
+              if [ -n "$existing" ]; then
+                if gh issue comment "$existing" --repo "$REPO" --body "$body"; then
+                  echo "Commented on existing issue #$existing"; exit 0
+                fi
+              elif gh issue create --repo "$REPO" \
+                     --title "Scheduled CI is failing" \
+                     --label scheduled-ci-failure \
+                     --body "$body"; then
+                echo "Opened the failure issue"; exit 0
+              fi
+            fi
+            echo "GitHub API call failed (attempt $attempt/5); retrying" >&2
+            sleep $((attempt * 10))
+          done
+          echo "could not report the failure after 5 attempts" >&2
+          exit 1
 
   # Close the failure issue once a scheduled run is green again, so an open issue
   # always means "currently broken" and the signal stays worth trusting.
@@ -362,13 +374,28 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          existing="$(gh issue list --repo "$REPO" \
-            --label scheduled-ci-failure --state open \
-            --json number --jq '.[0].number // empty')"
-          if [ -n "$existing" ]; then
-            gh issue close "$existing" --repo "$REPO" \
-              --comment "A scheduled CI run passed again: $RUN_URL"
-            echo "Closed issue #$existing"
-          else
-            echo "No open failure issue to close."
-          fi
+          # Same shape as Report Failure: re-list before every close attempt. If an earlier
+          # attempt actually closed the issue and only lost the response, the next pass sees
+          # nothing open and exits clean instead of closing twice.
+          #
+          # This job failed three times on 2026-08-17 with a bare 503 from `gh issue close`
+          # while GitHub was mid-incident, which left #28 open reporting a break that was
+          # already fixed. An issue tracker that says "currently broken" when it is not is
+          # exactly the signal this job exists to protect.
+          for attempt in 1 2 3 4 5; do
+            if existing="$(gh issue list --repo "$REPO" \
+                 --label scheduled-ci-failure --state open \
+                 --json number --jq '.[0].number // empty')"; then
+              if [ -z "$existing" ]; then
+                echo "No open failure issue to close."; exit 0
+              fi
+              if gh issue close "$existing" --repo "$REPO" \
+                   --comment "A scheduled CI run passed again: $RUN_URL"; then
+                echo "Closed issue #$existing"; exit 0
+              fi
+            fi
+            echo "GitHub API call failed (attempt $attempt/5); retrying" >&2
+            sleep $((attempt * 10))
+          done
+          echo "could not close the failure issue after 5 attempts" >&2
+          exit 1
