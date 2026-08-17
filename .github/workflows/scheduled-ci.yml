@@ -78,9 +78,18 @@ jobs:
           # A stale dist/ from an earlier build would be installed silently, so the
           # run would test a wheel that is not the one this commit produces.
           rm -rf dist
-          python -m pip install --upgrade pip build
+          # tomli is the pre-3.11 half of the tomllib fallback below. pyproject declares
+          # requires-python = ">=3.10" and this matrix tests 3.10, but tomllib only entered
+          # the stdlib in 3.11 - so the version check below could never run on the oldest
+          # Python the package claims to support.
+          python -m pip install --upgrade pip build 'tomli; python_version < "3.11"'
           python -m build --wheel
-          expected="$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          expected="$(python -c "
+          try:
+              import tomllib
+          except ModuleNotFoundError:  # Python 3.10
+              import tomli as tomllib
+          print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
           echo "EXPECTED_VERSION=$expected" >> "$GITHUB_ENV"
           count="$(ls dist/*.whl | wc -l)"
           if [ "$count" -ne 1 ]; then
