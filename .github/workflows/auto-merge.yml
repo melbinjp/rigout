@@ -45,4 +45,23 @@ jobs:
       - name: Enable auto-merge (squash)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr merge "${{ github.event.pull_request.number }}" --auto --squash --repo "${{ github.repository }}"
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        # Retried because arming auto-merge is idempotent - it sets a flag on the PR, so
+        # doing it twice is the same as doing it once, and there is no lost-response hazard
+        # of the kind the issue jobs have to design around.
+        #
+        # This step failed on 2026-08-17 with a bare `503 Service Unavailable` while GitHub
+        # was mid-incident, which shows a red X on a PR whose code is fine. A red check that
+        # means "GitHub had a bad minute" trains people to ignore red checks.
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if gh pr merge "$PR" --auto --squash --repo "$REPO"; then
+              exit 0
+            fi
+            echo "gh pr merge failed (attempt $attempt/5); retrying" >&2
+            sleep $((attempt * 10))
+          done
+          echo "could not arm auto-merge after 5 attempts" >&2
+          exit 1
