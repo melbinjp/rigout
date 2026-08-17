@@ -51,7 +51,7 @@ the sentence naming the affected caller matters more than the label.
 Every runtime dependency has an upper bound:
 
 ```toml
-mcp>=1.0.0,<2      starlette>=0.37.0,<2
+mcp>=1.0.0,<3      starlette>=0.37.0,<2
 uvicorn>=0.29.0,<1  paramiko>=3.0.0,<6
 ```
 
@@ -78,6 +78,75 @@ Two things watch this so it does not become permanent:
   that the pinned development environment would not see.
 - The same workflow reports which dependencies are held back and by how far, so an
   overdue major is visible rather than forgotten.
+
+## What Rigout adopts from a new MCP, and what it declines
+
+Being behind on a major does not mean ignoring what the current line offers. Two
+capabilities were assessed against mcp 1.29 in August 2026, and they went opposite ways.
+
+**Tool annotations: adopted.** `Tool.title` and `ToolAnnotations` - `readOnlyHint`,
+`destructiveHint`, `idempotentHint`, `openWorldHint` - let a client tell a question apart
+from an action before it runs one, which matters more here than in most servers: reading
+a CPU count and running an arbitrary command as root are both tools Rigout offers. The
+fields are in the specification, present in 1.x and 2.x alike, and additive to clients
+that ignore them.
+
+**Tasks: declined, and this is worth stating so it is not rediscovered.** `Tool.execution`
+with `taskSupport`, the `Task` type, `tasks/get` and its siblings, and
+`mcp.server.experimental.task_support` together describe long-running work a client polls
+rather than waits for. That addresses Rigout's oldest limitation directly - a command
+that outlives its timeout fails, and builds, installs and downloads all can.
+
+It is not adopted, because the API says of itself:
+
+> The experimental tasks API is deprecated and will be removed in mcp 2.0: tasks
+> (SEP-1686) were removed from the MCP specification and are expected to return as a
+> separate MCP extension.
+
+Checked rather than taken on the warning's word: `mcp.server.experimental.task_support`
+raises `ModuleNotFoundError` on 2.0.0. The types survive there, which makes the feature
+look available to anyone reading `mcp.types`, but the server half is gone.
+
+Building on it would mean shipping a feature on an interface that is deprecated in the
+version Rigout pins and absent from the version it must move to next. That is the same
+trade as the unbounded `mcp>=1.0.0` in 0.2.0: it works until someone else's release day.
+When tasks return as an extension, this is worth revisiting, and the reason to revisit is
+recorded above.
+
+## The mcp 2.x migration, mapped
+
+Rigout pins `mcp>=1.0.0,<2` and speaks MCP protocol `2025-11-25` where 2.x speaks
+`2026-07-28`. Moving is a release of its own. What it involves is recorded here because
+the discovery is most of the work and is easy to redo badly.
+
+What does **not** change, checked against 2.0.0 rather than assumed:
+
+- `Tool(name=..., description=..., inputSchema=...)` constructs unchanged. 2.x renamed the
+  fields to `input_schema` and friends but keeps the camelCase spellings as aliases, so
+  every tool definition ports as written.
+- `mcp.server.stdio`, `mcp.server.streamable_http_manager`, `mcp.server.models` and
+  `mcp.types` all still import.
+- `Server`, `Server.run` and `create_initialization_options` all survive.
+
+What does change, and is the whole of the migration:
+
+- `@server.list_tools()` and `@server.call_tool()` are gone. Registration is now
+  `server.add_request_handler(method, params_type, handler)`, with
+  `"tools/list"` taking `PaginatedRequestParams` and `"tools/call"` taking
+  `CallToolRequestParams`.
+- The handlers therefore return results directly rather than the bare list and content
+  the decorators wrapped, which also removes the wrinkle where an error result has to be
+  raised as `RuntimeError` for the SDK to rebuild it.
+
+Two decisions to make before starting, neither obvious:
+
+- **Whether to support both majors or move.** The incompatibility is only the
+  registration, so a single `hasattr(Server, "list_tools")` branch would let the cap
+  widen to `<3` and not force anybody onto a major that is days old. The cost is a fork
+  in the code that has to be tested twice, on both lines.
+- **Whether it is time at all.** Nothing Rigout needs is exclusive to 2.x - tasks, which
+  looked like the reason to move, are gone from both. The protocol revision is the only
+  gain, and the caps mean nobody is broken meanwhile.
 
 ## Releasing
 
