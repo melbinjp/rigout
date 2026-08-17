@@ -16,7 +16,7 @@ pipx install rigout
 
 Rigout requires Python 3.10 or newer.
 
-`pipx` is the recommendation because Rigout is an application rather than a library: it gets its own environment, and its dependency bounds - which are deliberate, see [VERSIONING.md](VERSIONING.md) - cannot then conflict with anything else you have installed. `uv tool install rigout` does the same. `pip install rigout` works and is fine in a virtual environment of its own; in a shared one, its `mcp<2` bound and another package's requirements have to be satisfiable together.
+`pipx` is the recommendation because Rigout is an application rather than a library: it gets its own environment, and its dependency bounds - which are deliberate, see [VERSIONING.md](VERSIONING.md) - cannot then conflict with anything else you have installed. `uv tool install rigout` does the same. `pip install rigout` works and is fine in a virtual environment of its own; in a shared one, its `mcp<3` bound and another package's requirements have to be satisfiable together.
 
 That environment isolates Rigout's dependencies, not the machine. Commands an agent runs are children of the Rigout process and inherit its environment, so what matters is the environment Rigout was started in, not where its own packages live. `pipx` installs a shim whose interpreter is inside the environment without activating it, so `python`, `pip`, `PATH` and `VIRTUAL_ENV` all mean for the agent exactly what they mean for you at a shell.
 
