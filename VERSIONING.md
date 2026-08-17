@@ -51,7 +51,7 @@ the sentence naming the affected caller matters more than the label.
 Every runtime dependency has an upper bound:
 
 ```toml
-mcp>=1.0.0,<2      starlette>=0.37.0,<2
+mcp>=1.0.0,<3      starlette>=0.37.0,<2
 uvicorn>=0.29.0,<1  paramiko>=3.0.0,<6
 ```
 
