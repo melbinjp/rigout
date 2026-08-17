@@ -1,0 +1,38 @@
+name: Docs match the code
+
+# Checks the claims this repository's documentation makes against what the repository
+# actually contains: paths that exist, CLI flags the parser really defines, importable
+# names, the declared Python floor and install extras. It calls a claim broken only when
+# history shows the project HAD the thing and removed it, so an illustration or a tutorial
+# path is a skip with a reason rather than a false alarm.
+#
+# Measured on this repository at the time of adding: 112 claims checked, nothing
+# contradicted. So this starts green and stays green until documentation and code drift
+# apart, which is the only state worth alarming on.
+#
+# Not in `ci.yml` because this is a different question from "does it work", and a docs gate
+# that goes red should say so in its own name rather than inside a job about tests.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  docproof:
+    name: Documented claims still hold
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Required, and the action refuses to run without it rather than passing quietly.
+          # Without history a path check cannot tell a file the project deleted from one it
+          # never had, so every path judgement becomes a skip and the job goes green having
+          # decided nothing.
+          fetch-depth: 0
+
+      - uses: melbinjp/docproof@main
+        with:
+          show-skips: 'true'
