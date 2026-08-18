@@ -38,8 +38,17 @@ jobs:
       # gate silently took whatever was on that branch at the time. A gate whose own version
       # moves underneath it cannot tell you whether the code changed or the checker did.
       #
-      # v0.1.0 exists now, and the release it comes from is the same one a Marketplace
-      # listing is made from.
-      - uses: melbinjp/docproof@v0.1.0
+      # **Bumped v0.1.0 -> v0.1.1, 2026-08-18.** The line under this used to say v0.1.0 was
+      # "the same one a Marketplace listing is made from", and that stopped being true the
+      # hour the listing went up: it was published from **v0.1.1**, because v0.1.0 carries a
+      # metadata name GitHub rejects. So this repository was pinned to a release that can no
+      # longer be listed, while claiming it was the listed one. A stale comment in the gate
+      # whose whole job is catching stale documentation.
+      #
+      # **Measured before bumping, both ways: no behaviour change here.** v0.1.0 and v0.1.1
+      # each report 112 claims checked and nothing contradicted on this tree. The seven
+      # commits between them are precision work on other corpora plus the name fix, so this
+      # is hygiene rather than a fix, and saying otherwise would be inventing a win.
+      - uses: melbinjp/docproof@v0.1.1
         with:
           show-skips: 'true'
