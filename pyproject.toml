@@ -68,7 +68,6 @@ Repository = "https://github.com/melbinjp/rigout"
 [project.scripts]
 rigout = "rigout.mcp_url_launcher:main"
 rigout-stdio = "rigout.server:stdio_main"
-rigout-broken = "rigout.server:function_that_does_not_exist"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rigout"]
