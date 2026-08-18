@@ -20,6 +20,9 @@ Versioning policy, which this enforces and `VERSIONING.md` explains:
   * Below 1.0.0, a release containing a breaking change bumps MINOR; everything else
     bumps PATCH. From 1.0.0 onward, strict SemVer: breaking bumps MAJOR.
   * A release has a changelog section with a date, and it is not empty.
+  * When a tag is being released, that date is the day it actually goes out. A date
+    that exists is not the same as a date that is true, and 0.3.1 shipped fifteen
+    days after the one it carried.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import argparse
 import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -115,7 +119,47 @@ def released_tags() -> list[tuple[int, int, int]]:
     return sorted(v for v in versions if v is not None)
 
 
-def check(tag: str | None) -> list[str]:
+CHANGELOG_DATE_TOLERANCE_DAYS = 1
+
+
+def stale_date_problem(
+    version: str,
+    entry_date: date,
+    today: date,
+    tolerance_days: int = CHANGELOG_DATE_TOLERANCE_DAYS,
+) -> str | None:
+    """Report a changelog date that is not the day the release actually happens.
+
+    `check` already required the date to EXIST. It never asked whether it was TRUE, and
+    that gap shipped: rigout 0.3.1 carried `## [0.3.1] - 2026-08-02` while PyPI recorded
+    the upload on 2026-08-17. The entry was written when the work was done and never
+    touched again when it went out fifteen days later. Nothing failed, because nothing
+    looked. A changelog is read for the one thing a git log does not answer at a glance -
+    when a version reached users - and it was wrong by two weeks.
+
+    Only applied when a tag is being released. On the working tree the date is legitimately
+    the day the entry was drafted, and failing a pull request for that would be noise.
+
+    One day of tolerance, because the release runs on a UTC runner and the entry is written
+    in whoever's local timezone, so an honest entry can name the adjacent day.
+    """
+    drift = (today - entry_date).days
+    if abs(drift) <= tolerance_days:
+        return None
+    if drift < 0:
+        return (
+            f"the `## [{version}]` heading is dated {entry_date.isoformat()}, which is "
+            f"{-drift} days in the future; it should be the day the release goes out ({today.isoformat()})"
+        )
+    return (
+        f"the `## [{version}]` heading is dated {entry_date.isoformat()} but this release is "
+        f"going out on {today.isoformat()}, {drift} days later. The date says when a version "
+        f"reached users, so an entry drafted early and never updated makes the changelog wrong "
+        f"about the one thing it is read for."
+    )
+
+
+def check(tag: str | None, today: date | None = None) -> list[str]:
     problems: list[str] = []
 
     version_text = read_project_version(REPO_ROOT / "pyproject.toml")
@@ -140,13 +184,21 @@ def check(tag: str | None) -> list[str]:
         return problems
 
     entry = next(item for item in sections if item[0] == version_text)
-    _, date, start = entry
+    # Named entry_date rather than date: the module imports `date` from datetime, and the
+    # obvious local name shadows it exactly where the comparison below needs the type.
+    _, entry_date, start = entry
     body = section_body(changelog, start)
 
-    if date is None:
+    if entry_date is None:
         problems.append(
             f"the `## [{version_text}]` heading has no date; it should read `## [{version_text}] - YYYY-MM-DD`"
         )
+    elif tag is not None:
+        stale = stale_date_problem(
+            version_text, date.fromisoformat(entry_date), today if today is not None else date.today()
+        )
+        if stale is not None:
+            problems.append(stale)
     if not body.strip():
         problems.append(f"the `## [{version_text}]` section is empty")
 
