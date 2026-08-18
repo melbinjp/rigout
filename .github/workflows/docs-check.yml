@@ -33,6 +33,13 @@ jobs:
           # decided nothing.
           fetch-depth: 0
 
-      - uses: melbinjp/docproof@main
+      # **Pinned to a release rather than a branch, 2026-08-18.** This said `@main` because
+      # `@main` was the only thing that existed: docproof had no tag, so every run of this
+      # gate silently took whatever was on that branch at the time. A gate whose own version
+      # moves underneath it cannot tell you whether the code changed or the checker did.
+      #
+      # v0.1.0 exists now, and the release it comes from is the same one a Marketplace
+      # listing is made from.
+      - uses: melbinjp/docproof@v0.1.0
         with:
           show-skips: 'true'
