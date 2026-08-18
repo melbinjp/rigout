@@ -9,6 +9,11 @@ jobs:
   agent-audit:
     name: Agent Connection Audit
     runs-on: ubuntu-latest
+    # A ceiling the script cannot talk its way past. The script's own timeout was
+    # decorative - it re-checked the clock only between blocking readline() calls -
+    # so this job sat at GitHub's 6-hour default on every pull request. A script-level
+    # bound can have a hole in it; a job-level one cannot.
+    timeout-minutes: 10
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
