@@ -1,0 +1,48 @@
+name: TEMP Verify Wheel Both Paths
+
+# TEMPORARY. Exists only on the ci/verify-wheel-before-publish branch to prove both
+# entry points of verify-wheel.yml actually run, and is deleted before review.
+#
+# The release path cannot be exercised any other way: release.yml triggers on a
+# v*.*.* tag, and pushing one publishes to PyPI for real.
+
+on:
+  push:
+    branches: [ci/verify-wheel-before-publish]
+
+permissions:
+  contents: read
+
+jobs:
+  # Stands in for build-release: same artifact name, same upload action.
+  build:
+    name: Build Release Artifacts (stand-in)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+  # The release path: verify the exact artifact that would be published.
+  from-artifact:
+    name: Path A - from artifact
+    needs: build
+    uses: ./.github/workflows/verify-wheel.yml
+    with:
+      artifact: release-dist
+
+  # The scheduled path: build from the checkout, unchanged behaviour.
+  from-checkout:
+    name: Path B - from checkout
+    uses: ./.github/workflows/verify-wheel.yml
