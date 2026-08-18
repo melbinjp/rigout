@@ -80,9 +80,35 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # The last chance to find out that the wheel does not work, and the only one that
+  # matters: PyPI does not allow a version to be re-uploaded, so a broken 0.3.2 can
+  # only be answered by shipping 0.3.3 to users who have already installed it.
+  #
+  # Nothing above this catches that. `ci` installs `-e ".[dev]"`, which imports out of
+  # src/ and therefore cannot see a module missing from the wheel, a mis-declared
+  # package, dropped package data, or a console script pointing at a function that does
+  # not exist. `twine check` reads metadata and never installs anything. Both are green
+  # on a wheel that fails for every user.
+  #
+  # The artifact name is passed so this installs the exact file publish-pypi uploads,
+  # rather than a rebuild that could differ from it.
+  verify-wheel:
+    name: Verify The Built Wheel
+    needs: build-release
+    uses: ./.github/workflows/verify-wheel.yml
+    permissions:
+      contents: read
+      # download-artifact reads the run's artifacts through the Actions API, the same
+      # reason publish-pypi below already asks for it. Granted here rather than inside
+      # verify-wheel.yml, because the scheduled caller builds its own wheel, needs no
+      # such access, and caps its run at `contents: read`.
+      actions: read
+    with:
+      artifact: release-dist
+
   publish-pypi:
     name: Publish to PyPI
-    needs: build-release
+    needs: [build-release, verify-wheel]
     runs-on: ubuntu-latest
     environment:
       name: pypi
