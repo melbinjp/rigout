@@ -30,13 +30,15 @@ on:
         required: false
         default: ""
 
-permissions:
-  contents: read
-  # download-artifact reads the run's artifacts through the Actions API. publish-pypi
-  # already grants this for the same reason; without it the release path fails at the
-  # download while the scheduled path, which builds its own wheel, stays green - so the
-  # gap would only ever show up during a release.
-  actions: read
+# Deliberately no `permissions:` block, so this inherits whatever the caller grants.
+#
+# The two paths genuinely need different things: the artifact path reads the run's
+# artifacts through the Actions API and so needs `actions: read`, and the checkout path
+# needs nothing beyond `contents: read`. Declaring the union here would break the
+# scheduled caller outright - scheduled-ci.yml caps its run at `contents: read`, and a
+# called workflow may not request more than its caller grants, so the weekly run would
+# fail at startup. Every Monday, in the workflow whose whole job is noticing silent
+# breakage. Each caller grants what its own path needs instead.
 
 jobs:
   verify:

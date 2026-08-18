@@ -96,6 +96,13 @@ jobs:
     name: Verify The Built Wheel
     needs: build-release
     uses: ./.github/workflows/verify-wheel.yml
+    permissions:
+      contents: read
+      # download-artifact reads the run's artifacts through the Actions API, the same
+      # reason publish-pypi below already asks for it. Granted here rather than inside
+      # verify-wheel.yml, because the scheduled caller builds its own wheel, needs no
+      # such access, and caps its run at `contents: read`.
+      actions: read
     with:
       artifact: release-dist
 

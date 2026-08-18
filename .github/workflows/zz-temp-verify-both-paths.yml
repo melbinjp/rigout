@@ -10,8 +10,9 @@ on:
   push:
     branches: [ci/verify-wheel-before-publish]
 
-permissions:
-  contents: read
+# No top-level block, matching release.yml. Each caller job below sets exactly the
+# permissions its real counterpart sets, because the permission ceiling is the thing
+# this file exists to test and a convenient union here would test nothing.
 
 jobs:
   # Stands in for build-release: same artifact name, same upload action.
@@ -34,15 +35,25 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  # The release path: verify the exact artifact that would be published.
+  # The release path: verify the exact artifact that would be published. Permissions
+  # mirror release.yml's verify-wheel job exactly, because the first run of this file
+  # proved that is the part most likely to be wrong.
   from-artifact:
     name: Path A - from artifact
     needs: build
     uses: ./.github/workflows/verify-wheel.yml
+    permissions:
+      contents: read
+      actions: read
     with:
       artifact: release-dist
 
-  # The scheduled path: build from the checkout, unchanged behaviour.
+  # The scheduled path: build from the checkout, unchanged behaviour. Capped at
+  # `contents: read` exactly as scheduled-ci.yml caps it - that cap is what made the
+  # first attempt fail at startup, so testing this path with anything wider would
+  # reintroduce the bug it caught.
   from-checkout:
     name: Path B - from checkout
+    permissions:
+      contents: read
     uses: ./.github/workflows/verify-wheel.yml
