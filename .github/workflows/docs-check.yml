@@ -49,6 +49,6 @@ jobs:
       # each report 112 claims checked and nothing contradicted on this tree. The seven
       # commits between them are precision work on other corpora plus the name fix, so this
       # is hygiene rather than a fix, and saying otherwise would be inventing a win.
-      - uses: melbinjp/docproof@v0.1.1
+      - uses: melbinjp/docproof@v0.2.2
         with:
           show-skips: 'true'
