@@ -49,6 +49,15 @@ jobs:
       # each report 112 claims checked and nothing contradicted on this tree. The seven
       # commits between them are precision work on other corpora plus the name fix, so this
       # is hygiene rather than a fix, and saying otherwise would be inventing a win.
-      - uses: melbinjp/docproof@v0.1.1
+      #
+      # **Pinned to a commit rather than a tag, 2026-09-01.** docproof's own README tells
+      # adopters to do this, and gives the reason: a tag is movable, so whoever controls the
+      # repository can change what `@v0.2.4` means without a diff for anyone to review. That
+      # is the same supply-chain hole azul's maintainer raised against docproof itself. This
+      # repository was still on a tag, and Dependabot's habit of moving between tags is the
+      # thing the advice exists to stop. The SHA below is what `v0.2.4` resolved to:
+      #
+      #     git ls-remote https://github.com/melbinjp/docproof refs/tags/v0.2.4
+      - uses: melbinjp/docproof@5798f6ac3c0b0aec739c4da135cc6b6c45c96fe5  # v0.2.4
         with:
           show-skips: 'true'
