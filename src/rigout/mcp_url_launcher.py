@@ -450,8 +450,21 @@ def start_cloudflare_tunnel(
         if process.poll() is not None:
             raise RuntimeError("cloudflared exited before publishing a tunnel URL")
         try:
-            line = output_queue.get(timeout=0.5)
+            line = output_queue.get_nowait()
         except queue.Empty:
+            # Poll rather than block. `queue.get(timeout=...)` is a lock wait, and this
+            # module avoids those on purpose: `interruptible_sleep` is built from
+            # `time.sleep` precisely because a signal handler runs in the main thread
+            # between bytecodes, and a lock wait can hold the interrupt until it returns.
+            #
+            # This loop was the one place that still blocked on a lock, and it is the
+            # longest wait in a start: 45 seconds. On 2026-08-31 a scheduled run failed on
+            # windows-latest with Python 3.13 because a Ctrl+C raised during this wait was
+            # not delivered here at all. It surfaced later, inside `tempfile`, long after
+            # the wait had returned, and took the whole test session down with it. For an
+            # operator that is the same defect the interrupt handling exists to fix: Ctrl+C
+            # during the tunnel wait, and nothing happens.
+            interruptible_sleep(0.1)
             continue
         match = CLOUDFLARE_URL_PATTERN.search(line)
         if match:

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from rigout import lifecycle
+from rigout import lifecycle, mcp_url_launcher
 from rigout.mcp_http_server import connection_setup_url, tokens_match, write_connection_file
 from rigout.mcp_url_launcher import (
     cloudflared_asset,
@@ -343,3 +343,52 @@ def test_resolve_public_mcp_url_falls_back_to_local_url():
     args = launcher_args(host="127.0.0.1", port=8765, path="/mcp", public_url=None)
 
     assert resolve_public_mcp_url(args, tunnel_base_url=None) == "http://127.0.0.1:8765/mcp"
+
+
+@pytest.mark.unit
+def test_the_tunnel_wait_does_not_block_on_a_lock():
+    """The 45 second tunnel wait must poll, not sit in a lock acquire.
+
+    `interruptible_sleep` exists because a signal handler runs in the main thread
+    between bytecodes, and its docstring says plainly that it is built from
+    `time.sleep` rather than an Event wait so an interrupt is noticed on Windows
+    as well as POSIX. The tunnel loop was the one startup wait that still blocked
+    on `queue.get(timeout=...)`, which is a lock acquire.
+
+    On 2026-08-31 a scheduled run failed on windows-latest with Python 3.13: a
+    Ctrl+C raised during this wait was not delivered here at all. It arrived
+    later, inside `tempfile`, after the wait had already returned, and took the
+    test session down with it. For an operator the same defect reads as Ctrl+C
+    during a start doing nothing.
+
+    This asserts the mechanism rather than the symptom, deliberately. The failure
+    is a delivery race on one runner and does not reproduce on demand: with the
+    lock wait restored, the interrupt test still passed five times out of five
+    locally. What can be checked is that the loop reaches for the interruptible
+    primitive when it has nothing to read, and that is the property that made the
+    difference.
+    """
+    fake_process = FakeCloudflaredProcess([])  # never publishes a URL
+    slept: list[float] = []
+
+    def spy(seconds: float) -> None:
+        slept.append(seconds)
+        if len(slept) > 3:
+            # Stop the loop without waiting out the timeout.
+            mcp_url_launcher.STARTUP_INTERRUPTED.set()
+
+    with (
+        patch("rigout.mcp_url_launcher.resolve_cloudflared_binary", return_value="cloudflared"),
+        patch("rigout.mcp_url_launcher.subprocess.Popen", side_effect=cloudflared_only(fake_process)),
+        patch("rigout.mcp_url_launcher.interruptible_sleep", side_effect=spy),
+    ):
+        try:
+            with pytest.raises(mcp_url_launcher.StartupInterruptedError):
+                start_cloudflare_tunnel(8765, timeout=5)
+        finally:
+            mcp_url_launcher.STARTUP_INTERRUPTED.clear()
+
+    assert slept, (
+        "the tunnel wait never called interruptible_sleep, so it is blocking on a "
+        "lock and an interrupt raised during it can be delivered late or not at all"
+    )
