@@ -691,10 +691,11 @@ class TestFetchDiffTooLarge:
 
 @pytest.mark.unit
 class TestLargeDiffs:
-    """PR #49: 872,642 characters, most of them deleted files, over an 80,000 limit."""
+    """PR #49: 872,642 characters, most of them deleted files, over the old 80,000 limit."""
 
-    def test_the_default_limit_fits_a_large_change(self):
-        assert jules_review.DEFAULT_MAX_DIFF_CHARS >= 500_000
+    def test_there_is_no_default_cap(self):
+        assert not hasattr(jules_review, "DEFAULT_MAX_DIFF_CHARS")
+        assert jules_review.MAX_DIFF_CHARS_ENV == "JULES_REVIEW_MAX_DIFF_CHARS"
 
     def test_deleted_files_collapse_to_one_line_and_other_files_stay_whole(self):
         deleted = "diff --git a/old.py b/old.py\ndeleted file mode 100644\n--- a/old.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a = 1\n-b = 2\n"

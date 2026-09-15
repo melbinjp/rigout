@@ -359,9 +359,9 @@ def order_diff_for_review(diff: str) -> str:
     return "".join(sections[i][1] for i in ordered)
 
 
-# What reaches the reviewer. 80,000 characters was set for a much smaller context; the model
-# behind the review reads far more, and at 80,000 PR #49's review could not approve.
-DEFAULT_MAX_DIFF_CHARS = 500_000
+# No cap by default. A fixed 80,000 characters stopped PR #49's review from approving while the
+# model behind the review reads far more; set JULES_REVIEW_MAX_DIFF_CHARS to cap it anyway.
+MAX_DIFF_CHARS_ENV = "JULES_REVIEW_MAX_DIFF_CHARS"
 DELETED_FILE_MARKER = "\ndeleted file mode"
 
 
@@ -369,8 +369,7 @@ def collapse_deleted_files(diff: str) -> str:
     """Show a wholly deleted file as one line instead of every line it removed.
 
     A deletion is reviewed by knowing what went, not by rereading each removed line. PR #49
-    deleted about 700,000 characters of old code, which pushed its real changes past the
-    limit. Used only when a diff is over the limit, so smaller reviews still see everything.
+    deleted about 700,000 characters of old code, which buried its real changes.
     """
     sections = split_diff_by_file(diff)
     if not sections:
@@ -730,11 +729,9 @@ def main() -> int:
 
     try:
         diff = fetch_diff(owner, repo, pr_number, token)
-        max_chars = int(os.environ.get("JULES_REVIEW_MAX_DIFF_CHARS", str(DEFAULT_MAX_DIFF_CHARS)))
-        ordered = order_diff_for_review(diff)
-        if len(ordered) > max_chars:
-            ordered = collapse_deleted_files(ordered)
-        diff_text, truncated_note = truncate_diff(ordered, max_chars)
+        ordered = collapse_deleted_files(order_diff_for_review(diff))
+        cap = os.environ.get(MAX_DIFF_CHARS_ENV, "").strip()
+        diff_text, truncated_note = truncate_diff(ordered, int(cap)) if cap else (ordered, None)
 
         rules_path = os.environ.get("JULES_REVIEW_RULES_FILE", ".github/jules-review-rules.md")
         rules_from_file = load_rules_file(owner, repo, rules_path, base_sha, token)
