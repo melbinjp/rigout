@@ -194,6 +194,9 @@ def serve(args: argparse.Namespace, public_base: str | None = None) -> int:
     print(f"\nClaude Code{' (copied to clipboard)' if copied else ''}:\n  {command}")
     print("Other clients: rigout url --client cursor | vscode | raw")
     print("\nAnyone with this URL and token can run commands here as you. Ctrl+C stops rigout.")
+    # Printed lines sit in a buffer when output goes to a file or a service log, and the server
+    # never returns to flush them, so the URL would never appear.
+    sys.stdout.flush()
     uvicorn.run(create_app(workspace, token), host=host, port=args.port, log_level="warning")
     return 0
 
