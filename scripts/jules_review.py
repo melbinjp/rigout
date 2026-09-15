@@ -280,7 +280,10 @@ def fetch_diff(owner: str, repo: str, pr_number: int, token: str) -> str:
             old = changed.get("previous_filename", name)
             patch = changed.get("patch")
             body = patch if patch is not None else f"(no text diff: {changed.get('status', 'changed')})"
-            parts.append(f"diff --git a/{old} b/{name}\n--- a/{old}\n+++ b/{name}\n{body}")
+            removed = changed.get("status") == "removed"
+            deleted = "deleted file mode 100644\n" if removed else ""
+            new_path = "/dev/null" if removed else f"b/{name}"
+            parts.append(f"diff --git a/{old} b/{name}\n{deleted}--- a/{old}\n+++ {new_path}\n{body}")
         if len(files) < FILES_PAGE_SIZE:
             break
     return "\n".join(parts) + "\n"
@@ -306,7 +309,8 @@ def load_rules_file(owner: str, repo: str, path: str, base_sha: str, token: str)
     return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
 
 
-FILE_HEADER_PATTERN = re.compile(r"^diff --git a/(\S+)", re.MULTILINE)
+# Up to the " b/" that starts the second path, so a name with spaces is kept whole.
+FILE_HEADER_PATTERN = re.compile(r"^diff --git a/(.+?) b/", re.MULTILINE)
 
 # What a reviewer must see first when not everything fits. `git diff` emits files in
 # path order, which put `.github/`, `CHANGELOG.md`, `README.md` and `docs/` ahead of
@@ -356,6 +360,51 @@ def order_diff_for_review(diff: str) -> str:
         return diff
     ordered = sorted(range(len(sections)), key=lambda i: (review_priority(sections[i][0]), i))
     return "".join(sections[i][1] for i in ordered)
+
+
+# No cap by default. A fixed 80,000 characters stopped PR #49's review from approving while the
+# model behind the review reads far more; set JULES_REVIEW_MAX_DIFF_CHARS to cap it anyway.
+MAX_DIFF_CHARS_ENV = "JULES_REVIEW_MAX_DIFF_CHARS"
+DELETED_FILE_MARKER = "\ndeleted file mode"
+
+
+def collapse_deleted_files(diff: str) -> str:
+    """Show a wholly deleted file as one line instead of every line it removed.
+
+    A deletion is reviewed by knowing what went, not by rereading each removed line. PR #49
+    deleted about 700,000 characters of old code, which buried its real changes.
+    """
+    sections = split_diff_by_file(diff)
+    if not sections:
+        return diff
+    parts = []
+    for _path, section in sections:
+        # The whole section, not a prefix: a long file name can push the marker far in, and no
+        # content line can match because each one starts with "+", "-", " " or a backslash.
+        if DELETED_FILE_MARKER in section:
+            # Only lines inside a hunk: a removed line that itself starts with "--" shows as "---".
+            removed = 0
+            in_hunk = False
+            for line in section.splitlines():
+                if line.startswith("@@"):
+                    in_hunk = True
+                elif in_hunk and line.startswith("-"):
+                    removed += 1
+            # The original header line, not one rebuilt from the parsed path, so no name is altered.
+            header = section.split("\n", 1)[0]
+            parts.append(f"{header}\ndeleted file mode 100644\n(file deleted: {removed} lines removed, not shown)\n")
+        else:
+            parts.append(section)
+    return "".join(parts)
+
+
+def diff_fully_shown(truncated_note: str | None, files_collapsed: bool, coverage_ok: bool) -> bool:
+    """Whether the review can count as having read the whole change.
+
+    Collapsed deleted files hide lines just as a cap does, so either one means approval needs
+    the reviewer's confirmed coverage.
+    """
+    return (truncated_note is None and not files_collapsed) or coverage_ok
 
 
 def truncate_diff(diff: str, max_chars: int) -> tuple[str, str | None]:
@@ -700,8 +749,11 @@ def main() -> int:
 
     try:
         diff = fetch_diff(owner, repo, pr_number, token)
-        max_chars = int(os.environ.get("JULES_REVIEW_MAX_DIFF_CHARS", "80000"))
-        diff_text, truncated_note = truncate_diff(order_diff_for_review(diff), max_chars)
+        full = order_diff_for_review(diff)
+        ordered = collapse_deleted_files(full)
+        files_collapsed = ordered != full
+        cap = os.environ.get(MAX_DIFF_CHARS_ENV, "").strip()
+        diff_text, truncated_note = truncate_diff(ordered, int(cap)) if cap else (ordered, None)
 
         rules_path = os.environ.get("JULES_REVIEW_RULES_FILE", ".github/jules-review-rules.md")
         rules_from_file = load_rules_file(owner, repo, rules_path, base_sha, token)
@@ -754,7 +806,7 @@ def main() -> int:
         # approvable, and this is a solo-maintainer repo where no second reviewer exists.
         coverage = parse_coverage(review_message)
         coverage_ok, coverage_problem = coverage_confirms_full_review(coverage, head_sha, changed_files)
-        reviewed_whole_diff = truncated_note is None or coverage_ok
+        reviewed_whole_diff = diff_fully_shown(truncated_note, files_collapsed, coverage_ok)
         # The dry-run check is placed in the same expression as the others rather than
         # around the later approval call, so there is one place that decides, and no
         # path where a candidate reviewer being tried out can approve anything.
@@ -770,8 +822,8 @@ def main() -> int:
             approval_note = "_No blocking issues were found, so this PR was auto-approved._"
         elif not reviewed_whole_diff:
             approval_note = (
-                f"_This did not auto-approve: {coverage_problem}, and the diff was too large to "
-                "include in full, so part of this change may never have been reviewed. Re-run the "
+                f"_This did not auto-approve: {coverage_problem}, and part of the diff was not "
+                "shown in full, so part of this change may never have been reviewed. Re-run the "
                 "workflow, or review and approve it yourself._"
             )
         elif verdict not in APPROVING_VERDICTS:

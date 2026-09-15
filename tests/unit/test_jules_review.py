@@ -553,7 +553,7 @@ class TestApprovalStillWorksForALoneMaintainer:
         ],
     )
     def test_coverage_is_an_alternative_route_not_an_extra_hurdle(self, truncated, coverage_ok, expected):
-        reviewed_whole_diff = (not truncated) or coverage_ok
+        reviewed_whole_diff = jules_review.diff_fully_shown("cut" if truncated else None, False, coverage_ok)
 
         assert reviewed_whole_diff is expected
 
@@ -687,3 +687,89 @@ class TestFetchDiffTooLarge:
         assert "diff --git a/src/a.py b/src/a.py" in diff
         assert "+new" in diff
         assert "logo.png" in diff
+
+
+@pytest.mark.unit
+class TestLargeDiffs:
+    """PR #49: 872,642 characters, most of them deleted files, over the old 80,000 limit."""
+
+    def test_there_is_no_default_cap(self):
+        assert not hasattr(jules_review, "DEFAULT_MAX_DIFF_CHARS")
+        assert jules_review.MAX_DIFF_CHARS_ENV == "JULES_REVIEW_MAX_DIFF_CHARS"
+
+    def test_deleted_files_collapse_to_one_line_and_other_files_stay_whole(self):
+        deleted = "diff --git a/old.py b/old.py\ndeleted file mode 100644\n--- a/old.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a = 1\n-b = 2\n"
+        changed = "diff --git a/new.py b/new.py\n--- a/new.py\n+++ b/new.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+        collapsed = jules_review.collapse_deleted_files(deleted + changed)
+        assert "file deleted: 2 lines removed" in collapsed
+        assert "-a = 1" not in collapsed
+        assert changed in collapsed
+
+    def test_rebuilt_diff_marks_removed_files_as_deleted(self):
+        files = [{"filename": "gone.py", "status": "removed", "patch": "@@ -1 +0,0 @@\n-x = 1"}]
+        with patch("requests.request", side_effect=[make_response(406), make_response(200, json_data=files)]):
+            diff = jules_review.fetch_diff("o", "r", 1, "t")
+        assert "deleted file mode" in diff
+        assert "file deleted: 1 lines removed" in jules_review.collapse_deleted_files(diff)
+
+
+@pytest.mark.unit
+class TestDeletedFileHeaders:
+    """Blocking findings on PR #51: a removed file's new path, and names with spaces."""
+
+    def test_rebuilt_removed_file_points_at_dev_null(self):
+        files = [{"filename": "gone.py", "status": "removed", "patch": "@@ -1 +0,0 @@\n-x = 1"}]
+        with patch("requests.request", side_effect=[make_response(406), make_response(200, json_data=files)]):
+            diff = jules_review.fetch_diff("o", "r", 1, "t")
+        assert "+++ /dev/null" in diff
+        assert "+++ b/gone.py" not in diff
+
+    def test_collapse_keeps_a_file_name_with_spaces(self):
+        deleted = (
+            "diff --git a/my folder/file.txt b/my folder/file.txt\ndeleted file mode 100644\n"
+            "--- a/my folder/file.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+        )
+        collapsed = jules_review.collapse_deleted_files(deleted)
+        assert collapsed.startswith("diff --git a/my folder/file.txt b/my folder/file.txt\n")
+        assert "file deleted: 1 lines removed" in collapsed
+
+    def test_split_keeps_a_file_name_with_spaces(self):
+        diff = "diff --git a/my folder/a.py b/my folder/a.py\n--- a/my folder/a.py\n+++ b/my folder/a.py\n"
+        assert jules_review.split_diff_by_file(diff)[0][0] == "my folder/a.py"
+
+
+@pytest.mark.unit
+class TestCollapseNeedsCoverage:
+    """CodeRabbit findings on PR #51: long names hid the marker, and collapse skipped coverage."""
+
+    def test_a_deleted_file_with_a_255_character_name_still_collapses(self):
+        name = "d/" + "n" * 253
+        deleted = (
+            f"diff --git a/{name} b/{name}\ndeleted file mode 100644\n"
+            f"--- a/{name}\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+        )
+        collapsed = jules_review.collapse_deleted_files(deleted)
+        assert "file deleted: 1 lines removed" in collapsed
+        assert "-old" not in collapsed
+
+    def test_a_removed_line_reading_deleted_file_mode_does_not_collapse_a_changed_file(self):
+        changed = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-deleted file mode\n+x\n"
+        assert jules_review.collapse_deleted_files(changed) == changed
+
+    def test_collapsed_files_need_confirmed_coverage_to_approve(self):
+        assert jules_review.diff_fully_shown(None, True, False) is False
+        assert jules_review.diff_fully_shown(None, True, True) is True
+        assert jules_review.diff_fully_shown(None, False, False) is True
+
+
+@pytest.mark.unit
+class TestDeletedLineCount:
+    """CodeRabbit finding on PR #51: removed lines starting with "--" were not counted."""
+
+    def test_removed_lines_starting_with_two_dashes_are_counted(self):
+        deleted = (
+            "diff --git a/schema.sql b/schema.sql\ndeleted file mode 100644\n"
+            "--- a/schema.sql\n+++ /dev/null\n@@ -1,3 +0,0 @@\n"
+            "--- a comment\n-create table t (id int);\n--- another comment\n"
+        )
+        assert "file deleted: 3 lines removed" in jules_review.collapse_deleted_files(deleted)
