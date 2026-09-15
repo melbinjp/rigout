@@ -31,7 +31,7 @@ def test_exactly_the_eight_tools_and_no_escape_hatch():
     definitions = tool_definitions()
     assert [tool.name for tool in definitions] == list(TOOL_NAMES)
     assert len(definitions) == 8
-    assert "bypass" not in json.dumps([tool.inputSchema for tool in definitions])
+    assert "bypass" not in json.dumps([tool.model_dump(by_alias=True)["inputSchema"] for tool in definitions])
 
 
 async def test_write_then_read_with_line_numbers(tools, tmp_path):

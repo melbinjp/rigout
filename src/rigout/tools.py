@@ -503,12 +503,21 @@ def _schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
     return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
 
 
+def _tool(**fields: Any) -> Tool:
+    """Built from the wire names, which both mcp majors accept. 2.x renamed the fields to snake_case."""
+    return Tool.model_validate(fields)
+
+
+def _annotations(**fields: Any) -> ToolAnnotations:
+    return ToolAnnotations.model_validate(fields)
+
+
 def tool_definitions() -> list[Tool]:
     text = {"type": "string"}
     path = {"type": "string", "description": "Relative to the workspace, or absolute."}
     folder = {"type": "string", "description": "Relative to the workspace, or absolute. Default: the workspace."}
     return [
-        Tool(
+        _tool(
             name="run",
             title="Run a command",
             description=(
@@ -526,9 +535,9 @@ def tool_definitions() -> list[Tool]:
                 },
                 ["command"],
             ),
-            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
+            annotations=_annotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
         ),
-        Tool(
+        _tool(
             name="process",
             title="Follow a job",
             description=(
@@ -543,9 +552,9 @@ def tool_definitions() -> list[Tool]:
                 },
                 [],
             ),
-            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
+            annotations=_annotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
         ),
-        Tool(
+        _tool(
             name="read",
             title="Read a file",
             description=(
@@ -560,9 +569,9 @@ def tool_definitions() -> list[Tool]:
                 },
                 ["path"],
             ),
-            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+            annotations=_annotations(readOnlyHint=True, openWorldHint=False),
         ),
-        Tool(
+        _tool(
             name="write",
             title="Write a file",
             description=(
@@ -570,9 +579,9 @@ def tool_definitions() -> list[Tool]:
                 "file use edit instead."
             ),
             inputSchema=_schema({"path": path, "content": text}, ["path", "content"]),
-            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
+            annotations=_annotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
         ),
-        Tool(
+        _tool(
             name="edit",
             title="Edit a file",
             description=(
@@ -584,23 +593,23 @@ def tool_definitions() -> list[Tool]:
                 {"path": path, "old_string": text, "new_string": text, "replace_all": {"type": "boolean"}},
                 ["path", "old_string", "new_string"],
             ),
-            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
+            annotations=_annotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
         ),
-        Tool(
+        _tool(
             name="ls",
             title="List a folder",
             description="List a folder. Folders end with /, files show their size.",
             inputSchema=_schema({"path": folder}, []),
-            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+            annotations=_annotations(readOnlyHint=True, openWorldHint=False),
         ),
-        Tool(
+        _tool(
             name="glob",
             title="Find files",
             description="Find files by name pattern, such as **/*.py or src/**/test_*.ts, newest first.",
             inputSchema=_schema({"pattern": text, "path": folder}, ["pattern"]),
-            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+            annotations=_annotations(readOnlyHint=True, openWorldHint=False),
         ),
-        Tool(
+        _tool(
             name="grep",
             title="Search file contents",
             description=(
@@ -620,6 +629,6 @@ def tool_definitions() -> list[Tool]:
                 },
                 ["pattern"],
             ),
-            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+            annotations=_annotations(readOnlyHint=True, openWorldHint=False),
         ),
     ]
