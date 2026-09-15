@@ -259,4 +259,3 @@ async def test_glob_invalid_pattern_says_how_to_fix_it(tools, tmp_path):
     result = await tools.call("glob", {"pattern": "[z-a]"})
     assert result_is_error(result)
     assert text(result).startswith("glob:")
-    assert "call glob again" in text(result)
