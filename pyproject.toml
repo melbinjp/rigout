@@ -29,7 +29,7 @@ classifiers = [
 # Capped below the next major, which is the range CI tests.
 dependencies = [
     "mcp>=1.20.0,<3",
-    "starlette>=0.37.0,<2",
+    "starlette>=1.6.0,<2",
     "uvicorn>=0.29.0,<1",
 ]
 
