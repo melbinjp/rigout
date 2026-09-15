@@ -253,6 +253,61 @@ def _clip(line: str) -> str:
     return line if len(line) <= LINE_CHARS else f"{line[:LINE_CHARS]} [+{len(line) - LINE_CHARS} characters]"
 
 
+def _glob_regex(pattern: str) -> re.Pattern[str]:
+    """A glob pattern as a regex over forward-slash relative paths, with ** spanning folders."""
+    out = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        elif pattern[i] == "[":
+            close = pattern.find("]", i + 1)
+            if close == -1:
+                out.append(re.escape(pattern[i]))
+                i += 1
+            else:
+                body = pattern[i + 1 : close]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                out.append(f"[{body}]")
+                i = close + 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def _glob_files(base: Path, pattern: str) -> list[Path]:
+    """Files under base matching pattern, never descending into SKIP_DIRS."""
+    pattern = pattern.replace("\\", "/")
+    while pattern.startswith("./"):
+        pattern = pattern[2:]
+    regex = _glob_regex(pattern)
+    top_level_only = "/" not in pattern
+    matches = []
+    for folder, dirs, names in os.walk(base):
+        if top_level_only:
+            dirs[:] = []
+        else:
+            dirs[:] = [name for name in dirs if name not in SKIP_DIRS]
+        relative_folder = Path(folder).relative_to(base).as_posix()
+        prefix = "" if relative_folder == "." else f"{relative_folder}/"
+        for name in names:
+            if regex.match(prefix + name):
+                matches.append(Path(folder) / name)
+    return matches
+
+
 class Tools:
     """The tool implementations for one workspace."""
 
@@ -421,11 +476,7 @@ class Tools:
                 f"glob: {self.workspace.show(base)} is not a folder. "
                 "Call ls to find the folder, or leave path out to search the workspace."
             )
-        matches = [
-            match
-            for match in base.glob(pattern)
-            if match.is_file() and not SKIP_DIRS.intersection(match.relative_to(base).parts)
-        ]
+        matches = await asyncio.to_thread(_glob_files, base, pattern)
         if not matches:
             return text_result(f"No files match {pattern} under {self.workspace.show(base)}.")
         matches.sort(key=lambda match: match.stat().st_mtime, reverse=True)

@@ -194,3 +194,45 @@ async def test_grep_on_a_single_file_names_the_file(tools, tmp_path):
     (tmp_path / "one.txt").write_text("alpha\nneedle\n")
     result = await tools.call("grep", {"pattern": "needle", "path": "one.txt"})
     assert "one.txt:2:needle" in text(result)
+
+
+async def test_glob_matches_like_pathlib(tools, tmp_path):
+    (tmp_path / "top.py").write_text("")
+    (tmp_path / "src" / "pkg").mkdir(parents=True)
+    (tmp_path / "src" / "pkg" / "test_one.py").write_text("")
+    (tmp_path / "src" / "pkg" / "one.py").write_text("")
+
+    top = text(await tools.call("glob", {"pattern": "*.py"}))
+    assert top.split() == ["top.py"]
+
+    everywhere = set(text(await tools.call("glob", {"pattern": "**/*.py"})).split())
+    assert everywhere == {"top.py", "src/pkg/test_one.py", "src/pkg/one.py"}
+
+    tests_only = text(await tools.call("glob", {"pattern": "src/**/test_*.py"})).split()
+    assert tests_only == ["src/pkg/test_one.py"]
+
+
+async def test_glob_never_walks_into_dependency_folders(tools, tmp_path, monkeypatch):
+    import os as real_os
+
+    (tmp_path / "node_modules" / "deep" / "deeper").mkdir(parents=True)
+    (tmp_path / "node_modules" / "deep" / "deeper" / "x.py").write_text("")
+    (tmp_path / "app.py").write_text("")
+    visited = []
+
+    def spying_walk(top, *args, **kwargs):
+        for folder, dirs, names in real_os.walk(top, *args, **kwargs):
+            visited.append(folder)
+            yield folder, dirs, names
+
+    monkeypatch.setattr("rigout.tools.os.walk", spying_walk)
+    result = text(await tools.call("glob", {"pattern": "**/*.py"}))
+    assert result.split() == ["app.py"]
+    assert not any("node_modules" in folder for folder in visited)
+
+
+async def test_glob_keeps_a_leading_dot_folder_after_dot_slash(tools, tmp_path):
+    (tmp_path / ".github").mkdir()
+    (tmp_path / ".github" / "ci.yml").write_text("")
+    result = text(await tools.call("glob", {"pattern": "./.github/*.yml"}))
+    assert result.split() == [".github/ci.yml"]
