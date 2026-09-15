@@ -102,11 +102,36 @@ jobs:
               print(row)
           PY
 
+  # ci installs the checkout in editable mode. This builds the wheel and installs it alone, so
+  # only the runtime dependencies resolve, which is what breaks when one of them ships a new major.
+  fresh-install:
+    name: Fresh Wheel Install
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build The Wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: Install The Wheel Alone And Use It
+        run: |
+          python -m venv /tmp/wheel-env
+          /tmp/wheel-env/bin/pip install dist/*.whl
+          cd /tmp && /tmp/wheel-env/bin/python "$GITHUB_WORKSPACE/production_validation.py"
+
   # A red run nobody looks at is not a safety net. Scheduled-run failures do not
   # appear on anyone's PR, so this turns one into a tracked, notifying issue.
   report-failure:
     name: Report Failure
-    needs: [full-ci]
+    needs: [full-ci, fresh-install]
     if: ${{ always() && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     permissions:
@@ -171,7 +196,7 @@ jobs:
   # always means "currently broken" and the signal stays worth trusting.
   clear-failure:
     name: Clear Failure Report
-    needs: [full-ci]
+    needs: [full-ci, fresh-install]
     if: ${{ always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     permissions:

@@ -11,9 +11,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, Any
 
@@ -273,7 +275,10 @@ class Tools:
     async def _run(self, args: dict[str, Any]) -> CallToolResult:
         cwd = self.workspace.path(args.get("cwd"))
         if not cwd.is_dir():
-            return _error(f"run: cwd {self.workspace.show(cwd)} is not a folder.")
+            return _error(
+                f"run: cwd {self.workspace.show(cwd)} is not a folder. "
+                "Call ls to find the folder, or leave cwd out to run in the workspace."
+            )
         job = self.jobs.start(args["command"], cwd, args.get("env"))
         await job.wait(float(args.get("wait_seconds", RUN_WAIT_SECONDS)))
         return job_report(job)
@@ -390,7 +395,7 @@ class Tools:
         path = self.workspace.path(args.get("path"))
         shown = self.workspace.show(path)
         if not path.exists():
-            return _error(f"ls: {shown} does not exist.")
+            return _error(f"ls: {shown} does not exist. Call ls on its parent folder, or glob to find it.")
         if path.is_file():
             return text_result(f"{shown}  {_size(path.stat().st_size)}")
         entries = sorted(path.iterdir(), key=lambda entry: (not entry.is_dir(), entry.name.lower()))
@@ -412,7 +417,10 @@ class Tools:
         base = self.workspace.path(args.get("path"))
         pattern = args["pattern"]
         if not base.is_dir():
-            return _error(f"glob: {self.workspace.show(base)} is not a folder.")
+            return _error(
+                f"glob: {self.workspace.show(base)} is not a folder. "
+                "Call ls to find the folder, or leave path out to search the workspace."
+            )
         matches = [
             match
             for match in base.glob(pattern)
@@ -433,7 +441,10 @@ class Tools:
         ignore_case = bool(args.get("ignore_case", False))
         literal = bool(args.get("literal", False))
         if not base.exists():
-            return _error(f"grep: {self.workspace.show(base)} does not exist.")
+            return _error(
+                f"grep: {self.workspace.show(base)} does not exist. "
+                "Call ls or glob to find it, or leave path out to search the workspace."
+            )
         ripgrep = shutil.which("rg")
         if ripgrep:
             rows = await asyncio.to_thread(self._ripgrep, ripgrep, pattern, base, include, ignore_case, literal)
@@ -455,7 +466,9 @@ class Tools:
         self, ripgrep: str, pattern: str, base: Path, include: str | None, ignore_case: bool, literal: bool = False
     ) -> list[str] | CallToolResult:
         argv = [ripgrep, "--line-number", "--no-heading", "--color", "never", "--hidden", "--path-separator", "/"]
-        argv += ["--max-columns", "500", "--max-columns-preview"]
+        # --null ends each path with a NUL byte, so a file name containing a colon stays whole, and
+        # --with-filename names the file even when the search is a single file.
+        argv += ["--null", "--with-filename", "--max-columns", "500", "--max-columns-preview"]
         for skipped in sorted(SKIP_DIRS):
             argv += ["--glob", f"!{skipped}"]
         if ignore_case:
@@ -466,27 +479,48 @@ class Tools:
             argv += ["--glob", include]
         folder = base.parent if base.is_file() else base
         argv += ["--", pattern] + ([base.name] if base.is_file() else [])
-        done = subprocess.run(  # noqa: S603
-            argv, cwd=folder, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
-        )
-        if done.returncode == 2 and not done.stdout:
-            return _error(f"grep: {done.stderr.strip()}")
-        rows = []
-        for line in done.stdout.splitlines()[: GREP_LIMIT + 1]:
-            relative, _, rest = line.partition(":")
-            rows.append(f"{self.workspace.show(folder / relative)}:{rest}")
+        # Streamed and stopped at the limit, so a pattern matching millions of lines never sits in
+        # memory. stderr goes to a file, so a noisy search cannot fill a pipe and stall.
+        rows: list[str] = []
+        with tempfile.TemporaryFile() as errors:
+            process = subprocess.Popen(  # noqa: S603
+                argv,
+                cwd=folder,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                relative, _, rest = line.rstrip("\n").partition("\0")
+                rows.append(f"{self.workspace.show(folder / relative)}:{rest}")
+                if len(rows) > GREP_LIMIT:
+                    process.kill()
+                    break
+            process.stdout.close()
+            process.wait()
+            errors.seek(0)
+            message = errors.read().decode("utf-8", errors="replace").strip()
+        if not rows and process.returncode == 2:
+            return _error(f"grep: {message}. Check the pattern, or pass literal: true to search for plain text.")
         return rows
 
-    def _python_grep(self, regex: re.Pattern[str], base: Path, include: str | None) -> list[str]:
+    @staticmethod
+    def _walk_files(base: Path) -> Iterator[Path]:
+        """Files under base, skipping dependency folders, yielded as found rather than listed first."""
         if base.is_file():
-            files = [base]
-        else:
-            files = []
-            for folder, dirs, names in os.walk(base):
-                dirs[:] = [name for name in dirs if name not in SKIP_DIRS]
-                files.extend(Path(folder) / name for name in names)
+            yield base
+            return
+        for folder, dirs, names in os.walk(base):
+            dirs[:] = [name for name in dirs if name not in SKIP_DIRS]
+            for name in names:
+                yield Path(folder) / name
+
+    def _python_grep(self, regex: re.Pattern[str], base: Path, include: str | None) -> list[str]:
         rows: list[str] = []
-        for file in files:
+        for file in self._walk_files(base):
             if include and not (fnmatch.fnmatch(file.name, include) or file.match(include)):
                 continue
             try:

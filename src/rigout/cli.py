@@ -136,10 +136,13 @@ def cloudflared_binary() -> str:
     return str(target)
 
 
-def _relay(process: subprocess.Popen[str], lines: queue.Queue[str]) -> None:
+def _relay(process: subprocess.Popen[str], lines: queue.Queue[str], found: threading.Event) -> None:
     assert process.stdout is not None
     for line in process.stdout:
-        lines.put(line)
+        # Once the URL is found nobody reads the queue. Lines are still read, so cloudflared never
+        # blocks on a full pipe, but they are dropped rather than kept for the life of the tunnel.
+        if not found.is_set():
+            lines.put(line)
 
 
 def start_tunnel(port: int, name: str | None, hostname: str | None) -> tuple[subprocess.Popen[str], str]:
@@ -148,7 +151,8 @@ def start_tunnel(port: int, name: str | None, hostname: str | None) -> tuple[sub
     argv += ["run", "--url", local, name] if name else ["--url", local]
     process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)  # noqa: S603
     lines: queue.Queue[str] = queue.Queue()
-    threading.Thread(target=_relay, args=(process, lines), daemon=True).start()
+    found = threading.Event()
+    threading.Thread(target=_relay, args=(process, lines, found), daemon=True).start()
     seen: list[str] = []
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -160,9 +164,11 @@ def start_tunnel(port: int, name: str | None, hostname: str | None) -> tuple[sub
             continue
         seen.append(line.rstrip())
         if name and "Registered tunnel connection" in line:
+            found.set()
             return process, f"https://{hostname}"
         match = QUICK_TUNNEL_URL.search(line)
         if not name and match:
+            found.set()
             return process, match.group(0)
     process.terminate()
     tail = "\n".join(seen[-10:])

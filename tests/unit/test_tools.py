@@ -162,3 +162,35 @@ async def test_edit_refuses_a_file_too_large_to_hold_in_memory(tools, tmp_path, 
     assert result_is_error(result)
     assert "run" in text(result)
     assert (tmp_path / "big.txt").read_text() == "x = 1\n" * 10
+
+
+async def test_errors_say_what_to_call_next(tools):
+    for name, arguments in [
+        ("ls", {"path": "nope"}),
+        ("run", {"command": "echo hi", "cwd": "nope"}),
+        ("glob", {"pattern": "*", "path": "nope"}),
+        ("grep", {"pattern": "x", "path": "nope"}),
+    ]:
+        result = await tools.call(name, arguments)
+        assert result_is_error(result), name
+        assert "Call " in text(result), name
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows file names cannot contain a colon")
+async def test_grep_keeps_a_file_name_with_a_colon(tools, tmp_path):
+    (tmp_path / "a:b.txt").write_text("needle\n")
+    result = await tools.call("grep", {"pattern": "needle"})
+    assert "a:b.txt:1:needle" in text(result)
+
+
+async def test_grep_stops_at_the_match_limit(tools, tmp_path, monkeypatch):
+    monkeypatch.setattr("rigout.tools.GREP_LIMIT", 5)
+    (tmp_path / "many.txt").write_text("hit\n" * 100)
+    result = await tools.call("grep", {"pattern": "hit"})
+    assert "first 5 matches shown" in text(result)
+
+
+async def test_grep_on_a_single_file_names_the_file(tools, tmp_path):
+    (tmp_path / "one.txt").write_text("alpha\nneedle\n")
+    result = await tools.call("grep", {"pattern": "needle", "path": "one.txt"})
+    assert "one.txt:2:needle" in text(result)
