@@ -1,28 +1,23 @@
 version: 2
 updates:
+  # One pull request a month per ecosystem. Version ranges in pyproject.toml are only raised when a
+  # new release falls outside them, so a release inside an allowed range opens nothing. New majors
+  # held back by a cap are reported by the scheduled CI run instead.
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
+      interval: "monthly"
+    versioning-strategy: increase-if-necessary
+    open-pull-requests-limit: 1
     groups:
-      # Minor/patch bumps are low-risk; bundle them into one PR per week.
-      # Major bumps are left ungrouped - those are the ones actually likely
-      # to carry breaking changes (e.g. mcp, starlette), so each
-      # gets its own PR and its own review rather than hiding inside a
-      # batch where one bad bump blocks the whole thing.
-      pip-minor-patch:
-        update-types: ["minor", "patch"]
+      pip:
+        patterns: ["*"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
+    open-pull-requests-limit: 1
     groups:
-      # All github-actions bumps grouped together regardless of version
-      # jump size: checkout/setup-python/artifact actions essentially never
-      # carry breaking changes for how this repo uses them, and separate
-      # PRs for each one just creates cross-PR staleness/rebase churn when
-      # they touch the same workflow files.
       github-actions:
         patterns: ["*"]
