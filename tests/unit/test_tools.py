@@ -215,13 +215,15 @@ async def test_glob_matches_like_pathlib(tools, tmp_path):
 async def test_glob_never_walks_into_dependency_folders(tools, tmp_path, monkeypatch):
     import os as real_os
 
+    real_walk = real_os.walk  # kept before patching: rigout.tools.os is this same module
+
     (tmp_path / "node_modules" / "deep" / "deeper").mkdir(parents=True)
     (tmp_path / "node_modules" / "deep" / "deeper" / "x.py").write_text("")
     (tmp_path / "app.py").write_text("")
     visited = []
 
     def spying_walk(top, *args, **kwargs):
-        for folder, dirs, names in real_os.walk(top, *args, **kwargs):
+        for folder, dirs, names in real_walk(top, *args, **kwargs):
             visited.append(folder)
             yield folder, dirs, names
 
