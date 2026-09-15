@@ -487,7 +487,13 @@ class Tools:
                 f"glob: {self.workspace.show(base)} is not a folder. "
                 "Call ls to find the folder, or leave path out to search the workspace."
             )
-        matches = await asyncio.to_thread(_glob_files, base, pattern)
+        try:
+            matches = await asyncio.to_thread(_glob_files, base, pattern)
+        except re.error as exc:
+            return _error(
+                f"glob: {pattern!r} is not a valid pattern ({exc}). "
+                "Fix the brackets, such as [a-z], and call glob again."
+            )
         if not matches:
             return text_result(f"No files match {pattern} under {self.workspace.show(base)}.")
         matches.sort(key=lambda match: match.stat().st_mtime, reverse=True)

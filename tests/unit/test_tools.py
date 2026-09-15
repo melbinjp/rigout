@@ -252,3 +252,11 @@ def test_glob_bracket_classes_follow_fnmatch():
     assert not _glob_regex("[!a]").match("a")
     assert _glob_regex("[!]]").match("a")
     assert not _glob_regex("[!]]").match("]")
+
+
+async def test_glob_invalid_pattern_says_how_to_fix_it(tools, tmp_path):
+    (tmp_path / "a.txt").write_text("")
+    result = await tools.call("glob", {"pattern": "[z-a]"})
+    assert result_is_error(result)
+    assert text(result).startswith("glob:")
+    assert "call glob again" in text(result)
