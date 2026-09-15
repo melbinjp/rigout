@@ -9,6 +9,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   docproof:
     name: Documented claims still hold
@@ -18,6 +21,8 @@ jobs:
         with:
           # Full history lets docproof tell a removed file from one that never existed.
           fetch-depth: 0
+          # docproof is a third-party action, so the token is not left in the git config for it.
+          persist-credentials: false
 
       # Pinned to a commit, since a tag can be moved.
       - uses: melbinjp/docproof@5798f6ac3c0b0aec739c4da135cc6b6c45c96fe5  # v0.2.4

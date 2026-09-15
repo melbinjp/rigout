@@ -19,4 +19,5 @@ Add a line to `CHANGELOG.md` under Unreleased for anything a user would notice.
   the package, installs the built wheel on its own to test it, and publishes it to PyPI.
 - Every Monday, a scheduled run repeats CI against newly released dependencies and opens an
   issue if it fails.
-- Dependabot opens at most one grouped update each month.
+- Dependabot opens at most one grouped update a month for Python packages and one for GitHub
+  Actions.
