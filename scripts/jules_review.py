@@ -382,7 +382,14 @@ def collapse_deleted_files(diff: str) -> str:
         # The whole section, not a prefix: a long file name can push the marker far in, and no
         # content line can match because each one starts with "+", "-", " " or a backslash.
         if DELETED_FILE_MARKER in section:
-            removed = sum(1 for line in section.splitlines() if line.startswith("-") and not line.startswith("---"))
+            # Only lines inside a hunk: a removed line that itself starts with "--" shows as "---".
+            removed = 0
+            in_hunk = False
+            for line in section.splitlines():
+                if line.startswith("@@"):
+                    in_hunk = True
+                elif in_hunk and line.startswith("-"):
+                    removed += 1
             # The original header line, not one rebuilt from the parsed path, so no name is altered.
             header = section.split("\n", 1)[0]
             parts.append(f"{header}\ndeleted file mode 100644\n(file deleted: {removed} lines removed, not shown)\n")

@@ -760,3 +760,16 @@ class TestCollapseNeedsCoverage:
         assert jules_review.diff_fully_shown(None, True, False) is False
         assert jules_review.diff_fully_shown(None, True, True) is True
         assert jules_review.diff_fully_shown(None, False, False) is True
+
+
+@pytest.mark.unit
+class TestDeletedLineCount:
+    """CodeRabbit finding on PR #51: removed lines starting with "--" were not counted."""
+
+    def test_removed_lines_starting_with_two_dashes_are_counted(self):
+        deleted = (
+            "diff --git a/schema.sql b/schema.sql\ndeleted file mode 100644\n"
+            "--- a/schema.sql\n+++ /dev/null\n@@ -1,3 +0,0 @@\n"
+            "--- a comment\n-create table t (id int);\n--- another comment\n"
+        )
+        assert "file deleted: 3 lines removed" in jules_review.collapse_deleted_files(deleted)
