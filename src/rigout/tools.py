@@ -31,6 +31,8 @@ LINE_CHARS = 2000
 LIST_LIMIT = 1000
 GREP_LIMIT = 500
 GREP_MAX_FILE_BYTES = 5_000_000
+# edit holds the whole file to replace text exactly. Past this size it points the agent at run instead.
+EDIT_MAX_BYTES = 50_000_000
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 
 TOOL_NAMES = ("run", "process", "read", "write", "edit", "ls", "glob", "grep")
@@ -306,22 +308,33 @@ class Tools:
             return _error(f"read: {shown} does not exist. Call glob or ls to find the file.")
         if path.is_dir():
             return _error(f"read: {shown} is a folder. Call ls on it.")
-        data = path.read_bytes()
-        if b"\x00" in data[:8192]:
-            return _error(f"read: {shown} is a binary file ({_size(len(data))}), so it is not shown as text.")
-        lines = data.decode("utf-8", errors="replace").splitlines()
-        if not lines:
-            return text_result(f"{shown} is empty.")
         offset = max(1, int(args.get("offset", 1)))
         limit = max(1, int(args.get("limit", READ_LINES)))
-        chunk = lines[offset - 1 : offset - 1 + limit]
-        if not chunk:
-            return _error(f"read: {shown} has {len(lines)} lines, so offset {offset} is past the end.")
-        end = offset + len(chunk) - 1
+        result: CallToolResult = await asyncio.to_thread(self._read_lines, path, shown, offset, limit)
+        return result
+
+    def _read_lines(self, path: Path, shown: str, offset: int, limit: int) -> CallToolResult:
+        # Line by line, so a multi-gigabyte log costs only the lines returned, not the whole file.
+        with open(path, "rb") as probe:
+            head = probe.read(8192)
+        if b"\x00" in head:
+            return _error(f"read: {shown} is a binary file ({_size(path.stat().st_size)}), so it is not shown as text.")
+        kept: list[str] = []
+        total = 0
+        last = offset + limit - 1
+        with open(path, encoding="utf-8", errors="replace", newline=None) as handle:
+            for total, line in enumerate(handle, 1):
+                if offset <= total <= last:
+                    kept.append(line.rstrip("\n"))
+        if total == 0:
+            return text_result(f"{shown} is empty.")
+        if not kept:
+            return _error(f"read: {shown} has {total} lines, so offset {offset} is past the end.")
+        end = offset + len(kept) - 1
         width = len(str(end))
-        body = "\n".join(f"{number:>{width}}\t{_clip(line)}" for number, line in enumerate(chunk, offset))
-        if end < len(lines):
-            body += f"\n[lines {offset}-{end} of {len(lines)}. Call read with offset {end + 1} for more.]"
+        body = "\n".join(f"{number:>{width}}\t{_clip(line)}" for number, line in enumerate(kept, offset))
+        if end < total:
+            body += f"\n[lines {offset}-{end} of {total}. Call read with offset {end + 1} for more.]"
         return text_result(body)
 
     async def _write(self, args: dict[str, Any]) -> CallToolResult:
@@ -345,6 +358,12 @@ class Tools:
             return _error("edit: old_string and new_string are the same, so there is nothing to change.")
         if not path.is_file():
             return _error(f"edit: {shown} does not exist. Use write to create it.")
+        size = path.stat().st_size
+        if size > EDIT_MAX_BYTES:
+            return _error(
+                f"edit: {shown} is {_size(size)}, too large to edit in memory. "
+                "Use run with a streaming tool such as sed instead."
+            )
         with open(path, encoding="utf-8", newline="") as handle:
             text = handle.read()
         count = text.count(old)

@@ -140,3 +140,25 @@ async def test_grep_literal_treats_regex_characters_as_text(tools, tmp_path):
     result = await tools.call("grep", {"pattern": "foo(bar", "literal": True})
     assert not result_is_error(result)
     assert "a.txt:1:" in text(result)
+
+
+async def test_read_streams_a_large_file_and_numbers_lines_correctly(tools, tmp_path):
+    (tmp_path / "big.log").write_text("".join(f"line {n}\n" for n in range(1, 50_001)))
+    result = await tools.call("read", {"path": "big.log", "offset": 49_999, "limit": 5})
+    assert not result_is_error(result)
+    assert text(result).startswith("49999\tline 49999")
+    assert "50000\tline 50000" in text(result)
+
+    middle = await tools.call("read", {"path": "big.log", "offset": 10, "limit": 2})
+    assert "of 50000" in text(middle)
+
+
+async def test_edit_refuses_a_file_too_large_to_hold_in_memory(tools, tmp_path, monkeypatch):
+    monkeypatch.setattr("rigout.tools.EDIT_MAX_BYTES", 10)
+    (tmp_path / "big.txt").write_text("x = 1\n" * 10)
+    result = await tools.call(
+        "edit", {"path": "big.txt", "old_string": "x = 1", "new_string": "x = 2", "replace_all": True}
+    )
+    assert result_is_error(result)
+    assert "run" in text(result)
+    assert (tmp_path / "big.txt").read_text() == "x = 1\n" * 10
