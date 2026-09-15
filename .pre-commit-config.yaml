@@ -23,5 +23,4 @@ repos:
     hooks:
       - id: mypy
         files: ^src/
-        additional_dependencies: [types-requests, types-PyYAML]
         args: [--ignore-missing-imports]

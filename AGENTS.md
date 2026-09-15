@@ -9,3 +9,4 @@ Rigout is small on purpose. Read `specs/v0.4.0.md` before changing behaviour.
 - Do not add a tool for something `run` can already do.
 - Every error message says what to call next.
 - Anything a user would notice gets a line in `CHANGELOG.md`.
+- How pull requests are reviewed, merged and released: `CONTRIBUTING.md`.

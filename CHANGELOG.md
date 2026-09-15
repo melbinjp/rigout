@@ -6,9 +6,8 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Changed
-- Repository tooling, not the package: the pull request review now reads the whole diff by
-  default, with each wholly deleted file shown as one line. `JULES_REVIEW_MAX_DIFF_CHARS`
-  still caps it when set.
+- Repository tooling, not the package: CodeRabbit is the only pull request reviewer. The Jules
+  review workflows and script are removed.
 
 ## [0.4.0] - 2026-09-15
 

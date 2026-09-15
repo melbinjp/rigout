@@ -1,73 +1,38 @@
-# Sensitive local configuration
+# Secrets
 .env
 .env.*
-!.env.example
 *.key
 *.pem
-*_key
-*_key.pub
-*_rsa
-*_rsa.pub
 *.token
-*.secret
 mcp-server-config.json
-cloudflare-config.json
-ai_agent_connection.*
-connection_info.*
-configs/
 
-# Runtime state and logs
+# Logs and local output
 *.log
-.rigout.pid
-.rigout.log
-.rigout_stdout.log
-.rigout_stderr.log
-logs/
 production_validation_report.json
-.workspace_state.json
-bin/
 
-# Python build/test artifacts
+# Python build and test artifacts
 __pycache__/
 *.py[cod]
-*$py.class
-.Python
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 coverage.xml
 htmlcov/
-.tox/
-.cache/
-.hypothesis/
 build/
 dist/
 *.egg-info/
-wheels/
 
 # Virtual environments
 .venv/
+.venv-*/
 venv/
-env/
-ENV/
 
-# Generated project exports
-generated_files/
-generated_repo_files/
-
-# Editor and OS files
+# Editors, agents and OS files
 .vscode/
 .idea/
 .kiro/
+.claude/
 *.swp
-*.swo
-*~
 .DS_Store
 Thumbs.db
-
-# Temporary files
-*.tmp
-*.temp
-tmp/
-temp/
