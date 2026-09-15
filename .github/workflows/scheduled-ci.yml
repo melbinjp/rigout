@@ -50,16 +50,6 @@ jobs:
     name: Full CI
     uses: ./.github/workflows/ci.yml
 
-  # ci.yml installs `-e ".[dev]"`. That is not what a user gets. This builds the
-  # wheel and installs it alone, so only the runtime dependency set is resolved -
-  # which is the thing that actually breaks when a dependency ships a new major.
-  #
-  # The job itself now lives in verify-wheel.yml so the release pipeline can run the
-  # identical checks against the wheel it is about to publish. No input is passed
-  # here, so this half keeps building the wheel from the checkout exactly as before.
-  fresh-install:
-    uses: ./.github/workflows/verify-wheel.yml
-
   # The failure mode of the capping policy in pyproject.toml is the opposite of
   # the one it prevents: a cap can silently freeze a dependency forever if nothing
   # ever proposes raising it. Dependabot normally does, but its pip strategy is
@@ -111,6 +101,31 @@ jobs:
           for row in rows:
               print(row)
           PY
+
+  # ci installs the checkout in editable mode. This builds the wheel and installs it alone, so
+  # only the runtime dependencies resolve, which is what breaks when one of them ships a new major.
+  fresh-install:
+    name: Fresh Wheel Install
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build The Wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: Install The Wheel Alone And Use It
+        run: |
+          python -m venv /tmp/wheel-env
+          /tmp/wheel-env/bin/pip install dist/*.whl
+          cd /tmp && /tmp/wheel-env/bin/python "$GITHUB_WORKSPACE/production_validation.py"
 
   # A red run nobody looks at is not a safety net. Scheduled-run failures do not
   # appear on anyone's PR, so this turns one into a tracked, notifying issue.

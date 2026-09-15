@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rigout"
-version = "0.3.1"
-description = "Let AI agents use your computer through MCP."
+version = "0.4.0"
+description = "An MCP server that gives an AI agent a shell and the files on your machine."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
@@ -26,23 +26,11 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-# Bounding policy: rigout is an installed application, not a library others build
-# on, so every runtime dependency is capped below its next major version - the
-# range CI actually tests. An untested major buys our users nothing, and mcp 2.0.0
-# showed that an uncapped one breaks `pip install rigout` silently. Patch and minor
-# releases, including security fixes, still flow through uncapped. Dependabot
-# proposes each major as its own PR and the scheduled CI run catches breakage that
-# lands inside the allowed range.
-#
-# Only packages rigout actually imports are listed. cryptography and pyyaml were
-# declared but imported nowhere; requests is used only by scripts/ and its tests,
-# which are not shipped, so it moved to the dev extra. cryptography still arrives
-# transitively via paramiko, which owns the version it needs.
+# Capped below the next major, which is the range CI tests.
 dependencies = [
-    "mcp>=1.0.0,<3",
+    "mcp>=1.20.0,<3",
     "starlette>=0.37.0,<2",
     "uvicorn>=0.29.0,<1",
-    "paramiko>=3.0.0,<6",
 ]
 
 [project.optional-dependencies]
@@ -66,8 +54,8 @@ Homepage = "https://github.com/melbinjp/rigout"
 Repository = "https://github.com/melbinjp/rigout"
 
 [project.scripts]
-rigout = "rigout.mcp_url_launcher:main"
-rigout-stdio = "rigout.server:stdio_main"
+rigout = "rigout.cli:main"
+rigout-stdio = "rigout.cli:stdio_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rigout"]
@@ -131,11 +119,6 @@ warn_unused_configs = true
 files = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["paramiko.*", "mcp.*", "starlette.*", "uvicorn.*"]
+module = ["mcp.*", "starlette.*", "uvicorn.*"]
 ignore_missing_imports = true
 
-[[tool.mypy.overrides]]
-module = [
-    "rigout.config_manager"
-]
-ignore_errors = true
