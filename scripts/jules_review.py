@@ -280,8 +280,10 @@ def fetch_diff(owner: str, repo: str, pr_number: int, token: str) -> str:
             old = changed.get("previous_filename", name)
             patch = changed.get("patch")
             body = patch if patch is not None else f"(no text diff: {changed.get('status', 'changed')})"
-            deleted = "deleted file mode 100644\n" if changed.get("status") == "removed" else ""
-            parts.append(f"diff --git a/{old} b/{name}\n{deleted}--- a/{old}\n+++ b/{name}\n{body}")
+            removed = changed.get("status") == "removed"
+            deleted = "deleted file mode 100644\n" if removed else ""
+            new_path = "/dev/null" if removed else f"b/{name}"
+            parts.append(f"diff --git a/{old} b/{name}\n{deleted}--- a/{old}\n+++ {new_path}\n{body}")
         if len(files) < FILES_PAGE_SIZE:
             break
     return "\n".join(parts) + "\n"
@@ -307,7 +309,8 @@ def load_rules_file(owner: str, repo: str, path: str, base_sha: str, token: str)
     return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
 
 
-FILE_HEADER_PATTERN = re.compile(r"^diff --git a/(\S+)", re.MULTILINE)
+# Up to the " b/" that starts the second path, so a name with spaces is kept whole.
+FILE_HEADER_PATTERN = re.compile(r"^diff --git a/(.+?) b/", re.MULTILINE)
 
 # What a reviewer must see first when not everything fits. `git diff` emits files in
 # path order, which put `.github/`, `CHANGELOG.md`, `README.md` and `docs/` ahead of
@@ -375,13 +378,12 @@ def collapse_deleted_files(diff: str) -> str:
     if not sections:
         return diff
     parts = []
-    for path, section in sections:
+    for _path, section in sections:
         if DELETED_FILE_MARKER in section[:500]:
             removed = sum(1 for line in section.splitlines() if line.startswith("-") and not line.startswith("---"))
-            parts.append(
-                f"diff --git a/{path} b/{path}\ndeleted file mode 100644\n"
-                f"(file deleted: {removed} lines removed, not shown)\n"
-            )
+            # The original header line, not one rebuilt from the parsed path, so no name is altered.
+            header = section.split("\n", 1)[0]
+            parts.append(f"{header}\ndeleted file mode 100644\n(file deleted: {removed} lines removed, not shown)\n")
         else:
             parts.append(section)
     return "".join(parts)

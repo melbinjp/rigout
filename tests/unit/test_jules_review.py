@@ -711,3 +711,28 @@ class TestLargeDiffs:
             diff = jules_review.fetch_diff("o", "r", 1, "t")
         assert "deleted file mode" in diff
         assert "file deleted: 1 lines removed" in jules_review.collapse_deleted_files(diff)
+
+
+@pytest.mark.unit
+class TestDeletedFileHeaders:
+    """Blocking findings on PR #51: a removed file's new path, and names with spaces."""
+
+    def test_rebuilt_removed_file_points_at_dev_null(self):
+        files = [{"filename": "gone.py", "status": "removed", "patch": "@@ -1 +0,0 @@\n-x = 1"}]
+        with patch("requests.request", side_effect=[make_response(406), make_response(200, json_data=files)]):
+            diff = jules_review.fetch_diff("o", "r", 1, "t")
+        assert "+++ /dev/null" in diff
+        assert "+++ b/gone.py" not in diff
+
+    def test_collapse_keeps_a_file_name_with_spaces(self):
+        deleted = (
+            "diff --git a/my folder/file.txt b/my folder/file.txt\ndeleted file mode 100644\n"
+            "--- a/my folder/file.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+        )
+        collapsed = jules_review.collapse_deleted_files(deleted)
+        assert collapsed.startswith("diff --git a/my folder/file.txt b/my folder/file.txt\n")
+        assert "file deleted: 1 lines removed" in collapsed
+
+    def test_split_keeps_a_file_name_with_spaces(self):
+        diff = "diff --git a/my folder/a.py b/my folder/a.py\n--- a/my folder/a.py\n+++ b/my folder/a.py\n"
+        assert jules_review.split_diff_by_file(diff)[0][0] == "my folder/a.py"
