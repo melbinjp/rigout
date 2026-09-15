@@ -1,15 +1,8 @@
 name: Enable Auto-Merge
 
-# Arms GitHub's native auto-merge on PRs opened by the repo owner against
-# main. This is deliberately independent of Jules: it never inspects a
-# review verdict itself, it just flips a flag that tells GitHub "merge this
-# once every required status check and required review is satisfied" - the
-# same mechanism that would apply if a human reviewer approved instead of
-# the Jules PR Review bot. Jules' approval is one of the things auto-merge
-# waits on, not something this workflow evaluates directly.
-#
-# PRs opened by anyone else never get this flag set, so they always need a
-# manual review and merge, regardless of what Jules' review says.
+# Arms GitHub auto-merge on pull requests to main from people with write access. GitHub merges
+# once the required checks pass and the pull request has an approval (CodeRabbit's counts).
+# Anyone else's pull request is merged by hand.
 
 on:
   pull_request:
@@ -19,25 +12,12 @@ jobs:
   enable-auto-merge:
     name: Enable Auto-Merge for Owner PRs
     runs-on: ubuntu-latest
-    # Keyed off write access rather than a name. author_association is GitHub's own
-    # answer to "does this person have write access here": OWNER, MEMBER and
-    # COLLABORATOR do, CONTRIBUTOR and NONE do not. Comparing against
-    # repository_owner instead meant a second maintainer's pull request would
-    # silently never have auto-merge armed, and adding one would need this file
-    # edited. Granting repository access is now the whole of it. Nothing changes
-    # while there is one maintainer, which is why it is safe to do before it is
-    # needed rather than during the week somebody joins.
     if: >-
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
                github.event.pull_request.author_association) &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.draft == false
-    # contents: write is required here - verified empirically after
-    # pull-requests: write alone failed with "GraphQL: Resource not
-    # accessible by integration (enablePullRequestAutoMerge)". This still
-    # only *arms* auto-merge; the actual merge commit is written by
-    # GitHub's own merge queue once required checks/reviews clear, not by
-    # this token performing a push.
+    # contents: write is needed to arm auto-merge; pull-requests: write alone is refused.
     permissions:
       pull-requests: write
       contents: write
@@ -47,19 +27,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-        # Retried because arming auto-merge is idempotent - it sets a flag on the PR, so
-        # doing it twice is the same as doing it once, and there is no lost-response hazard
-        # of the kind the issue jobs have to design around.
-        #
-        # This step failed on 2026-08-17 with a bare `503 Service Unavailable` while GitHub
-        # was mid-incident, which shows a red X on a PR whose code is fine. A red check that
-        # means "GitHub had a bad minute" trains people to ignore red checks.
+        # Retried so a brief GitHub outage does not leave a red check on a good pull request.
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if gh pr merge "$PR" --auto --squash --repo "$REPO"; then
-              exit 0
-            fi
+            gh pr merge "$PR" --auto --squash --repo "$REPO" && exit 0
             echo "gh pr merge failed (attempt $attempt/5); retrying" >&2
             sleep $((attempt * 10))
           done

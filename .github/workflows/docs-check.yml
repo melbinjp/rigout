@@ -1,17 +1,6 @@
 name: Docs match the code
 
-# Checks the claims this repository's documentation makes against what the repository
-# actually contains: paths that exist, CLI flags the parser really defines, importable
-# names, the declared Python floor and install extras. It calls a claim broken only when
-# history shows the project HAD the thing and removed it, so an illustration or a tutorial
-# path is a skip with a reason rather than a false alarm.
-#
-# Measured on this repository at the time of adding: 112 claims checked, nothing
-# contradicted. So this starts green and stays green until documentation and code drift
-# apart, which is the only state worth alarming on.
-#
-# Not in `ci.yml` because this is a different question from "does it work", and a docs gate
-# that goes red should say so in its own name rather than inside a job about tests.
+# docproof checks that paths, CLI flags and names the documentation mentions still exist.
 
 on:
   push:
@@ -20,6 +9,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   docproof:
     name: Documented claims still hold
@@ -27,37 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Required, and the action refuses to run without it rather than passing quietly.
-          # Without history a path check cannot tell a file the project deleted from one it
-          # never had, so every path judgement becomes a skip and the job goes green having
-          # decided nothing.
+          # Full history lets docproof tell a removed file from one that never existed.
           fetch-depth: 0
+          # docproof is a third-party action, so the token is not left in the git config for it.
+          persist-credentials: false
 
-      # **Pinned to a release rather than a branch, 2026-08-18.** This said `@main` because
-      # `@main` was the only thing that existed: docproof had no tag, so every run of this
-      # gate silently took whatever was on that branch at the time. A gate whose own version
-      # moves underneath it cannot tell you whether the code changed or the checker did.
-      #
-      # **Bumped v0.1.0 -> v0.1.1, 2026-08-18.** The line under this used to say v0.1.0 was
-      # "the same one a Marketplace listing is made from", and that stopped being true the
-      # hour the listing went up: it was published from **v0.1.1**, because v0.1.0 carries a
-      # metadata name GitHub rejects. So this repository was pinned to a release that can no
-      # longer be listed, while claiming it was the listed one. A stale comment in the gate
-      # whose whole job is catching stale documentation.
-      #
-      # **Measured before bumping, both ways: no behaviour change here.** v0.1.0 and v0.1.1
-      # each report 112 claims checked and nothing contradicted on this tree. The seven
-      # commits between them are precision work on other corpora plus the name fix, so this
-      # is hygiene rather than a fix, and saying otherwise would be inventing a win.
-      #
-      # **Pinned to a commit rather than a tag, 2026-09-01.** docproof's own README tells
-      # adopters to do this, and gives the reason: a tag is movable, so whoever controls the
-      # repository can change what `@v0.2.4` means without a diff for anyone to review. That
-      # is the same supply-chain hole azul's maintainer raised against docproof itself. This
-      # repository was still on a tag, and Dependabot's habit of moving between tags is the
-      # thing the advice exists to stop. The SHA below is what `v0.2.4` resolved to:
-      #
-      #     git ls-remote https://github.com/melbinjp/docproof refs/tags/v0.2.4
+      # Pinned to a commit, since a tag can be moved.
       - uses: melbinjp/docproof@5798f6ac3c0b0aec739c4da135cc6b6c45c96fe5  # v0.2.4
         with:
           show-skips: 'true'

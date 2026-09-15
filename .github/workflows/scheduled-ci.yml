@@ -1,39 +1,12 @@
 name: Scheduled CI
 
-# Why this workflow exists.
-#
-# ci.yml only runs on push and pull_request. Dependencies are resolved fresh at
-# install time, so CI would have caught the mcp 2.0.0 breakage - but nothing was
-# pushed after mcp 2.0.0 was published, so no run happened and nobody was told. A
-# dependency published after the last commit can break `pip install rigout` for
-# every new user, silently and indefinitely.
-#
-# This is a SEPARATE workflow rather than a `schedule:` trigger added to ci.yml so
-# that the push/PR behaviour of ci.yml is provably unchanged, and so that the jobs
-# added here (fresh install, failure reporting) can never appear as new required
-# status checks on a pull request.
-#
-# Note: GitHub only runs `schedule:` triggers on the repository's DEFAULT branch.
-# This file does nothing until it is merged to main.
+# A dependency released after the last commit can break `pip install rigout` with no push to
+# trigger CI. This runs the full CI and a clean wheel install every week, and keeps one issue
+# open while it fails.
 
 on:
   schedule:
-    # 06:17 UTC every Monday.
-    #
-    # Weekly, because it is matched to dependabot's weekly cadence: dependabot
-    # proposes in-range bumps as PRs that run full CI, so the unique job of this
-    # run is to catch what dependabot cannot - breakage from *transitive*
-    # dependencies (httpx, anyio, h11, pydantic and friends arrive via mcp and
-    # starlette and are managed by nobody) and from runner image changes. Daily
-    # would cut worst-case exposure from 7 days to 1, but this matrix is ~21 jobs
-    # across three operating systems, and paying that every day to shorten a
-    # window that dependabot already covers for direct dependencies is not a
-    # trade worth making.
-    #
-    # Off the hour on purpose: GitHub delays or silently drops scheduled runs
-    # that pile up on the hour. Monday morning UTC so a failure is waiting at the
-    # start of the week rather than ageing over a weekend.
-    - cron: "17 6 * * 1"
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC; off the hour, where GitHub drops fewer runs.
   workflow_dispatch:
 
 permissions:
@@ -44,18 +17,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # The exact same jobs the push/PR runs execute, via ci.yml's workflow_call.
-  # Reusing it means this can never drift from what CI actually checks.
   full-ci:
     name: Full CI
     uses: ./.github/workflows/ci.yml
 
-  # The failure mode of the capping policy in pyproject.toml is the opposite of
-  # the one it prevents: a cap can silently freeze a dependency forever if nothing
-  # ever proposes raising it. Dependabot normally does, but its pip strategy is
-  # chosen automatically and `widen` cannot be requested explicitly for pip, so
-  # this does not rely on it. Reports only - it must never fail the run, because a
-  # new major being available is news, not breakage.
+  # Report only: a new major version of a capped dependency is news, not a failure.
   held-back-majors:
     name: Report Dependencies Held Back By Caps
     runs-on: ubuntu-latest
@@ -79,31 +45,24 @@ jobs:
               deps = tomllib.load(handle)["project"]["dependencies"]
 
           print("## Dependencies held back by a version cap\n")
-          rows = []
+          print("| package | latest on PyPI | cap | status |")
+          print("| --- | --- | --- | --- |")
           for spec in deps:
               name = spec.split(">")[0].split("<")[0].split("=")[0].strip()
               cap = spec.split("<")[1].strip() if "<" in spec else None
               try:
-                  with urllib.request.urlopen(
-                      f"https://pypi.org/pypi/{name}/json", timeout=30
-                  ) as response:
+                  with urllib.request.urlopen(f"https://pypi.org/pypi/{name}/json", timeout=30) as response:
                       latest = json.load(response)["info"]["version"]
               except (URLError, KeyError, ValueError) as exc:
-                  rows.append(f"| {name} | ? | {cap or '-'} | lookup failed: {exc} |")
+                  print(f"| {name} | ? | {cap or '-'} | lookup failed: {exc} |")
                   continue
               if cap and int(latest.split(".")[0]) >= int(cap.split(".")[0]):
-                  rows.append(f"| {name} | {latest} | <{cap} | **held back - test and raise the cap** |")
+                  print(f"| {name} | {latest} | <{cap} | **held back: test and raise the cap** |")
               else:
-                  rows.append(f"| {name} | {latest} | {'<' + cap if cap else 'uncapped'} | ok |")
-
-          print("| package | latest on PyPI | cap | status |")
-          print("| --- | --- | --- | --- |")
-          for row in rows:
-              print(row)
+                  print(f"| {name} | {latest} | {'<' + cap if cap else 'uncapped'} | ok |")
           PY
 
-  # ci installs the checkout in editable mode. This builds the wheel and installs it alone, so
-  # only the runtime dependencies resolve, which is what breaks when one of them ships a new major.
+  # CI installs the checkout in editable mode; this installs the built wheel alone, as a user would.
   fresh-install:
     name: Fresh Wheel Install
     runs-on: ubuntu-latest
@@ -125,10 +84,9 @@ jobs:
         run: |
           python -m venv /tmp/wheel-env
           /tmp/wheel-env/bin/pip install dist/*.whl
+          /tmp/wheel-env/bin/pip freeze
           cd /tmp && /tmp/wheel-env/bin/python "$GITHUB_WORKSPACE/production_validation.py"
 
-  # A red run nobody looks at is not a safety net. Scheduled-run failures do not
-  # appear on anyone's PR, so this turns one into a tracked, notifying issue.
   report-failure:
     name: Report Failure
     needs: [full-ci, fresh-install]
@@ -144,56 +102,32 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          gh label create scheduled-ci-failure --repo "$REPO" --color B60205 \
+            --description "A scheduled CI run failed without any code change" 2>/dev/null || true
 
-          # Idempotent: the label may already exist from a previous failure.
-          gh label create scheduled-ci-failure \
-            --repo "$REPO" \
-            --color B60205 \
-            --description "A scheduled CI run failed without any code change" \
-            2>/dev/null || true
-
-          body="$(cat <<EOF
-          The scheduled CI run failed. No code changed, so this is almost certainly
-          a newly published dependency (direct or transitive) breaking the build.
+          body="The scheduled CI run failed with no code change, so a newly released dependency is the likely cause.
 
           Failed run: $RUN_URL
 
-          Check the resolved versions in the \`Show Resolved Dependency Versions\`
-          step of the Fresh Install jobs against the bounds in \`pyproject.toml\`.
+          Compare the versions printed by \`pip freeze\` in Fresh Wheel Install with the bounds in \`pyproject.toml\`. This issue is commented on, not duplicated, while runs keep failing, and closes when one passes."
 
-          This issue is updated rather than duplicated on each subsequent failure,
-          and closed automatically when a scheduled run next passes.
-          EOF
-          )"
-
-          # Re-derive the issue state on EVERY attempt rather than retrying a remembered
-          # decision. A blanket retry around `gh issue create` would file a duplicate if the
-          # create actually succeeded and only the response was lost; re-listing first means
-          # the next pass finds the issue and comments on it instead. Idempotent by
-          # construction rather than by assuming a 503 never reached the backend.
+          # The open issue is looked up again on every attempt, so a create whose response was
+          # lost is found and commented on instead of filed twice.
           for attempt in 1 2 3 4 5; do
-            if existing="$(gh issue list --repo "$REPO" \
-                 --label scheduled-ci-failure --state open \
+            if existing="$(gh issue list --repo "$REPO" --label scheduled-ci-failure --state open \
                  --json number --jq '.[0].number // empty')"; then
               if [ -n "$existing" ]; then
-                if gh issue comment "$existing" --repo "$REPO" --body "$body"; then
-                  echo "Commented on existing issue #$existing"; exit 0
-                fi
-              elif gh issue create --repo "$REPO" \
-                     --title "Scheduled CI is failing" \
-                     --label scheduled-ci-failure \
-                     --body "$body"; then
-                echo "Opened the failure issue"; exit 0
+                gh issue comment "$existing" --repo "$REPO" --body "$body" && exit 0
+              else
+                gh issue create --repo "$REPO" --title "Scheduled CI is failing" \
+                  --label scheduled-ci-failure --body "$body" && exit 0
               fi
             fi
-            echo "GitHub API call failed (attempt $attempt/5); retrying" >&2
             sleep $((attempt * 10))
           done
           echo "could not report the failure after 5 attempts" >&2
           exit 1
 
-  # Close the failure issue once a scheduled run is green again, so an open issue
-  # always means "currently broken" and the signal stays worth trusting.
   clear-failure:
     name: Clear Failure Report
     needs: [full-ci, fresh-install]
@@ -209,27 +143,12 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          # Same shape as Report Failure: re-list before every close attempt. If an earlier
-          # attempt actually closed the issue and only lost the response, the next pass sees
-          # nothing open and exits clean instead of closing twice.
-          #
-          # This job failed three times on 2026-08-17 with a bare 503 from `gh issue close`
-          # while GitHub was mid-incident, which left #28 open reporting a break that was
-          # already fixed. An issue tracker that says "currently broken" when it is not is
-          # exactly the signal this job exists to protect.
           for attempt in 1 2 3 4 5; do
-            if existing="$(gh issue list --repo "$REPO" \
-                 --label scheduled-ci-failure --state open \
+            if existing="$(gh issue list --repo "$REPO" --label scheduled-ci-failure --state open \
                  --json number --jq '.[0].number // empty')"; then
-              if [ -z "$existing" ]; then
-                echo "No open failure issue to close."; exit 0
-              fi
-              if gh issue close "$existing" --repo "$REPO" \
-                   --comment "A scheduled CI run passed again: $RUN_URL"; then
-                echo "Closed issue #$existing"; exit 0
-              fi
+              [ -z "$existing" ] && { echo "No open failure issue."; exit 0; }
+              gh issue close "$existing" --repo "$REPO" --comment "A scheduled CI run passed again: $RUN_URL" && exit 0
             fi
-            echo "GitHub API call failed (attempt $attempt/5); retrying" >&2
             sleep $((attempt * 10))
           done
           echo "could not close the failure issue after 5 attempts" >&2
