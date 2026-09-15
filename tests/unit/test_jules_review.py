@@ -667,3 +667,23 @@ class TestTrustFollowsWriteAccess:
 
     def test_association_is_matched_case_insensitively(self):
         assert jules_review.is_trusted_author("someone", "melbinjp", "collaborator") is True
+
+
+@pytest.mark.unit
+class TestFetchDiffTooLarge:
+    """GitHub answers 406 for a diff too large to render. PR #49 hit it and the review failed."""
+
+    def test_uses_the_rendered_diff_when_github_returns_one(self):
+        with patch("requests.request", side_effect=[make_response(200, text="diff --git a/x b/x\n")]):
+            assert jules_review.fetch_diff("o", "r", 1, "t") == "diff --git a/x b/x\n"
+
+    def test_rebuilds_the_diff_from_the_files_endpoint_on_406(self):
+        files = [
+            {"filename": "src/a.py", "status": "modified", "patch": "@@ -1 +1 @@\n-old\n+new"},
+            {"filename": "logo.png", "status": "added"},
+        ]
+        with patch("requests.request", side_effect=[make_response(406), make_response(200, json_data=files)]):
+            diff = jules_review.fetch_diff("o", "r", 1, "t")
+        assert "diff --git a/src/a.py b/src/a.py" in diff
+        assert "+new" in diff
+        assert "logo.png" in diff
