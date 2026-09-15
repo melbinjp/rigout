@@ -5,6 +5,26 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-15
+
+### Changed
+- Breaking: rigout offers eight tools that agents already know how to use: `run`, `process`,
+  `read`, `write`, `edit`, `ls`, `glob` and `grep`. They replace the fifteen tools of 0.3.
+- The server identifies as `rigout`, and tells the agent its workspace, its shell and which tool
+  to use for what when it connects.
+- Commands and relative paths start in the workspace (`--workspace`, default the current
+  folder). A command still running after about 50 seconds keeps running as a job instead of
+  timing out.
+- `rigout` serves on this machine, `rigout share` serves through a Cloudflare tunnel,
+  `rigout url --client` prints client settings, and `rigout token --reset` replaces the token.
+  The token is kept across restarts.
+
+### Removed
+- The 0.3 tools, `bypass_security`, the command blocklist and the 30-second default timeout.
+- SSH endpoints, `connection.json` and setup tokens, and the background `start`, `stop`,
+  `status` and `logs` commands.
+- paramiko as a dependency.
+
 ## [0.3.1] - 2026-08-17
 
 ### Added

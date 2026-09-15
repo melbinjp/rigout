@@ -80,7 +80,7 @@ the hunk.
   carrying them, hanging the client with no error and no timeout. If a change
   adds or widens a path from a file, a process, or a remote host into a tool
   result, check that it passes through the bound and the scrub in
-  `tools/_results.py` and that the tool applies its own limit.
+  `results.py` and that the tool applies its own limit.
 - **Failure paths must keep what the caller needs.** A failing command used to
   discard the stdout it had already produced, so a build that failed in its
   tests reported nothing about the build. When a change touches an error branch,
@@ -89,19 +89,19 @@ the hunk.
   even when no signature changes. Check that `CHANGELOG.md` says so under
   `Changed`, in terms of what a user will observe rather than what the code now
   does.
-- **A new argument on an MCP tool has to reach the thing it configures.**
-  `manage_tunnels` accepted endpoints for years while pinning every one of them
-  to port 22, because the tool schema had no port and the constructor default
-  filled it in silently. Follow a new argument from the schema to its use.
-- **Security checks are load-bearing in both directions.** Over-refusal pushes
-  callers toward `bypass_security=true`, which disables everything; under-refusal
-  is obvious. If a change alters `security_validator.py`, state which commands
-  start being refused and which stop, and check the tests assert both.
+- **A new argument on a tool has to reach the thing it configures.** A 0.3 tool
+  accepted endpoints for years while pinning every one of them to port 22, because
+  the schema had no port and a default filled it in silently. Follow a new argument
+  from its schema in `tools.py` to its use.
+- **The token is the protection.** Rigout has no command blocklist by design:
+  whoever starts it grants the agent the machine. Block any change that serves
+  `/mcp` without the bearer token, prints or logs the token somewhere other than
+  the owner's own terminal, or weakens the constant-time comparison in `http.py`.
 
 ## Rigout product invariants
 
-- `execute_command` intentionally accepts shell syntax, including pipelines,
-  redirects, and command chains, for an authenticated device-control agent.
+- `run` intentionally accepts shell syntax, including pipelines, redirects, and
+  command chains, for an authenticated agent.
   Do not recommend replacing `shell=True` with `shell=False` merely because a
   generic scanner dislikes it. Trace authentication, command validation, and
   the caller-to-shell path. Block only for a concrete new privilege-boundary
@@ -110,7 +110,7 @@ the hunk.
 - Test coverage is organized by behavior, not by one-test-file-per-source-file.
   Search unit and integration tests for the changed callable and contract
   before claiming that a module is untested.
-- The URL launcher is deliberately synchronous. A use of `time.sleep` or
+- `cli.py` is deliberately synchronous. A use of `time.sleep` or
   `urllib.request` is not an async-path defect unless its actual call graph
   enters a running event loop.
 - HTTP 200 is normal for an MCP tool response even when the tool operation

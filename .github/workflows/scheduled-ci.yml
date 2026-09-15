@@ -50,16 +50,6 @@ jobs:
     name: Full CI
     uses: ./.github/workflows/ci.yml
 
-  # ci.yml installs `-e ".[dev]"`. That is not what a user gets. This builds the
-  # wheel and installs it alone, so only the runtime dependency set is resolved -
-  # which is the thing that actually breaks when a dependency ships a new major.
-  #
-  # The job itself now lives in verify-wheel.yml so the release pipeline can run the
-  # identical checks against the wheel it is about to publish. No input is passed
-  # here, so this half keeps building the wheel from the checkout exactly as before.
-  fresh-install:
-    uses: ./.github/workflows/verify-wheel.yml
-
   # The failure mode of the capping policy in pyproject.toml is the opposite of
   # the one it prevents: a cap can silently freeze a dependency forever if nothing
   # ever proposes raising it. Dependabot normally does, but its pip strategy is
@@ -116,7 +106,7 @@ jobs:
   # appear on anyone's PR, so this turns one into a tracked, notifying issue.
   report-failure:
     name: Report Failure
-    needs: [full-ci, fresh-install]
+    needs: [full-ci]
     if: ${{ always() && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     permissions:
@@ -181,7 +171,7 @@ jobs:
   # always means "currently broken" and the signal stays worth trusting.
   clear-failure:
     name: Clear Failure Report
-    needs: [full-ci, fresh-install]
+    needs: [full-ci]
     if: ${{ always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     permissions:
