@@ -687,3 +687,26 @@ class TestFetchDiffTooLarge:
         assert "diff --git a/src/a.py b/src/a.py" in diff
         assert "+new" in diff
         assert "logo.png" in diff
+
+
+@pytest.mark.unit
+class TestLargeDiffs:
+    """PR #49: 872,642 characters, most of them deleted files, over an 80,000 limit."""
+
+    def test_the_default_limit_fits_a_large_change(self):
+        assert jules_review.DEFAULT_MAX_DIFF_CHARS >= 500_000
+
+    def test_deleted_files_collapse_to_one_line_and_other_files_stay_whole(self):
+        deleted = "diff --git a/old.py b/old.py\ndeleted file mode 100644\n--- a/old.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a = 1\n-b = 2\n"
+        changed = "diff --git a/new.py b/new.py\n--- a/new.py\n+++ b/new.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+        collapsed = jules_review.collapse_deleted_files(deleted + changed)
+        assert "file deleted: 2 lines removed" in collapsed
+        assert "-a = 1" not in collapsed
+        assert changed in collapsed
+
+    def test_rebuilt_diff_marks_removed_files_as_deleted(self):
+        files = [{"filename": "gone.py", "status": "removed", "patch": "@@ -1 +0,0 @@\n-x = 1"}]
+        with patch("requests.request", side_effect=[make_response(406), make_response(200, json_data=files)]):
+            diff = jules_review.fetch_diff("o", "r", 1, "t")
+        assert "deleted file mode" in diff
+        assert "file deleted: 1 lines removed" in jules_review.collapse_deleted_files(diff)

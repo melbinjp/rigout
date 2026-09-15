@@ -280,7 +280,8 @@ def fetch_diff(owner: str, repo: str, pr_number: int, token: str) -> str:
             old = changed.get("previous_filename", name)
             patch = changed.get("patch")
             body = patch if patch is not None else f"(no text diff: {changed.get('status', 'changed')})"
-            parts.append(f"diff --git a/{old} b/{name}\n--- a/{old}\n+++ b/{name}\n{body}")
+            deleted = "deleted file mode 100644\n" if changed.get("status") == "removed" else ""
+            parts.append(f"diff --git a/{old} b/{name}\n{deleted}--- a/{old}\n+++ b/{name}\n{body}")
         if len(files) < FILES_PAGE_SIZE:
             break
     return "\n".join(parts) + "\n"
@@ -356,6 +357,35 @@ def order_diff_for_review(diff: str) -> str:
         return diff
     ordered = sorted(range(len(sections)), key=lambda i: (review_priority(sections[i][0]), i))
     return "".join(sections[i][1] for i in ordered)
+
+
+# What reaches the reviewer. 80,000 characters was set for a much smaller context; the model
+# behind the review reads far more, and at 80,000 PR #49's review could not approve.
+DEFAULT_MAX_DIFF_CHARS = 500_000
+DELETED_FILE_MARKER = "\ndeleted file mode"
+
+
+def collapse_deleted_files(diff: str) -> str:
+    """Show a wholly deleted file as one line instead of every line it removed.
+
+    A deletion is reviewed by knowing what went, not by rereading each removed line. PR #49
+    deleted about 700,000 characters of old code, which pushed its real changes past the
+    limit. Used only when a diff is over the limit, so smaller reviews still see everything.
+    """
+    sections = split_diff_by_file(diff)
+    if not sections:
+        return diff
+    parts = []
+    for path, section in sections:
+        if DELETED_FILE_MARKER in section[:500]:
+            removed = sum(1 for line in section.splitlines() if line.startswith("-") and not line.startswith("---"))
+            parts.append(
+                f"diff --git a/{path} b/{path}\ndeleted file mode 100644\n"
+                f"(file deleted: {removed} lines removed, not shown)\n"
+            )
+        else:
+            parts.append(section)
+    return "".join(parts)
 
 
 def truncate_diff(diff: str, max_chars: int) -> tuple[str, str | None]:
@@ -700,8 +730,11 @@ def main() -> int:
 
     try:
         diff = fetch_diff(owner, repo, pr_number, token)
-        max_chars = int(os.environ.get("JULES_REVIEW_MAX_DIFF_CHARS", "80000"))
-        diff_text, truncated_note = truncate_diff(order_diff_for_review(diff), max_chars)
+        max_chars = int(os.environ.get("JULES_REVIEW_MAX_DIFF_CHARS", str(DEFAULT_MAX_DIFF_CHARS)))
+        ordered = order_diff_for_review(diff)
+        if len(ordered) > max_chars:
+            ordered = collapse_deleted_files(ordered)
+        diff_text, truncated_note = truncate_diff(ordered, max_chars)
 
         rules_path = os.environ.get("JULES_REVIEW_RULES_FILE", ".github/jules-review-rules.md")
         rules_from_file = load_rules_file(owner, repo, rules_path, base_sha, token)
