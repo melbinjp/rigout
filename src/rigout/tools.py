@@ -271,15 +271,26 @@ def _glob_regex(pattern: str) -> re.Pattern[str]:
             out.append("[^/]")
             i += 1
         elif pattern[i] == "[":
-            close = pattern.find("]", i + 1)
+            # fnmatch rules: "!" negates, a leading "^" is literal, and a "]" straight after "[" or
+            # "[!" is a member rather than the end of the class.
+            start = i + 1
+            if start < len(pattern) and pattern[start] == "!":
+                start += 1
+            if start < len(pattern) and pattern[start] == "]":
+                start += 1
+            close = pattern.find("]", start)
             if close == -1:
                 out.append(re.escape(pattern[i]))
                 i += 1
             else:
                 body = pattern[i + 1 : close]
-                if body.startswith("!"):
-                    body = "^" + body[1:]
-                out.append(f"[{body}]")
+                negate = body.startswith("!")
+                if negate:
+                    body = body[1:]
+                body = body.replace("\\", "\\\\")
+                if body.startswith("^"):
+                    body = "\\" + body
+                out.append(f"[{'^' if negate else ''}{body}]")
                 i = close + 1
         else:
             out.append(re.escape(pattern[i]))

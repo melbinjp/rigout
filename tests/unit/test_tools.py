@@ -238,3 +238,17 @@ async def test_glob_keeps_a_leading_dot_folder_after_dot_slash(tools, tmp_path):
     (tmp_path / ".github" / "ci.yml").write_text("")
     result = text(await tools.call("glob", {"pattern": "./.github/*.yml"}))
     assert result.split() == [".github/ci.yml"]
+
+
+def test_glob_bracket_classes_follow_fnmatch():
+    from rigout.tools import _glob_regex
+
+    assert _glob_regex("[]]").match("]")
+    assert not _glob_regex("[]]").match("a")
+    assert _glob_regex("[^a]").match("^")
+    assert _glob_regex("[^a]").match("a")
+    assert not _glob_regex("[^a]").match("b")
+    assert _glob_regex("[!a]").match("b")
+    assert not _glob_regex("[!a]").match("a")
+    assert _glob_regex("[!]]").match("a")
+    assert not _glob_regex("[!]]").match("]")
