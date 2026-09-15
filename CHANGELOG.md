@@ -30,6 +30,10 @@ All notable changes to this project are documented here. Format follows
   `status` and `logs` commands.
 - paramiko as a dependency.
 
+### Fixed
+- `glob` skips `node_modules`, `.git` and similar folders while it walks, instead of walking them
+  and discarding the matches afterwards, so a recursive pattern on a large project stays fast.
+
 ## [0.3.1] - 2026-08-17
 
 ### Added
