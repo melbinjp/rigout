@@ -379,7 +379,9 @@ def collapse_deleted_files(diff: str) -> str:
         return diff
     parts = []
     for _path, section in sections:
-        if DELETED_FILE_MARKER in section[:500]:
+        # The whole section, not a prefix: a long file name can push the marker far in, and no
+        # content line can match because each one starts with "+", "-", " " or a backslash.
+        if DELETED_FILE_MARKER in section:
             removed = sum(1 for line in section.splitlines() if line.startswith("-") and not line.startswith("---"))
             # The original header line, not one rebuilt from the parsed path, so no name is altered.
             header = section.split("\n", 1)[0]
@@ -387,6 +389,15 @@ def collapse_deleted_files(diff: str) -> str:
         else:
             parts.append(section)
     return "".join(parts)
+
+
+def diff_fully_shown(truncated_note: str | None, files_collapsed: bool, coverage_ok: bool) -> bool:
+    """Whether the review can count as having read the whole change.
+
+    Collapsed deleted files hide lines just as a cap does, so either one means approval needs
+    the reviewer's confirmed coverage.
+    """
+    return (truncated_note is None and not files_collapsed) or coverage_ok
 
 
 def truncate_diff(diff: str, max_chars: int) -> tuple[str, str | None]:
@@ -731,7 +742,9 @@ def main() -> int:
 
     try:
         diff = fetch_diff(owner, repo, pr_number, token)
-        ordered = collapse_deleted_files(order_diff_for_review(diff))
+        full = order_diff_for_review(diff)
+        ordered = collapse_deleted_files(full)
+        files_collapsed = ordered != full
         cap = os.environ.get(MAX_DIFF_CHARS_ENV, "").strip()
         diff_text, truncated_note = truncate_diff(ordered, int(cap)) if cap else (ordered, None)
 
@@ -786,7 +799,7 @@ def main() -> int:
         # approvable, and this is a solo-maintainer repo where no second reviewer exists.
         coverage = parse_coverage(review_message)
         coverage_ok, coverage_problem = coverage_confirms_full_review(coverage, head_sha, changed_files)
-        reviewed_whole_diff = truncated_note is None or coverage_ok
+        reviewed_whole_diff = diff_fully_shown(truncated_note, files_collapsed, coverage_ok)
         # The dry-run check is placed in the same expression as the others rather than
         # around the later approval call, so there is one place that decides, and no
         # path where a candidate reviewer being tried out can approve anything.
@@ -802,8 +815,8 @@ def main() -> int:
             approval_note = "_No blocking issues were found, so this PR was auto-approved._"
         elif not reviewed_whole_diff:
             approval_note = (
-                f"_This did not auto-approve: {coverage_problem}, and the diff was too large to "
-                "include in full, so part of this change may never have been reviewed. Re-run the "
+                f"_This did not auto-approve: {coverage_problem}, and part of the diff was not "
+                "shown in full, so part of this change may never have been reviewed. Re-run the "
                 "workflow, or review and approve it yourself._"
             )
         elif verdict not in APPROVING_VERDICTS:

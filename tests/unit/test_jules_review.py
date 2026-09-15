@@ -553,7 +553,7 @@ class TestApprovalStillWorksForALoneMaintainer:
         ],
     )
     def test_coverage_is_an_alternative_route_not_an_extra_hurdle(self, truncated, coverage_ok, expected):
-        reviewed_whole_diff = (not truncated) or coverage_ok
+        reviewed_whole_diff = jules_review.diff_fully_shown("cut" if truncated else None, False, coverage_ok)
 
         assert reviewed_whole_diff is expected
 
@@ -736,3 +736,27 @@ class TestDeletedFileHeaders:
     def test_split_keeps_a_file_name_with_spaces(self):
         diff = "diff --git a/my folder/a.py b/my folder/a.py\n--- a/my folder/a.py\n+++ b/my folder/a.py\n"
         assert jules_review.split_diff_by_file(diff)[0][0] == "my folder/a.py"
+
+
+@pytest.mark.unit
+class TestCollapseNeedsCoverage:
+    """CodeRabbit findings on PR #51: long names hid the marker, and collapse skipped coverage."""
+
+    def test_a_deleted_file_with_a_255_character_name_still_collapses(self):
+        name = "d/" + "n" * 253
+        deleted = (
+            f"diff --git a/{name} b/{name}\ndeleted file mode 100644\n"
+            f"--- a/{name}\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+        )
+        collapsed = jules_review.collapse_deleted_files(deleted)
+        assert "file deleted: 1 lines removed" in collapsed
+        assert "-old" not in collapsed
+
+    def test_a_removed_line_reading_deleted_file_mode_does_not_collapse_a_changed_file(self):
+        changed = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-deleted file mode\n+x\n"
+        assert jules_review.collapse_deleted_files(changed) == changed
+
+    def test_collapsed_files_need_confirmed_coverage_to_approve(self):
+        assert jules_review.diff_fully_shown(None, True, False) is False
+        assert jules_review.diff_fully_shown(None, True, True) is True
+        assert jules_review.diff_fully_shown(None, False, False) is True
