@@ -250,11 +250,40 @@ def check_skip_conditions(pr: dict, owner: str, repo: str) -> None:
         raise ReviewSkippedError(f'bypass label "{bypass_label}" present')
 
 
+FILES_PAGE_SIZE = 100
+FILES_MAX_PAGES = 30  # GitHub lists at most 3000 files for a pull request
+
+
 def fetch_diff(owner: str, repo: str, pr_number: int, token: str) -> str:
-    response = github_request(
-        "GET", f"/repos/{owner}/{repo}/pulls/{pr_number}", token, accept="application/vnd.github.v3.diff"
-    )
-    return response.text
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3.diff",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = request_with_retry("GET", f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}", headers=headers)
+    if response.status_code != 406:
+        response.raise_for_status()
+        return response.text
+    # GitHub answers 406 when a diff is too large to render in one piece. PR #49 deleted about
+    # twenty thousand lines and the review failed here without reading a line of it. The same
+    # text is rebuilt file by file; truncate_diff still bounds what reaches the reviewer.
+    parts: list[str] = []
+    for page in range(1, FILES_MAX_PAGES + 1):
+        files = github_request(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{pr_number}/files",
+            token,
+            params={"per_page": FILES_PAGE_SIZE, "page": page},
+        ).json()
+        for changed in files:
+            name = changed.get("filename", "")
+            old = changed.get("previous_filename", name)
+            patch = changed.get("patch")
+            body = patch if patch is not None else f"(no text diff: {changed.get('status', 'changed')})"
+            parts.append(f"diff --git a/{old} b/{name}\n--- a/{old}\n+++ b/{name}\n{body}")
+        if len(files) < FILES_PAGE_SIZE:
+            break
+    return "\n".join(parts) + "\n"
 
 
 def load_rules_file(owner: str, repo: str, path: str, base_sha: str, token: str) -> str | None:
