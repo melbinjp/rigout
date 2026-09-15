@@ -280,15 +280,10 @@ def fetch_diff(owner: str, repo: str, pr_number: int, token: str) -> str:
             old = changed.get("previous_filename", name)
             patch = changed.get("patch")
             body = patch if patch is not None else f"(no text diff: {changed.get('status', 'changed')})"
-            parts.append(f"diff --git a/{old} b/{name}
---- a/{old}
-+++ b/{name}
-{body}")
+            parts.append(f"diff --git a/{old} b/{name}\n--- a/{old}\n+++ b/{name}\n{body}")
         if len(files) < FILES_PAGE_SIZE:
             break
-    return "
-".join(parts) + "
-"
+    return "\n".join(parts) + "\n"
 
 
 def load_rules_file(owner: str, repo: str, path: str, base_sha: str, token: str) -> str | None:
