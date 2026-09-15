@@ -1,0 +1,26 @@
+# CodeRabbit pull request reviews. Free for public repositories.
+language: en-US
+reviews:
+  profile: chill
+  # Approves the pull request once its review comments are resolved, which satisfies the
+  # one-approval rule on main without anyone approving their own work.
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: "src/rigout/**"
+      instructions: >-
+        Rigout is an MCP server that gives an AI agent a shell and the files on one machine.
+        It has no command blocklist by design; the bearer token check in http.py is the
+        protection. Flag anything that bypasses or leaks the token, crashes, or returns an
+        error that does not tell the agent what to call next. Do not suggest restricting
+        commands or adding tools for things run can already do.
+    - path: "tests/**"
+      instructions: "Tests check behaviour, not wording. Flag a test that asserts documentation sentences."
+chat:
+  auto_reply: true
