@@ -50,9 +50,33 @@ def text_result(text: str, *, error: bool = False) -> CallToolResult:
     return build_result(content=[TextContent(type="text", text=transport_safe_text(text))], isError=error)
 
 
+#: Distinct from None, because a flag that is present and set to None means no
+#: error, while the attribute being absent means the shape is not one we know.
+#: The old code used None for both and so could not tell them apart.
+_ABSENT = object()
+
+ERROR_FLAG_NAMES = ("isError", "is_error")
+
+
+class UnknownResultShape(TypeError):
+    """A result carrying no error flag under any name this package knows."""
+
+
 def result_is_error(result: CallToolResult) -> bool:
-    """Read the error flag on either mcp major."""
-    flag = getattr(result, "isError", None)
-    if flag is None:
-        flag = getattr(result, "is_error", None)
-    return bool(flag)
+    """Read the error flag on either mcp major.
+
+    Raises rather than guessing when it recognises neither name. Returning
+    False there would report a failed call as a success, which is how the last
+    rename went unnoticed for ten days: 1.x `isError` became 2.x `is_error`,
+    and a wrapper that falls back to a default survives only the rename it has
+    already been told about. Not knowing is not the same as fine.
+    """
+    for name in ERROR_FLAG_NAMES:
+        flag = getattr(result, name, _ABSENT)
+        if flag is not _ABSENT:
+            return bool(flag)
+    raise UnknownResultShape(
+        f"{type(result).__name__} carries no error flag under any known name "
+        f"({', '.join(ERROR_FLAG_NAMES)}). The mcp result shape has probably "
+        f"changed again; add the new name here rather than assuming success."
+    )
