@@ -1,6 +1,7 @@
 # Spec: an unrecognised result shape must not read as success
 
-Status: proposed 2026-09-22. Not implemented.
+Status: IMPLEMENTED 2026-09-22, commit 8e15d4e. Six tests in
+`tests/unit/test_result_shape.py`; 74 pass.
 Found by: Low_Rush_8535, in a comment on the r/mcp post about the mcp 2.0.0 fix.
 
 ## The defect
@@ -53,3 +54,13 @@ that was otherwise checked on both majors in isolated venvs.
 
 Guessing the next name. The point is to fail where a human can see it, not to
 keep working through a rename nobody has read yet.
+
+## Built as specced, with one thing the spec did not say
+
+Task 4 checked out: nothing in `src/` calls `result_is_error` at all, only the
+tests, so raising could not break a caller.
+
+The sentinel matters more than it reads. `None` could not be the marker for
+absent, because a flag that is present and set to `None` also reads as `None`,
+and that case means no error rather than an unknown shape. The old code
+conflated the two, which is part of why it failed open.
