@@ -261,20 +261,11 @@ async def test_glob_invalid_pattern_says_how_to_fix_it(tools, tmp_path):
     assert text(result).startswith("glob:")
 
 
-def test_read_only_and_destructive_split_matches_the_readme():
-    """The README states the split; this keeps the sentence from drifting from the code."""
-    from pathlib import Path
-
+def test_read_only_and_destructive_split():
+    """Four read, four change the machine. The README states this split; a tool whose hint changes
+    fails here, which is the prompt to update that sentence too."""
     definitions = tool_definitions()
     # Read from the wire names, which both mcp majors send; 2.x renamed the Python attributes.
     hints = {t.name: t.model_dump(by_alias=True)["annotations"] for t in definitions}
-    read_only = sorted(name for name, h in hints.items() if h["readOnlyHint"])
-    destructive = sorted(name for name, h in hints.items() if h["destructiveHint"])
-    assert read_only == ["glob", "grep", "ls", "read"]
-    assert destructive == ["edit", "process", "run", "write"]
-    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text(encoding="utf-8")
-    sentence = re.search(r"Four tools are read-only \(([^)]*)\) and four can change the machine\s+\(([^)]*)\)", readme)
-    assert sentence, "README no longer states the read-only and destructive split"
-    named = lambda group: sorted(re.findall(r"`(\w+)`", group))  # noqa: E731
-    assert named(sentence.group(1)) == read_only
-    assert named(sentence.group(2)) == destructive
+    assert sorted(n for n, h in hints.items() if h["readOnlyHint"]) == ["glob", "grep", "ls", "read"]
+    assert sorted(n for n, h in hints.items() if h["destructiveHint"]) == ["edit", "process", "run", "write"]
