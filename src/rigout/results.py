@@ -58,7 +58,7 @@ _ABSENT = object()
 ERROR_FLAG_NAMES = ("isError", "is_error")
 
 
-class UnknownResultShape(TypeError):
+class UnknownResultShapeError(TypeError):
     """A result carrying no error flag under any name this package knows."""
 
 
@@ -75,8 +75,19 @@ def result_is_error(result: CallToolResult) -> bool:
         flag = getattr(result, name, _ABSENT)
         if flag is not _ABSENT:
             return bool(flag)
-    raise UnknownResultShape(
+    raise UnknownResultShapeError(
         f"{type(result).__name__} carries no error flag under any known name "
         f"({', '.join(ERROR_FLAG_NAMES)}). The mcp result shape has probably "
-        f"changed again; add the new name here rather than assuming success."
+        f"changed again; add the new name here rather than assuming success. "
+        f"Received: {_preview(result)}"
     )
+
+
+def _preview(result: object, limit: int = 500) -> str:
+    """The payload as it arrived, so an unknown shape can be read rather than guessed at."""
+    dump = getattr(result, "model_dump", None)
+    try:
+        shown = repr(dump()) if callable(dump) else repr(vars(result))
+    except Exception:  # noqa: BLE001 - a preview must never hide the real error
+        shown = repr(result)
+    return shown if len(shown) <= limit else f"{shown[:limit]}... [{len(shown) - limit} more characters]"

@@ -5,7 +5,15 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- A tool result carrying no error flag under any known name was reported as a success. It now
+  raises `UnknownResultShapeError`, naming the fields it looked for and showing the payload
+  that arrived.
+
 ### Changed
+- CI runs the unit tests against both mcp 1.x and 2.x, so a rename in either shows up at once.
+- The README states which four tools are read-only and which four can change the machine, and a
+  test checks that sentence against the tool definitions.
 - Repository tooling, not the package: CodeRabbit is the only pull request reviewer. The Jules
   review workflows and script are removed.
 

@@ -88,6 +88,34 @@ jobs:
           path: coverage.xml
           if-no-files-found: ignore
 
+  mcp-majors:
+    # The result wrapper reads the error flag under both spellings (1.x isError, 2.x is_error).
+    # A default install only ever tests one, which is how the last rename went unseen for ten days.
+    name: Unit Tests (mcp ${{ matrix.mcp }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ["1", "2"]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install "mcp>=${{ matrix.mcp }},<$(( ${{ matrix.mcp }} + 1 ))"
+
+      - name: Run Unit Tests
+        run: pytest tests/unit/ -m unit
+
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
