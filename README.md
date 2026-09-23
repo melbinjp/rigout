@@ -39,6 +39,10 @@ A client that starts local servers itself can run `rigout stdio` instead, with n
 | `glob` | Finds files by pattern, such as `**/*.py`. |
 | `grep` | Searches file contents. Uses ripgrep when it is installed. |
 
+Four tools are read-only (`read`, `ls`, `glob`, `grep`) and four can change the machine
+(`run`, `process`, `write`, `edit`). Each is marked that way for the client, so a client can
+approve reads on its own and ask about the rest.
+
 Relative paths and commands start in the workspace: the folder rigout was started in, or
 `--workspace DIR`. The agent is told this, and which shell `run` uses, when it connects.
 

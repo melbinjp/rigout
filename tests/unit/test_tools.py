@@ -259,3 +259,13 @@ async def test_glob_invalid_pattern_says_how_to_fix_it(tools, tmp_path):
     result = await tools.call("glob", {"pattern": "[z-a]"})
     assert result_is_error(result)
     assert text(result).startswith("glob:")
+
+
+def test_read_only_and_destructive_split():
+    """Four read, four change the machine. The README states this split; a tool whose hint changes
+    fails here, which is the prompt to update that sentence too."""
+    definitions = tool_definitions()
+    # Read from the wire names, which both mcp majors send; 2.x renamed the Python attributes.
+    hints = {t.name: t.model_dump(by_alias=True)["annotations"] for t in definitions}
+    assert sorted(n for n, h in hints.items() if h["readOnlyHint"]) == ["glob", "grep", "ls", "read"]
+    assert sorted(n for n, h in hints.items() if h["destructiveHint"]) == ["edit", "process", "run", "write"]
