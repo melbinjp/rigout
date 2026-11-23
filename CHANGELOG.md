@@ -5,10 +5,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-23
+
 ### Fixed
 - A tool result carrying no error flag under any known name was reported as a success. It now
   raises `UnknownResultShapeError`, naming the fields it looked for and showing the payload
   that arrived.
+- Scheduled CI clears an open failure issue only when both CI and the wheel install succeed.
 
 ### Changed
 - CI runs the unit tests against both mcp 1.x and 2.x, so a rename in either shows up at once.

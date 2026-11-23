@@ -13,6 +13,8 @@ from pathlib import Path
 from mcp import ClientSession
 from mcp.client import streamable_http
 
+from rigout.results import result_is_error
+
 EXPECTED_TOOLS = ["run", "process", "read", "write", "edit", "ls", "glob", "grep"]
 
 
@@ -70,11 +72,11 @@ async def exercise(url: str, token: str, workspace: Path) -> None:
 
             await session.call_tool("write", {"path": "hello.txt", "content": "hello\n"})
             edited = await session.call_tool("edit", {"path": "hello.txt", "old_string": "hello", "new_string": "hello rigout"})
-            assert not field(edited, "is_error", "isError"), text(edited)
+            assert not result_is_error(edited), text(edited)
             assert (workspace / "hello.txt").read_text() == "hello rigout\n"
 
             ran = await session.call_tool("run", {"command": "echo rigout-ok"})
-            assert not field(ran, "is_error", "isError") and "rigout-ok" in text(ran), text(ran)
+            assert not result_is_error(ran) and "rigout-ok" in text(ran), text(ran)
 
 
 def main() -> int:
